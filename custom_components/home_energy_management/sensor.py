@@ -42,6 +42,7 @@ async def async_setup_entry(
         ChargerPlanSensor(coordinator, entry),
         DailySavingsSensor(coordinator, entry),
         PredictionLogSensor(coordinator, entry),
+        PredictionAccuracySensor(coordinator, entry),
     ]
 
     async_add_entities(entities)
@@ -192,9 +193,16 @@ class PredictedConsumptionSensor(EnergyManagementSensor):
     def extra_state_attributes(self) -> dict[str, Any]:
         data = self.coordinator.data or {}
         predictions = data.get("predicted_consumption", [])
+        split = data.get("prediction_split", {})
+        house = split.get("house_base", [])
+        ev = split.get("ev_charging", [])
         return {
             "next_24h": predictions[:24],
+            "house_base_24h": house[:24],
+            "ev_charging_24h": ev[:24],
             "total_predicted_24h": round(sum(predictions[:24]), 2) if predictions else 0,
+            "total_house_base_24h": round(sum(house[:24]), 2) if house else 0,
+            "total_ev_charging_24h": round(sum(ev[:24]), 2) if ev else 0,
         }
 
     @property
@@ -327,3 +335,63 @@ class PredictionLogSensor(EnergyManagementSensor):
     @property
     def icon(self) -> str:
         return "mdi:notebook"
+
+
+class PredictionAccuracySensor(EnergyManagementSensor):
+    """Tracks prediction error over time — MAE in kWh.
+
+    The main state is the all-time MAE for total consumption.
+    Attributes expose per-stream breakdown and rolling windows
+    (last 24 h, last 7 d) so you can see if changes improve accuracy.
+    """
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "kWh"
+
+    def __init__(self, coordinator, entry):
+        super().__init__(
+            coordinator, entry, "prediction_accuracy", "Prediction Accuracy (MAE)",
+        )
+
+    @property
+    def native_value(self) -> float | None:
+        data = self.coordinator.data or {}
+        accuracy = data.get("accuracy", {})
+        total = accuracy.get("total", {})
+        all_time = total.get("all_time", {})
+        return all_time.get("mae_kwh")
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data or {}
+        accuracy = data.get("accuracy", {})
+
+        attrs: dict[str, Any] = {}
+
+        # Per-stream all-time MAE
+        for stream in ("total", "house_base", "ev_charging"):
+            s = accuracy.get(stream, {})
+            at = s.get("all_time", {})
+            attrs[f"{stream}_mae_kwh"] = at.get("mae_kwh")
+            attrs[f"{stream}_mape_pct"] = at.get("mape_pct")
+            attrs[f"{stream}_pairs"] = at.get("pairs", 0)
+
+        # Rolling windows for total
+        total = accuracy.get("total", {})
+        last_24 = total.get("last_24h", {})
+        last_7d = total.get("last_7d", {})
+        attrs["total_mae_last_24h"] = last_24.get("mae_kwh")
+        attrs["total_mape_last_24h"] = last_24.get("mape_pct")
+        attrs["total_mae_last_7d"] = last_7d.get("mae_kwh")
+        attrs["total_mape_last_7d"] = last_7d.get("mape_pct")
+
+        # Recent individual errors for charting
+        combined = accuracy.get("combined", {})
+        at_combined = combined.get("all_time", {})
+        attrs["recent_errors"] = at_combined.get("recent_errors", [])
+
+        return attrs
+
+    @property
+    def icon(self) -> str:
+        return "mdi:target"

@@ -2,7 +2,11 @@
 
 import pytest
 from datetime import datetime
-from custom_components.home_energy_management.predictor import ConsumptionPredictor
+from custom_components.home_energy_management.predictor import (
+    ConsumptionPredictor,
+    STREAM_HOUSE,
+    STREAM_EV,
+)
 
 
 class TestConsumptionPredictor:
@@ -127,3 +131,141 @@ class TestConsumptionPredictor:
         result = pred.predict(hours_ahead=24, current_load=500)
         for val in result:
             assert isinstance(val, float)
+
+
+class TestSplitStreams:
+    """Test house-base vs EV-charging stream separation."""
+
+    def test_ev_defaults_to_zero(self):
+        """EV stream should predict 0 when no EV observations exist."""
+        pred = ConsumptionPredictor()
+        ev_pred = pred.predict(hours_ahead=4, stream=STREAM_EV)
+        assert ev_pred == [0.0, 0.0, 0.0, 0.0]
+
+    def test_house_and_ev_streams_are_independent(self):
+        """Observations in one stream should not affect the other."""
+        pred = ConsumptionPredictor(history_days=7, recency_weight=0.5)
+
+        # Feed house data for Monday 10:00
+        for week in range(3):
+            pred.add_observation(
+                datetime(2026, 3, 2 + week * 7, 10, 0),
+                2.0,
+                stream=STREAM_HOUSE,
+            )
+
+        # Feed EV data for the same slot
+        for week in range(3):
+            pred.add_observation(
+                datetime(2026, 3, 2 + week * 7, 10, 0),
+                7.5,
+                stream=STREAM_EV,
+            )
+
+        house_val = pred._predict_hour_from_stream(
+            pred._streams[STREAM_HOUSE], 0, 10, 0, STREAM_HOUSE,
+        )
+        ev_val = pred._predict_hour_from_stream(
+            pred._streams[STREAM_EV], 0, 10, 0, STREAM_EV,
+        )
+
+        assert abs(house_val - 2.0) < 0.1
+        assert abs(ev_val - 7.5) < 0.1
+
+    def test_predict_split_returns_all_keys(self):
+        """predict_split() should return house_base, ev_charging, total."""
+        pred = ConsumptionPredictor()
+        result = pred.predict_split(hours_ahead=6)
+        assert STREAM_HOUSE in result
+        assert STREAM_EV in result
+        assert "total" in result
+        assert len(result["total"]) == 6
+
+    def test_predict_split_total_equals_sum(self):
+        """total should equal house_base + ev_charging."""
+        pred = ConsumptionPredictor(history_days=7, recency_weight=0.5)
+
+        # Add some house data
+        pred.add_observation(datetime(2026, 3, 16, 10, 0), 2.0, stream=STREAM_HOUSE)
+        # Add some EV data
+        pred.add_observation(datetime(2026, 3, 16, 10, 0), 5.0, stream=STREAM_EV)
+
+        result = pred.predict_split(hours_ahead=24)
+        for h, e, t in zip(result[STREAM_HOUSE], result[STREAM_EV], result["total"]):
+            assert abs(t - (h + e)) < 0.01
+
+    def test_ev_stream_does_not_pollute_house(self):
+        """Big EV session should not inflate house base prediction."""
+        pred = ConsumptionPredictor(history_days=7, recency_weight=0.5)
+
+        # Normal house load: 1.5 kWh every Monday 20:00
+        for week in range(4):
+            pred.add_observation(
+                datetime(2026, 3, 2 + week * 7, 20, 0),
+                1.5,
+                stream=STREAM_HOUSE,
+            )
+
+        # One big EV session on Monday 20:00
+        pred.add_observation(
+            datetime(2026, 3, 16, 20, 0),
+            7.0,
+            stream=STREAM_EV,
+        )
+
+        house_pred = pred._predict_hour_from_stream(
+            pred._streams[STREAM_HOUSE], 0, 20, 0, STREAM_HOUSE,
+        )
+
+        # House base should stay near 1.5, not jump to 8.5
+        assert house_pred < 2.0
+
+    def test_predict_with_stream_parameter(self):
+        """predict(stream=...) should return only that stream's values."""
+        pred = ConsumptionPredictor()
+        pred.add_observation(datetime(2026, 3, 16, 10, 0), 3.0, stream=STREAM_HOUSE)
+
+        house_only = pred.predict(hours_ahead=4, stream=STREAM_HOUSE)
+        ev_only = pred.predict(hours_ahead=4, stream=STREAM_EV)
+
+        assert len(house_only) == 4
+        assert len(ev_only) == 4
+        # EV should be all zeros (no observations)
+        assert all(v == 0.0 for v in ev_only)
+
+    def test_statistics_includes_streams(self):
+        """get_statistics() should include per-stream breakdown."""
+        pred = ConsumptionPredictor()
+        pred.add_observation(datetime(2026, 3, 16, 10, 0), 2.0, stream=STREAM_HOUSE)
+        pred.add_observation(datetime(2026, 3, 16, 10, 0), 5.0, stream=STREAM_EV)
+
+        stats = pred.get_statistics()
+        assert "streams" in stats
+        assert STREAM_HOUSE in stats["streams"]
+        assert STREAM_EV in stats["streams"]
+        assert stats["streams"][STREAM_HOUSE]["observations"] == 1
+        assert stats["streams"][STREAM_EV]["observations"] == 1
+
+    def test_weekday_differentiation_across_streams(self):
+        """Monday and Tuesday should have independent predictions per stream."""
+        pred = ConsumptionPredictor(history_days=7, recency_weight=0.5)
+
+        # Monday 08:00 house = 1.0, Tuesday 08:00 house = 3.0
+        for week in range(3):
+            pred.add_observation(
+                datetime(2026, 3, 2 + week * 7, 8, 0), 1.0, stream=STREAM_HOUSE,
+            )
+            pred.add_observation(
+                datetime(2026, 3, 3 + week * 7, 8, 0), 3.0, stream=STREAM_HOUSE,
+            )
+
+        mon = pred._predict_hour_from_stream(
+            pred._streams[STREAM_HOUSE], 0, 8, 0, STREAM_HOUSE,
+        )
+        tue = pred._predict_hour_from_stream(
+            pred._streams[STREAM_HOUSE], 1, 8, 0, STREAM_HOUSE,
+        )
+
+        assert abs(mon - 1.0) < 0.1
+        assert abs(tue - 3.0) < 0.1
+        assert abs(tue - mon) > 1.5  # clearly different

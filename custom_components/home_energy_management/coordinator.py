@@ -27,7 +27,7 @@ from .const import (
 )
 from .logger import PredictionLogger
 from .optimizer import Optimizer
-from .predictor import ConsumptionPredictor
+from .predictor import ConsumptionPredictor, STREAM_EV, STREAM_HOUSE
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -73,16 +73,21 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             # 1. Read current sensor values
             sensor_data = self._read_sensors()
 
-            # 2. Get price data
+            # 2. Record observations — split house base load vs EV
+            self._record_observations(sensor_data)
+
+            # 3. Get price data
             prices = self._read_prices()
 
-            # 3. Predict consumption for the planning horizon
-            predicted_consumption = self.predictor.predict(
-                hours_ahead=self.params.get("planning_horizon_hours", 24),
-                current_load=sensor_data.get("house_load", 0),
+            # 4. Predict consumption (split by stream)
+            horizon = self.params.get("planning_horizon_hours", 24)
+            prediction_split = self.predictor.predict_split(
+                hours_ahead=horizon,
+                current_house_load=sensor_data.get("house_load", 0),
             )
+            predicted_consumption = prediction_split["total"]
 
-            # 4. Run optimizer to produce a schedule
+            # 5. Run optimizer to produce a schedule
             schedule = self.optimizer.optimize(
                 prices=prices,
                 predicted_consumption=predicted_consumption,
@@ -90,23 +95,29 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 ev_connected=sensor_data.get("ev_connected", False),
             )
 
-            # 5. Execute immediate actions
+            # 6. Execute immediate actions
             await self._execute_actions(schedule)
 
-            # 6. Log the decision
+            # 7. Log actual vs previous prediction (before overwriting)
+            self._log_actuals(sensor_data)
+
+            # 8. Log the new decision (stores predictions for next comparison)
             self.prediction_logger.log_decision(
                 prices=prices,
                 predicted_consumption=predicted_consumption,
                 schedule=schedule,
                 sensor_data=sensor_data,
+                prediction_split=prediction_split,
             )
 
             return {
                 "sensor_data": sensor_data,
                 "prices": prices,
                 "predicted_consumption": predicted_consumption,
+                "prediction_split": prediction_split,
                 "schedule": schedule,
                 "log_entries": self.prediction_logger.get_recent_entries(20),
+                "accuracy": self.prediction_logger.get_accuracy_summary(),
                 "status": "ok",
             }
 
@@ -118,6 +129,65 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 "error": str(exc),
                 "log_entries": self.prediction_logger.get_recent_entries(20),
             }
+
+    # ------------------------------------------------------------------
+    # Accuracy tracking — log actual vs previous prediction
+    # ------------------------------------------------------------------
+
+    def _log_actuals(self, sensor_data: dict[str, Any]) -> None:
+        """Compare the *previous* cycle's prediction against what actually happened.
+
+        Called at the start of each new cycle, before the new prediction
+        overwrites the stored values.
+        """
+        total_house = sensor_data.get("house_load", 0)   # W
+        ev_power = sensor_data.get("ev_power", 0)         # W
+        house_base_w = max(total_house - ev_power, 0)
+
+        interval_h = self.update_interval.total_seconds() / 3600.0
+        total_kwh = (total_house / 1000.0) * interval_h
+        house_kwh = (house_base_w / 1000.0) * interval_h
+        ev_kwh = (ev_power / 1000.0) * interval_h
+
+        prices = self._read_prices()
+
+        self.prediction_logger.log_actual(
+            actual_consumption_kwh=total_kwh,
+            actual_price=prices.get("current", 0),
+            actual_soc=sensor_data.get("battery_soc", 0),
+            actual_house_kwh=house_kwh,
+            actual_ev_kwh=ev_kwh,
+        )
+
+    # ------------------------------------------------------------------
+    # Observation recording
+    # ------------------------------------------------------------------
+
+    def _record_observations(self, sensor_data: dict[str, Any]) -> None:
+        """Feed the predictor with separated house-base and EV load.
+
+        The Sungrow *house_load* sensor typically includes everything
+        behind the meter — including the EV charger.  We subtract the
+        current EV power so the house-base stream only captures the
+        "normal" household pattern.
+        """
+        from datetime import datetime
+
+        now = datetime.now()
+        total_house = sensor_data.get("house_load", 0)   # W
+        ev_power = sensor_data.get("ev_power", 0)         # W
+
+        # House base = total minus EV (clamp to zero)
+        house_base_w = max(total_house - ev_power, 0)
+
+        # Convert W → kWh (one observation per coordinator interval)
+        interval_h = self.update_interval.total_seconds() / 3600.0
+        house_kwh = (house_base_w / 1000.0) * interval_h
+        ev_kwh = (ev_power / 1000.0) * interval_h
+
+        self.predictor.add_observation(now, house_kwh, stream=STREAM_HOUSE)
+        if ev_kwh > 0:
+            self.predictor.add_observation(now, ev_kwh, stream=STREAM_EV)
 
     # ------------------------------------------------------------------
     # Sensor reading helpers

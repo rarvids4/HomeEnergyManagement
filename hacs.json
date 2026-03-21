@@ -1,0 +1,7 @@
+{
+  "name": "Home Energy Management",
+  "domains": ["sensor", "switch", "number"],
+  "render_readme": true,
+  "homeassistant": "2024.1.0",
+  "hacs": "2.0.0"
+}

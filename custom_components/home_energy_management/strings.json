@@ -1,0 +1,16 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Home Energy Management",
+        "description": "Configure the path to your variable mapping file.",
+        "data": {
+          "mapping_path": "Mapping file path"
+        }
+      }
+    },
+    "error": {
+      "mapping_not_found": "Mapping file not found or invalid YAML. Check the path."
+    }
+  }
+}

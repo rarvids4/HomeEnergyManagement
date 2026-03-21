@@ -1,0 +1,4 @@
+force_replan:
+  name: Force replan
+  description: Force the optimizer to re-run immediately.
+  fields: {}

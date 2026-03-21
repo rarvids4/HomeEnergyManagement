@@ -1,0 +1,168 @@
+# ============================================================
+# Home Energy Management — Variable Mapping
+# ============================================================
+#
+# This file maps generic variable names used by the integration
+# to YOUR specific Home Assistant entity IDs.
+#
+# HOW TO USE:
+#   1. Replace every "sensor.CHANGE_ME_*" with your real entity ID
+#   2. You can find entity IDs in HA → Developer Tools → States
+#   3. Restart Home Assistant after editing
+#
+# ============================================================
+
+# ----------------------------------------------------------
+# INPUT VARIABLES (sensors the integration READS)
+# ----------------------------------------------------------
+inputs:
+
+  # --- Nordpool electricity prices ---
+  nordpool:
+    # The Nordpool sensor entity that provides today's hourly prices
+    current_price: "sensor.CHANGE_ME_nordpool_kwh_se3_sek_3_10_025"
+    # Attribute on the sensor that holds today's price list (list of floats)
+    today_prices_attribute: "today"
+    # Attribute for tomorrow's prices (available after ~13:00)
+    tomorrow_prices_attribute: "tomorrow"
+    # Currency used (SEK, NOK, EUR, etc.)
+    currency: "SEK"
+    # Price unit (kWh)
+    price_unit: "kWh"
+
+  # --- Easee EV Charger ---
+  easee:
+    # Current charger status (disconnected / awaiting_start / charging / completed / error)
+    status: "sensor.CHANGE_ME_easee_status"
+    # Current power draw in kW
+    power: "sensor.CHANGE_ME_easee_power"
+    # Energy delivered in current session (kWh)
+    session_energy: "sensor.CHANGE_ME_easee_session_energy"
+    # Lifetime energy delivered (kWh)
+    lifetime_energy: "sensor.CHANGE_ME_easee_lifetime_energy"
+    # Whether a cable is connected (binary_sensor)
+    cable_connected: "binary_sensor.CHANGE_ME_easee_cable_connected"
+    # Is charger currently enabled
+    enabled: "switch.CHANGE_ME_easee_is_enabled"
+    # Dynamic current limit (A)
+    current_limit: "number.CHANGE_ME_easee_dynamic_charger_limit"
+
+  # --- Sungrow Inverter / Battery ---
+  sungrow:
+    # Battery state of charge (%)
+    battery_soc: "sensor.CHANGE_ME_sungrow_battery_soc"
+    # Battery power — positive = charging, negative = discharging (W)
+    battery_power: "sensor.CHANGE_ME_sungrow_battery_power"
+    # Solar/PV generation power (W)
+    pv_power: "sensor.CHANGE_ME_sungrow_pv_power"
+    # Grid import power (W) — power drawn from the grid
+    grid_import_power: "sensor.CHANGE_ME_sungrow_grid_import_power"
+    # Grid export power (W) — power fed back to the grid
+    grid_export_power: "sensor.CHANGE_ME_sungrow_grid_export_power"
+    # Total house load / consumption (W)
+    house_load: "sensor.CHANGE_ME_sungrow_house_load"
+    # Daily PV generation (kWh)
+    daily_pv_energy: "sensor.CHANGE_ME_sungrow_daily_pv_energy"
+    # Daily consumption (kWh)
+    daily_consumption: "sensor.CHANGE_ME_sungrow_daily_consumption"
+    # Daily grid import (kWh)
+    daily_grid_import: "sensor.CHANGE_ME_sungrow_daily_grid_import"
+    # Daily grid export (kWh)
+    daily_grid_export: "sensor.CHANGE_ME_sungrow_daily_grid_export"
+    # Daily battery charge (kWh)
+    daily_battery_charge: "sensor.CHANGE_ME_sungrow_daily_battery_charge"
+    # Daily battery discharge (kWh)
+    daily_battery_discharge: "sensor.CHANGE_ME_sungrow_daily_battery_discharge"
+    # Battery health / state of health (%)
+    battery_soh: "sensor.CHANGE_ME_sungrow_battery_soh"
+
+  # --- Smart Meter / Grid ---
+  smart_meter:
+    # Total cumulative import (kWh) — from smart meter or grid sensor
+    total_import: "sensor.CHANGE_ME_total_grid_import"
+    # Total cumulative export (kWh)
+    total_export: "sensor.CHANGE_ME_total_grid_export"
+
+  # --- Weather (optional, improves PV prediction) ---
+  weather:
+    # HA weather entity for cloud cover / forecast
+    entity: "weather.CHANGE_ME_home"
+    # Outdoor temperature sensor
+    temperature: "sensor.CHANGE_ME_outdoor_temperature"
+
+
+# ----------------------------------------------------------
+# OUTPUT VARIABLES (entities/services the integration CONTROLS)
+# ----------------------------------------------------------
+outputs:
+
+  # --- Easee Charger Control ---
+  easee:
+    # Service to start charging
+    start_charging:
+      service: "easee.start"
+      entity_id: "switch.CHANGE_ME_easee_is_enabled"
+    # Service to stop / pause charging
+    stop_charging:
+      service: "easee.stop"
+      entity_id: "switch.CHANGE_ME_easee_is_enabled"
+    # Set dynamic current limit (amps)
+    set_current_limit:
+      service: "number.set_value"
+      entity_id: "number.CHANGE_ME_easee_dynamic_charger_limit"
+      # Min/max amps your charger supports
+      min_amps: 6
+      max_amps: 32
+
+  # --- Sungrow Battery Control ---
+  sungrow:
+    # Force charge from grid (buy cheap electricity)
+    force_charge:
+      service: "CHANGE_ME_sungrow.set_battery_mode"
+      # or use a select/input_select entity:
+      entity_id: "select.CHANGE_ME_sungrow_battery_mode"
+      mode_value: "force_charge"
+    # Force discharge (sell or use during peak)
+    force_discharge:
+      service: "CHANGE_ME_sungrow.set_battery_mode"
+      entity_id: "select.CHANGE_ME_sungrow_battery_mode"
+      mode_value: "force_discharge"
+    # Self-consumption mode (normal/automatic)
+    self_consumption:
+      service: "CHANGE_ME_sungrow.set_battery_mode"
+      entity_id: "select.CHANGE_ME_sungrow_battery_mode"
+      mode_value: "self_consumption"
+    # Set max charge power (W) — optional
+    set_charge_power:
+      service: "number.set_value"
+      entity_id: "number.CHANGE_ME_sungrow_max_charge_power"
+    # Set max discharge power (W) — optional
+    set_discharge_power:
+      service: "number.set_value"
+      entity_id: "number.CHANGE_ME_sungrow_max_discharge_power"
+    # Battery SoC limits
+    min_soc: 10          # Never discharge below this (%)
+    max_soc: 100         # Never charge above this (%)
+    capacity_kwh: 10.0   # Usable battery capacity in kWh
+
+
+# ----------------------------------------------------------
+# SYSTEM PARAMETERS (tuning knobs — not entity IDs)
+# ----------------------------------------------------------
+parameters:
+  # How often to re-run the optimizer (minutes)
+  optimization_interval_minutes: 15
+  # How many hours ahead to plan
+  planning_horizon_hours: 24
+  # Minimum price difference (SEK/kWh) to justify a charge/discharge cycle
+  min_price_spread: 0.30
+  # Number of days of history to use for consumption prediction
+  prediction_history_days: 14
+  # Weight for recent days in prediction (0.0–1.0, higher = more weight on recent)
+  prediction_recency_weight: 0.7
+  # Enable/disable EV charger control
+  enable_charger_control: true
+  # Enable/disable battery control
+  enable_battery_control: true
+  # Log level for internal prediction log (debug / info / warning)
+  log_level: "info"

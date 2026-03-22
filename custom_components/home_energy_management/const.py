@@ -61,6 +61,14 @@ DEFAULT_EV_CHEAP_PRICE_THRESHOLD = 0.10
 # Charge EVs when grid export exceeds this (W) — absorb solar surplus
 DEFAULT_SOLAR_SURPLUS_THRESHOLD = 2000
 
+# Preferred EV charging window (night, off-peak) to minimize grid load
+DEFAULT_EV_NIGHT_START = 22   # 22:00
+DEFAULT_EV_NIGHT_END = 6      # 06:00
+# Night hours get this bonus in sorting (SEK/kWh) — prefer night over day
+DEFAULT_EV_NIGHT_PREFERENCE_SEK = 0.10
+# On weekends, target lower SoC (car parked at home, can charge from solar later)
+DEFAULT_EV_WEEKEND_TARGET_SOC = 80  # %
+
 # --- Nordpool ---
 DEFAULT_ENTRIES_PER_HOUR = 1  # 1 = hourly prices, 4 = 15-min
 

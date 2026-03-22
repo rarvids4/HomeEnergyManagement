@@ -187,5 +187,11 @@ parameters:
   enable_charger_control: true
   # Enable/disable battery control
   enable_battery_control: true
+  # EV grid minimization: prefer night charging over daytime grid
+  ev_cheap_price_threshold: 0.10
+  ev_night_start: 22
+  ev_night_end: 6
+  ev_night_preference_sek: 0.10
+  ev_weekend_target_soc: 80
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"

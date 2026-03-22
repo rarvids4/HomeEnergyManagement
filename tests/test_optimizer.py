@@ -1463,3 +1463,472 @@ class TestEVChargePlanning:
         )
 
         assert "EV-charge" in result["summary"]
+
+
+class TestEVGridMinimization:
+    """Tests for EV grid minimization: ramp-down, night preference, weekend target.
+
+    The optimizer should minimize grid energy consumption by:
+      - Stopping charger when vehicle SoC >= target (ramp-down)
+      - Preferring night hours (22:00-06:00) for charging (off-peak)
+      - Lowering target SoC on weekends (car parked at home, solar later)
+      - Overriding weekend target during negative prices (get paid to charge)
+    """
+
+    @pytest.fixture
+    def ev_vehicle_ex90_full(self):
+        """EX90 at 100% — already at target, should stop."""
+        return [{
+            "name": "ex90",
+            "power_w": 0,
+            "status": "connected",
+            "connected": True,
+            "vehicle_soc": 100,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 0,
+        }]
+
+    @pytest.fixture
+    def ev_vehicle_ex90_at_80(self):
+        """EX90 at 80% — at weekend target but below vehicle target."""
+        return [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 80,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+        }]
+
+    @pytest.fixture
+    def ev_vehicle_ex90_charging(self):
+        """EX90 at 50% — needs charging."""
+        return [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+        }]
+
+    # ------------------------------------------------------------------
+    # Ramp-down: stop when vehicle at target
+    # ------------------------------------------------------------------
+
+    def test_ramp_down_stops_charger_at_target(
+        self, default_params, default_outputs, ev_vehicle_ex90_full
+    ):
+        """When vehicle SoC >= target, the charger switch should be turned OFF
+        even if the price is cheap."""
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [0.05] * 24,  # Very cheap — normally would charge
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle_ex90_full,
+        )
+
+        actions = result["immediate_actions"]
+        # EX90 at 100% → should STOP, not start
+        ev_stop = [a for a in actions if a["service"] == "switch.turn_off"
+                   and "ex90" in a.get("entity_id", "")]
+        ev_start = [a for a in actions if a["service"] == "switch.turn_on"
+                    and "ex90" in a.get("entity_id", "")]
+        assert len(ev_stop) >= 1, "Should stop EX90 charger at target SoC"
+        assert len(ev_start) == 0, "Should NOT start EX90 when at target"
+
+    def test_ramp_down_does_not_affect_other_chargers(
+        self, default_params, default_outputs
+    ):
+        """When one EV is at target, other EVs should still charge normally."""
+        ev_vehicles = [
+            {
+                "name": "ex90",
+                "power_w": 0,
+                "status": "connected",
+                "connected": True,
+                "vehicle_soc": 100,  # At target — should stop
+                "vehicle_capacity_kwh": 111,
+                "vehicle_target_soc": 100,
+                "vehicle_charging_power_w": 0,
+            },
+            {
+                "name": "renault_zoe",
+                "power_w": 7000,
+                "status": "charging",
+                "connected": True,
+                "vehicle_soc": 50,  # Needs charging
+                "vehicle_capacity_kwh": 52,
+                "vehicle_target_soc": 100,
+                "vehicle_charging_power_w": 7000,
+            },
+        ]
+
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.05] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicles,
+        )
+
+        actions = result["immediate_actions"]
+        # EX90 should stop (at target)
+        ex90_stop = [a for a in actions if a["service"] == "switch.turn_off"
+                     and "ex90" in a.get("entity_id", "")]
+        assert len(ex90_stop) >= 1, "EX90 should stop at target"
+
+        # Renault Zoe should charge (cheap price, needs energy)
+        zoe_start = [a for a in actions if a["service"] == "switch.turn_on"
+                     and "renault_zoe" in a.get("entity_id", "")]
+        assert len(zoe_start) >= 1, "Zoe should charge when price is cheap"
+
+    # ------------------------------------------------------------------
+    # Weekend target SoC
+    # ------------------------------------------------------------------
+
+    def test_weekend_lower_target_stops_charger(
+        self, default_params, default_outputs, ev_vehicle_ex90_at_80
+    ):
+        """On weekends, charger should stop at ev_weekend_target_soc (80%)
+        even though vehicle target is 100%."""
+        # Patch to Saturday
+        fake_saturday = datetime(2025, 1, 4, 0, 0, 0)  # Saturday
+        with patch(
+            "custom_components.home_energy_management.optimizer.datetime"
+        ) as mock_dt:
+            mock_dt.now.return_value = fake_saturday
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            opt = Optimizer(default_params, default_outputs)
+            prices = {
+                "today": [0.05] * 24,
+                "tomorrow": [],
+                "currency": "SEK",
+            }
+
+            result = opt.optimize(
+                prices=prices,
+                predicted_consumption=[1.0] * 24,
+                battery_soc=50,
+                ev_connected=True,
+                ev_vehicles=ev_vehicle_ex90_at_80,
+            )
+
+        actions = result["immediate_actions"]
+        # Weekend + SoC=80% >= weekend_target=80% → stop
+        ev_stop = [a for a in actions if a["service"] == "switch.turn_off"
+                   and "ex90" in a.get("entity_id", "")]
+        assert len(ev_stop) >= 1, "Should stop at weekend target (80%)"
+
+    def test_weekday_charges_to_full_target(
+        self, default_params, default_outputs, ev_vehicle_ex90_at_80
+    ):
+        """On weekdays, charger should continue past 80% toward 100%."""
+        # Default freeze_time is Monday — weekday
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.05] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle_ex90_at_80,
+        )
+
+        actions = result["immediate_actions"]
+        # Weekday + SoC=80% < target=100% + cheap price → should charge
+        ev_start = [a for a in actions if a["service"] == "switch.turn_on"
+                    and "ex90" in a.get("entity_id", "")]
+        assert len(ev_start) >= 1, "Weekday should charge past 80% toward 100%"
+
+    def test_weekend_negative_price_overrides_target(
+        self, default_params, default_outputs, ev_vehicle_ex90_at_80
+    ):
+        """On weekends, negative prices should override the weekend target —
+        charge to full vehicle target (we get paid to consume)."""
+        fake_saturday = datetime(2025, 1, 4, 0, 0, 0)  # Saturday
+        with patch(
+            "custom_components.home_energy_management.optimizer.datetime"
+        ) as mock_dt:
+            mock_dt.now.return_value = fake_saturday
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            opt = Optimizer(default_params, default_outputs)
+            prices = {
+                "today": [-0.20] * 3 + [0.50] * 21,
+                "tomorrow": [],
+                "currency": "SEK",
+            }
+
+            result = opt.optimize(
+                prices=prices,
+                predicted_consumption=[1.0] * 24,
+                battery_soc=50,
+                ev_connected=True,
+                ev_vehicles=ev_vehicle_ex90_at_80,
+            )
+
+        actions = result["immediate_actions"]
+        # Negative price + SoC=80% < vehicle_target=100% → keep charging
+        ev_start = [a for a in actions if a["service"] == "switch.turn_on"
+                    and "ex90" in a.get("entity_id", "")]
+        assert len(ev_start) >= 1, (
+            "Negative price should override weekend target and charge to full"
+        )
+
+    def test_weekend_reduces_scheduled_kwh(
+        self, default_params, default_outputs, ev_vehicle_ex90_charging
+    ):
+        """On weekends, the scheduled kWh should be less (lower target)."""
+        fake_saturday = datetime(2025, 1, 4, 0, 0, 0)
+        with patch(
+            "custom_components.home_energy_management.optimizer.datetime"
+        ) as mock_dt:
+            mock_dt.now.return_value = fake_saturday
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            opt = Optimizer(default_params, default_outputs)
+            prices = {
+                "today": [0.50] * 24,
+                "tomorrow": [],
+                "currency": "SEK",
+            }
+
+            result_weekend = opt.optimize(
+                prices=prices,
+                predicted_consumption=[1.0] * 24,
+                battery_soc=50,
+                ev_connected=True,
+                ev_vehicles=ev_vehicle_ex90_charging,
+            )
+
+        # Weekday result (using default Monday freeze_time)
+        opt2 = Optimizer(default_params, default_outputs)
+        result_weekday = opt2.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle_ex90_charging,
+        )
+
+        weekend_kwh = result_weekend["ev_charge_schedule"]["total_kwh_needed"]
+        weekday_kwh = result_weekday["ev_charge_schedule"]["total_kwh_needed"]
+
+        # Weekend: (80-50)/100 * 111 = 33.3 kWh
+        # Weekday: (100-50)/100 * 111 = 55.5 kWh
+        assert weekend_kwh < weekday_kwh, (
+            f"Weekend ({weekend_kwh}) should need less kWh than weekday ({weekday_kwh})"
+        )
+
+    # ------------------------------------------------------------------
+    # Night preference
+    # ------------------------------------------------------------------
+
+    def test_night_hours_preferred_over_same_price_day(
+        self, default_params, default_outputs
+    ):
+        """When night and day hours have similar prices, night should be chosen."""
+        ev_vehicle = [{
+            "name": "ex90",
+            "power_w": 11000,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 90,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 11000,
+        }]
+
+        opt = Optimizer(default_params, default_outputs)
+
+        # Flat prices all day — night preference should be the tiebreaker
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [h["hour"] for h in plan["schedule"] if h["charging"]]
+
+        # With flat prices, night hours (0-5, 22-23) should be preferred
+        night_hours = {h for h in charging_hours if h >= 22 or h < 6}
+        assert len(night_hours) > 0, (
+            f"Night hours should be preferred with flat prices, got: {charging_hours}"
+        )
+
+    def test_cheap_day_hour_beats_expensive_night(
+        self, default_params, default_outputs
+    ):
+        """A significantly cheaper daytime hour should still beat an
+        expensive night hour (price dominates over night bonus)."""
+        ev_vehicle = [{
+            "name": "ex90",
+            "power_w": 11000,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 98,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 11000,
+        }]
+
+        opt = Optimizer(default_params, default_outputs)
+
+        # Night hours at 1.00, but hour 12 at 0.10 — day hour should win
+        prices = {
+            "today": [1.00] * 12 + [0.10] + [1.00] * 11,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [h["hour"] for h in plan["schedule"] if h["charging"]]
+
+        # Hour 12 at 0.10 should be selected (much cheaper than night at 1.00)
+        assert 12 in charging_hours, (
+            f"Cheap daytime hour (0.10) should beat expensive night (1.00), "
+            f"got: {charging_hours}"
+        )
+
+    # ------------------------------------------------------------------
+    # Grid minimization: avoids peak hours
+    # ------------------------------------------------------------------
+
+    def test_ev_scheduling_avoids_expensive_discharge_hours(
+        self, default_params, default_outputs
+    ):
+        """EV schedule should not overlap with battery discharge hours
+        to avoid pulling from grid during peak prices."""
+        ev_vehicle = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 80,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+        }]
+
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.10] * 6 + [2.00] * 12 + [0.10] * 6,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle,
+        )
+
+        discharge_hours = {
+            h["hour"] for h in result["hourly_plan"]
+            if h["action"] == ACTION_DISCHARGE_BATTERY
+        }
+
+        ev_schedule = result["ev_charge_schedule"]["schedule"]
+        ev_charging_hours = {h["hour"] for h in ev_schedule if h["charging"]}
+
+        overlap = discharge_hours & ev_charging_hours
+        assert len(overlap) == 0, (
+            f"EV should not charge during discharge hours. Overlap: {overlap}"
+        )
+
+    def test_ramp_down_weekend_and_night_combined(
+        self, default_params, default_outputs
+    ):
+        """Combined scenario: weekend + night preference + ramp-down.
+        Car at 85% on Saturday → should stop (above weekend target 80%)."""
+        ev_vehicle = [{
+            "name": "ex90",
+            "power_w": 3000,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 85,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 3000,
+        }]
+
+        fake_saturday = datetime(2025, 1, 4, 2, 0, 0)  # Saturday 02:00
+        with patch(
+            "custom_components.home_energy_management.optimizer.datetime"
+        ) as mock_dt:
+            mock_dt.now.return_value = fake_saturday
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            opt = Optimizer(default_params, default_outputs)
+            prices = {
+                "today": [0.05] * 24,
+                "tomorrow": [],
+                "currency": "SEK",
+            }
+
+            result = opt.optimize(
+                prices=prices,
+                predicted_consumption=[1.0] * 24,
+                battery_soc=50,
+                ev_connected=True,
+                ev_vehicles=ev_vehicle,
+            )
+
+        actions = result["immediate_actions"]
+        # Saturday, SoC=85% > weekend_target=80% → stop
+        ev_stop = [a for a in actions if a["service"] == "switch.turn_off"
+                   and "ex90" in a.get("entity_id", "")]
+        assert len(ev_stop) >= 1, "Should stop at weekend — SoC above weekend target"
+
+        # EV schedule should also show reduced kwh (or 0)
+        ev_plan = result["ev_charge_schedule"]
+        assert ev_plan["total_kwh_needed"] == 0, (
+            "No kWh needed when SoC >= weekend target"
+        )

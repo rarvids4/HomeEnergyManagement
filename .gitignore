@@ -17,3 +17,11 @@ secrets.yaml
 check_ssh.py
 deploy.py
 ha_deploy_commands.sh
+check_entities.py
+debug_apexcharts.py
+diagnose_crash.py
+diagnose_crash2.py
+diagnose_crash3.py
+diagnose_ha.py
+force_update_hacs.py
+rename_renault_entities.py

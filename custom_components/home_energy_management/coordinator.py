@@ -254,6 +254,12 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             vehicle_target_soc = self._get_state_float(charger.get("vehicle_target_soc"))
             vehicle_charging_power = self._get_state_float(charger.get("vehicle_charging_power"))
 
+            # Fallbacks for vehicles whose APIs report "unknown" when sleeping
+            if vehicle_capacity <= 0:
+                vehicle_capacity = float(charger.get("vehicle_capacity_kwh_fallback", 0))
+            if vehicle_charging_power <= 0:
+                vehicle_charging_power = float(charger.get("vehicle_charging_power_fallback", 0))
+
             total_ev_power += power_w
             if is_connected:
                 ev_any_connected = True

@@ -1813,8 +1813,14 @@ class TestEVChargePlanning:
                     f"EV should not charge during discharge hour {entry['hour']}"
                 )
 
-    def test_ev_no_schedule_when_disconnected(self, default_params, default_outputs):
-        """No EV charge plan when EV is not connected."""
+    def test_ev_schedule_created_even_when_disconnected(
+        self, default_params, default_outputs
+    ):
+        """Disconnected vehicles should still be scheduled (plan preview).
+
+        Immediate actions won't issue start/stop for disconnected
+        chargers, but the schedule should show when they *would* charge.
+        """
         ev_disconnected = [{
             "name": "ex90",
             "power_w": 0,
@@ -1842,7 +1848,10 @@ class TestEVChargePlanning:
 
         plan = result["ev_charge_schedule"]
         charging_hours = [h for h in plan["schedule"] if h["charging"]]
-        assert len(charging_hours) == 0
+        # (95-50)/100 * 111 = 49.95 kWh → ceil(49.95/7) = 8 hours
+        assert len(charging_hours) > 0, "Disconnected vehicles should still be scheduled"
+        assert plan["vehicles"][0]["connected"] is False
+        assert plan["vehicles"][0]["kwh_needed"] > 0
 
     def test_ev_charging_hours_match_energy_need(
         self, default_params, default_outputs, ev_vehicle_ex90

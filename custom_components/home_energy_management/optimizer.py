@@ -533,16 +533,19 @@ class Optimizer:
                 target = self.ev_weekend_target_soc
 
             # Determine charging power (kW)
+            # Use vehicle_charging_power_w when connected, else fall
+            # back to the charger's rated power (power_w) for planning.
             charging_kw = (charging_w / 1000.0) if charging_w > 0 else (
                 ev.get("power_w", 7000) / 1000.0
             )
             if charging_kw <= 0:
                 charging_kw = 7.0  # fallback
 
-            # Skip vehicles that don't need charging
+            # Schedule any vehicle that needs energy — even if
+            # disconnected.  The schedule is a *plan*; immediate
+            # actions still gate on the connected state.
             needs_charge = (
-                connected
-                and soc > 0
+                soc > 0
                 and capacity > 0
                 and soc < target
             )

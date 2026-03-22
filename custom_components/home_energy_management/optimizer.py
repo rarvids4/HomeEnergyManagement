@@ -622,6 +622,27 @@ class Optimizer:
     # Service call builder
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _stop_forced_cmd(sg_out: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build action(s) to reset the forced charge/discharge command to Stop.
+
+        When switching from a forced mode (charge/discharge) to
+        self-consumption, the Sungrow inverter may keep the previous
+        forced command latched.  Explicitly setting the input_select
+        to "Stop (default)" clears it so self-consumption works.
+        """
+        actions: list[dict[str, Any]] = []
+        entity = sg_out.get("battery_mode_select")
+        options = sg_out.get("battery_mode_options", {})
+        stop_option = options.get("stop")
+        if entity and stop_option:
+            actions.append({
+                "service": "input_select.select_option",
+                "entity_id": entity,
+                "data": {"option": stop_option},
+            })
+        return actions
+
     def _build_immediate_actions(
         self,
         action: str,
@@ -668,6 +689,8 @@ class Optimizer:
                         "entity_id": cfg["entity_id"],
                         "data": {},
                     })
+                # Explicitly clear forced charge/discharge command
+                actions.extend(self._stop_forced_cmd(sg_out))
                 # Reset forced power to 0 (not in forced mode)
                 pwr_cfg = sg_out.get("set_forced_power", {})
                 if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
@@ -733,6 +756,8 @@ class Optimizer:
                         "entity_id": cfg["entity_id"],
                         "data": {},
                     })
+                # Explicitly clear forced charge/discharge command
+                actions.extend(self._stop_forced_cmd(sg_out))
                 # Reset forced power to 0 (self-consumption handles it)
                 pwr_cfg = sg_out.get("set_forced_power", {})
                 if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
@@ -750,6 +775,8 @@ class Optimizer:
                         "entity_id": cfg["entity_id"],
                         "data": {},
                     })
+                # Explicitly clear forced charge/discharge command
+                actions.extend(self._stop_forced_cmd(sg_out))
                 # Reset forced power to 0 (not in forced mode)
                 pwr_cfg = sg_out.get("set_forced_power", {})
                 if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):

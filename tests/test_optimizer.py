@@ -569,6 +569,14 @@ class TestForcedPowerSetting:
             "max": 5000,
             "step": 100,
         }
+        default_outputs["sungrow"]["battery_mode_select"] = (
+            "input_select.set_sg_battery_forced_charge_discharge_cmd"
+        )
+        default_outputs["sungrow"]["battery_mode_options"] = {
+            "stop": "Stop (default)",
+            "force_charge": "Forced charge",
+            "force_discharge": "Forced discharge",
+        }
         return default_outputs
 
     def test_discharge_resets_forced_power(
@@ -770,6 +778,192 @@ class TestForcedPowerSetting:
         ]
         assert len(power_actions) == 0, (
             "No forced power action should be generated without config"
+        )
+
+    def test_discharge_clears_forced_cmd(
+        self, default_params, outputs_with_forced_power, freeze_time
+    ):
+        """When switching to self-consumption for discharge, the forced
+        charge/discharge command must be explicitly set to Stop."""
+        freeze_time.now.return_value = datetime(2025, 1, 6, 6, 0, 0)
+        opt = Optimizer(default_params, outputs_with_forced_power)
+
+        prices = {
+            "today": [0.10] * 6 + [1.50] * 6 + [0.10] * 12,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=80,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_DISCHARGE_BATTERY
+
+        actions = result["immediate_actions"]
+        stop_actions = [
+            a for a in actions
+            if a.get("entity_id") == "input_select.set_sg_battery_forced_charge_discharge_cmd"
+        ]
+        assert len(stop_actions) == 1, (
+            "Discharge should explicitly clear forced cmd"
+        )
+        assert stop_actions[0]["data"]["option"] == "Stop (default)"
+
+    def test_self_consumption_clears_forced_cmd(
+        self, default_params, outputs_with_forced_power, freeze_time
+    ):
+        """Normal self-consumption hours should also clear the forced cmd."""
+        freeze_time.now.return_value = datetime(2025, 1, 6, 12, 0, 0)
+        opt = Optimizer(default_params, outputs_with_forced_power)
+
+        # Flat prices → self_consumption
+        prices = {
+            "today": [1.00] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_SELF_CONSUMPTION
+
+        actions = result["immediate_actions"]
+        stop_actions = [
+            a for a in actions
+            if a.get("entity_id") == "input_select.set_sg_battery_forced_charge_discharge_cmd"
+        ]
+        assert len(stop_actions) == 1, (
+            "Self-consumption should explicitly clear forced cmd"
+        )
+        assert stop_actions[0]["data"]["option"] == "Stop (default)"
+
+    def test_maximize_load_clears_forced_cmd(
+        self, default_params, outputs_with_forced_power
+    ):
+        """Negative price (maximize_load) should clear the forced cmd."""
+        opt = Optimizer(default_params, outputs_with_forced_power)
+
+        prices = {
+            "today": [-0.10] * 3 + [0.80] * 21,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_MAXIMIZE_LOAD
+
+        actions = result["immediate_actions"]
+        stop_actions = [
+            a for a in actions
+            if a.get("entity_id") == "input_select.set_sg_battery_forced_charge_discharge_cmd"
+        ]
+        assert len(stop_actions) == 1, (
+            "Maximize load should explicitly clear forced cmd"
+        )
+        assert stop_actions[0]["data"]["option"] == "Stop (default)"
+
+    def test_pre_discharge_does_not_clear_forced_cmd(
+        self, default_params, outputs_with_forced_power
+    ):
+        """Pre-discharge uses forced discharge mode → should NOT set Stop."""
+        opt = Optimizer(default_params, outputs_with_forced_power)
+
+        prices = {
+            "today": [0.50, -0.10, -0.20] + [0.80] * 21,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=80,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_PRE_DISCHARGE
+
+        actions = result["immediate_actions"]
+        stop_actions = [
+            a for a in actions
+            if a.get("entity_id") == "input_select.set_sg_battery_forced_charge_discharge_cmd"
+        ]
+        assert len(stop_actions) == 0, (
+            "Pre-discharge uses forced mode, should NOT clear forced cmd"
+        )
+
+    def test_charge_does_not_clear_forced_cmd(
+        self, default_params, outputs_with_forced_power
+    ):
+        """Charge uses forced charge mode → should NOT set Stop."""
+        opt = Optimizer(default_params, outputs_with_forced_power)
+
+        prices = {
+            "today": [0.10] * 6 + [1.50] * 6 + [0.10] * 12,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=30,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_CHARGE_BATTERY
+
+        actions = result["immediate_actions"]
+        stop_actions = [
+            a for a in actions
+            if a.get("entity_id") == "input_select.set_sg_battery_forced_charge_discharge_cmd"
+        ]
+        assert len(stop_actions) == 0, (
+            "Charge uses forced mode, should NOT clear forced cmd"
+        )
+
+    def test_no_stop_cmd_when_config_missing(
+        self, default_params, default_outputs, freeze_time
+    ):
+        """When battery_mode_select is not in config, no stop command generated.
+        This ensures backward compatibility."""
+        freeze_time.now.return_value = datetime(2025, 1, 6, 6, 0, 0)
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [0.10] * 6 + [1.50] * 6 + [0.10] * 12,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=80,
+            ev_connected=False,
+        )
+
+        actions = result["immediate_actions"]
+        stop_actions = [
+            a for a in actions
+            if a.get("service") == "input_select.select_option"
+        ]
+        assert len(stop_actions) == 0, (
+            "No stop cmd action should be generated without config"
         )
 
 

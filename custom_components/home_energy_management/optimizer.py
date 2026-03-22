@@ -665,6 +665,14 @@ class Optimizer:
                         "entity_id": cfg["entity_id"],
                         "data": {},
                     })
+                # Reset forced power to 0 (not in forced mode)
+                pwr_cfg = sg_out.get("set_forced_power", {})
+                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                    actions.append({
+                        "service": pwr_cfg["service"],
+                        "entity_id": pwr_cfg["entity_id"],
+                        "data": {"value": 0},
+                    })
 
             elif action == ACTION_PRE_DISCHARGE:
                 # Discharge battery to make room before negative prices
@@ -675,13 +683,21 @@ class Optimizer:
                         "entity_id": cfg["entity_id"],
                         "data": {},
                     })
-                # Ramp discharge power to maximum
-                pwr_cfg = sg_out.get("set_discharge_power", {})
+                # Set forced charge/discharge power to maximum
+                pwr_cfg = sg_out.get("set_forced_power", {})
                 if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
                     actions.append({
                         "service": pwr_cfg["service"],
                         "entity_id": pwr_cfg["entity_id"],
                         "data": {"value": pwr_cfg.get("max", 5000)},
+                    })
+                # Also set max discharge power limit
+                pwr_limit = sg_out.get("set_discharge_power", {})
+                if pwr_limit.get("service") and pwr_limit.get("entity_id"):
+                    actions.append({
+                        "service": pwr_limit["service"],
+                        "entity_id": pwr_limit["entity_id"],
+                        "data": {"value": pwr_limit.get("max", 5000)},
                     })
 
             elif action == ACTION_CHARGE_BATTERY:
@@ -692,6 +708,14 @@ class Optimizer:
                         "entity_id": cfg["entity_id"],
                         "data": {},
                     })
+                # Set forced charge/discharge power to maximum
+                pwr_cfg = sg_out.get("set_forced_power", {})
+                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                    actions.append({
+                        "service": pwr_cfg["service"],
+                        "entity_id": pwr_cfg["entity_id"],
+                        "data": {"value": pwr_cfg.get("max", 5000)},
+                    })
 
             elif action == ACTION_DISCHARGE_BATTERY:
                 cfg = sg_out.get("force_discharge", {})
@@ -701,6 +725,14 @@ class Optimizer:
                         "entity_id": cfg["entity_id"],
                         "data": {},
                     })
+                # Set forced charge/discharge power to maximum
+                pwr_cfg = sg_out.get("set_forced_power", {})
+                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                    actions.append({
+                        "service": pwr_cfg["service"],
+                        "entity_id": pwr_cfg["entity_id"],
+                        "data": {"value": pwr_cfg.get("max", 5000)},
+                    })
 
             else:
                 cfg = sg_out.get("self_consumption", {})
@@ -709,6 +741,14 @@ class Optimizer:
                         "service": cfg["service"],
                         "entity_id": cfg["entity_id"],
                         "data": {},
+                    })
+                # Reset forced power to 0 (not in forced mode)
+                pwr_cfg = sg_out.get("set_forced_power", {})
+                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                    actions.append({
+                        "service": pwr_cfg["service"],
+                        "entity_id": pwr_cfg["entity_id"],
+                        "data": {"value": 0},
                     })
 
         # ---------------------------------------------------------------

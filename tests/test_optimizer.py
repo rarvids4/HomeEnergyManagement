@@ -549,6 +549,219 @@ class TestNegativePriceOptimization:
         )
 
 
+class TestForcedPowerSetting:
+    """Tests that the optimizer sets forced charge/discharge power correctly."""
+
+    @pytest.fixture
+    def outputs_with_forced_power(self, default_outputs):
+        """Outputs config that includes set_forced_power entry."""
+        default_outputs["sungrow"]["set_forced_power"] = {
+            "service": "input_number.set_value",
+            "entity_id": "input_number.set_sg_forced_charge_discharge_power",
+            "min": 0,
+            "max": 5000,
+            "step": 100,
+        }
+        default_outputs["sungrow"]["set_discharge_power"] = {
+            "service": "input_number.set_value",
+            "entity_id": "input_number.set_sg_battery_max_discharge_power",
+            "min": 10,
+            "max": 5000,
+            "step": 100,
+        }
+        return default_outputs
+
+    def test_discharge_sets_forced_power_to_max(
+        self, default_params, outputs_with_forced_power
+    ):
+        """When discharging, forced power should be set to max."""
+        opt = Optimizer(default_params, outputs_with_forced_power)
+
+        prices = {
+            "today": [0.10] * 6 + [1.50] * 6 + [0.10] * 12,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=80,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] in (ACTION_CHARGE_BATTERY, ACTION_SELF_CONSUMPTION)
+
+        actions = result["immediate_actions"]
+        power_actions = [
+            a for a in actions
+            if a["entity_id"] == "input_number.set_sg_forced_charge_discharge_power"
+        ]
+        # Current hour is cheap → self_consumption or charge → power should be
+        # set to 0 (self_consumption) or max (charge)
+        assert len(power_actions) == 1
+
+    def test_discharge_hour_sets_power_5000(
+        self, default_params, outputs_with_forced_power, freeze_time
+    ):
+        """When current hour is expensive and action is discharge,
+        forced power should be set to 5000."""
+        # Set time to hour 6 (will be the expensive hour)
+        freeze_time.now.return_value = datetime(2025, 1, 6, 6, 0, 0)
+        opt = Optimizer(default_params, outputs_with_forced_power)
+
+        prices = {
+            "today": [0.10] * 6 + [1.50] * 6 + [0.10] * 12,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=80,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_DISCHARGE_BATTERY
+
+        actions = result["immediate_actions"]
+        power_actions = [
+            a for a in actions
+            if a["entity_id"] == "input_number.set_sg_forced_charge_discharge_power"
+        ]
+        assert len(power_actions) == 1
+        assert power_actions[0]["data"]["value"] == 5000
+
+    def test_charge_hour_sets_power_5000(
+        self, default_params, outputs_with_forced_power
+    ):
+        """When current hour is cheap and action is charge,
+        forced power should be set to max."""
+        opt = Optimizer(default_params, outputs_with_forced_power)
+
+        prices = {
+            "today": [0.10] * 6 + [1.50] * 6 + [0.10] * 12,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=30,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_CHARGE_BATTERY
+
+        actions = result["immediate_actions"]
+        power_actions = [
+            a for a in actions
+            if a["entity_id"] == "input_number.set_sg_forced_charge_discharge_power"
+        ]
+        assert len(power_actions) == 1
+        assert power_actions[0]["data"]["value"] == 5000
+
+    def test_self_consumption_resets_forced_power_to_zero(
+        self, default_params, outputs_with_forced_power, freeze_time
+    ):
+        """When switching to self-consumption, forced power should be reset to 0."""
+        # Set time to a mid-price hour
+        freeze_time.now.return_value = datetime(2025, 1, 6, 12, 0, 0)
+        opt = Optimizer(default_params, outputs_with_forced_power)
+
+        # Flat prices → self_consumption
+        prices = {
+            "today": [1.00] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_SELF_CONSUMPTION
+
+        actions = result["immediate_actions"]
+        power_actions = [
+            a for a in actions
+            if a["entity_id"] == "input_number.set_sg_forced_charge_discharge_power"
+        ]
+        assert len(power_actions) == 1
+        assert power_actions[0]["data"]["value"] == 0
+
+    def test_pre_discharge_sets_forced_power_and_limit(
+        self, default_params, outputs_with_forced_power
+    ):
+        """Pre-discharge should set both forced power and max discharge limit."""
+        opt = Optimizer(default_params, outputs_with_forced_power)
+
+        prices = {
+            "today": [0.50, -0.10, -0.20] + [0.80] * 21,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=80,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_PRE_DISCHARGE
+
+        actions = result["immediate_actions"]
+        # Should set forced power
+        forced_pwr = [
+            a for a in actions
+            if a["entity_id"] == "input_number.set_sg_forced_charge_discharge_power"
+        ]
+        assert len(forced_pwr) == 1
+        assert forced_pwr[0]["data"]["value"] == 5000
+
+        # Should also set max discharge limit
+        limit_pwr = [
+            a for a in actions
+            if a["entity_id"] == "input_number.set_sg_battery_max_discharge_power"
+        ]
+        assert len(limit_pwr) == 1
+        assert limit_pwr[0]["data"]["value"] == 5000
+
+    def test_no_forced_power_when_config_missing(
+        self, default_params, default_outputs
+    ):
+        """When set_forced_power is not in config, no power action should be added.
+        This ensures backward compatibility."""
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [0.10] * 6 + [1.50] * 6 + [0.10] * 12,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=30,
+            ev_connected=False,
+        )
+
+        actions = result["immediate_actions"]
+        power_actions = [
+            a for a in actions
+            if "forced_charge_discharge_power" in a.get("entity_id", "")
+        ]
+        assert len(power_actions) == 0, (
+            "No forced power action should be generated without config"
+        )
+
+
 class TestSolarSurplusEVCharging:
     """Tests for solar-surplus-aware EV charging."""
 

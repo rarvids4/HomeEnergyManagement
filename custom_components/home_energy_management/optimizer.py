@@ -5,10 +5,12 @@ battery state, and EV connection status, and produces an hour-by-hour
 schedule of actions (charge battery, discharge, start EV, etc.).
 
 Key strategies:
-  - **Negative prices**: Maximize load (charge battery + all EVs).
-    We are literally paid to consume electricity.
+  - **Negative prices**: Self-consumption mode — the battery absorbs
+    any solar surplus (preventing grid export) and EVs charge.
+    We do NOT force-charge from the grid.
   - **Pre-discharge**: When negative prices are approaching in the next
-    few hours, discharge the battery first to create room for free charging.
+    few hours, discharge the battery first to create room so it can
+    absorb surplus during the negative window.
   - **Cheap hours**: Charge battery from grid.
   - **Expensive hours**: Discharge battery to avoid grid import.
   - **Normal hours**: Self-consumption mode.
@@ -231,12 +233,12 @@ class Optimizer:
         if upcoming_prices is None:
             upcoming_prices = []
 
-        # --- 1. NEGATIVE PRICE: maximize consumption ---
+        # --- 1. NEGATIVE PRICE: absorb surplus, charge EVs ---
         if price < 0:
             return (
                 ACTION_MAXIMIZE_LOAD,
-                f"Negative price ({price:.3f}), maximizing load — "
-                f"charge battery + all EVs",
+                f"Negative price ({price:.3f}) — self-consumption "
+                f"(absorb surplus, no grid export) + all EVs ON",
             )
 
         # --- 2. PRE-DISCHARGE before upcoming negative prices ---
@@ -281,9 +283,14 @@ class Optimizer:
         """Rough SoC simulation for planning purposes."""
         # Assume ~2 kW charge/discharge rate per hour as % of capacity
         delta_pct = (2.0 / self.battery_capacity) * 100
+        # Surplus absorption is slower — roughly half of forced charge
+        surplus_delta_pct = (1.0 / self.battery_capacity) * 100
 
-        if action in (ACTION_CHARGE_BATTERY, ACTION_MAXIMIZE_LOAD):
+        if action == ACTION_CHARGE_BATTERY:
             return min(self.max_soc, soc + delta_pct)
+        elif action == ACTION_MAXIMIZE_LOAD:
+            # Self-consumption: battery absorbs surplus only (not grid)
+            return min(self.max_soc, soc + surplus_delta_pct)
         elif action in (ACTION_DISCHARGE_BATTERY, ACTION_PRE_DISCHARGE):
             return max(self.min_soc, soc - delta_pct)
         return soc
@@ -320,21 +327,16 @@ class Optimizer:
         # --- Battery actions (master inverter only, slave follows) ---
         if self.enable_battery:
             if action == ACTION_MAXIMIZE_LOAD:
-                # Negative price → force-charge battery at max power
-                cfg = sg_out.get("force_charge", {})
+                # Negative price → self-consumption mode.
+                # The battery absorbs any solar surplus (prevents grid
+                # export at negative prices) but does NOT force-charge
+                # from the grid.  EVs handle the load maximisation.
+                cfg = sg_out.get("self_consumption", {})
                 if cfg.get("service") and cfg.get("entity_id"):
                     actions.append({
                         "service": cfg["service"],
                         "entity_id": cfg["entity_id"],
                         "data": {},
-                    })
-                # Also ramp charge power to maximum
-                pwr_cfg = sg_out.get("set_charge_power", {})
-                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
-                    actions.append({
-                        "service": pwr_cfg["service"],
-                        "entity_id": pwr_cfg["entity_id"],
-                        "data": {"value": pwr_cfg.get("max", 5000)},
                     })
 
             elif action == ACTION_PRE_DISCHARGE:

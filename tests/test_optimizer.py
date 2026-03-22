@@ -322,8 +322,11 @@ class TestNegativePriceOptimization:
         assert "switch.ex90_charger_enabled" in entity_ids
         assert "switch.renault_zoe_charger_enabled" in entity_ids
 
-    def test_battery_charges_during_negative_prices(self, default_params, default_outputs):
-        """During negative prices, battery should be force-charged."""
+    def test_battery_self_consumption_during_negative_prices(
+        self, default_params, default_outputs
+    ):
+        """During negative prices, battery should be in self-consumption
+        mode — absorbs solar surplus but does NOT force-charge from grid."""
         opt = Optimizer(default_params, default_outputs)
 
         prices = {
@@ -340,12 +343,19 @@ class TestNegativePriceOptimization:
         )
 
         actions = result["immediate_actions"]
-        # Should include force-charge on the battery
-        battery_actions = [
+        # Should use self-consumption (absorb surplus, not force-charge)
+        sc_actions = [
+            a for a in actions
+            if a["entity_id"] == "script.sg_set_self_consumption_mode"
+        ]
+        assert len(sc_actions) == 1, "Battery should be in self-consumption during negative prices"
+
+        # Should NOT force-charge from grid
+        fc_actions = [
             a for a in actions
             if a["entity_id"] == "script.sg_set_forced_charge_battery_mode"
         ]
-        assert len(battery_actions) == 1
+        assert len(fc_actions) == 0, "Should NOT force-charge from grid during negative prices"
 
     def test_pre_discharge_before_negative_window(self, default_params, default_outputs):
         """Battery should be discharged in hours preceding a negative price window."""

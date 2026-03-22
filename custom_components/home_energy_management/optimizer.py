@@ -139,6 +139,9 @@ class Optimizer:
         max_price = max(horizon_prices) if horizon_prices else 0
         price_spread = max_price - min_price
 
+        # Save initial SoC for post-processing (capacity-aware discharge limiting)
+        initial_soc = battery_soc
+
         # Classify each hour with look-ahead for negative prices
         hourly_plan = []
         immediate_actions = []
@@ -172,6 +175,16 @@ class Optimizer:
 
             # Simulate SoC changes for future hours
             battery_soc = self._simulate_soc_change(battery_soc, action)
+
+        # --- Post-processing: SoC-aware discharge limiting ---
+        # The classification above may have planned more discharge hours
+        # than the battery can actually cover.  We rank discharge hours
+        # by price (most expensive first) and only keep the top-N that
+        # the available battery capacity can sustain.  The rest become
+        # self_consumption.
+        hourly_plan = self._limit_discharge_to_capacity(
+            hourly_plan, initial_soc, predicted_consumption
+        )
 
         # Build immediate actions (only for the current hour)
         if hourly_plan:
@@ -310,6 +323,92 @@ class Optimizer:
             return ACTION_DISCHARGE_BATTERY, f"Expensive price ({price:.2f}), discharging battery"
 
         return ACTION_SELF_CONSUMPTION, f"Normal price ({price:.2f}), self-consumption mode"
+
+    # ------------------------------------------------------------------
+    # SoC-aware discharge limiting
+    # ------------------------------------------------------------------
+
+    def _limit_discharge_to_capacity(
+        self,
+        hourly_plan: list[dict[str, Any]],
+        initial_soc: float,
+        predicted_consumption: list[float],
+    ) -> list[dict[str, Any]]:
+        """Limit discharge hours to what the battery can actually cover.
+
+        Walks through the plan chronologically, tracking SoC.  Collects
+        all ``discharge_battery`` hours, ranks them by price (most
+        expensive first), and only retains the top-N that the battery
+        can sustain.  The rest are downgraded to ``self_consumption``.
+
+        This ensures the battery is "saved" for the truly peak-price
+        hours rather than being emptied across too many discharge slots.
+        """
+        if not self.enable_battery:
+            return hourly_plan
+
+        # Gather indices of all discharge_battery hours with their prices
+        discharge_indices = [
+            (i, entry["price"])
+            for i, entry in enumerate(hourly_plan)
+            if entry["action"] == ACTION_DISCHARGE_BATTERY
+        ]
+
+        if len(discharge_indices) <= 1:
+            # Zero or one discharge hour — nothing to optimise
+            return hourly_plan
+
+        # Sort by price descending → most expensive first
+        discharge_indices.sort(key=lambda x: x[1], reverse=True)
+
+        # Calculate available energy (kWh) the battery can deliver
+        available_kwh = (initial_soc - self.min_soc) / 100.0 * self.battery_capacity
+        if available_kwh <= 0:
+            # Nothing to discharge — downgrade all discharge hours
+            for idx, _ in discharge_indices:
+                hourly_plan[idx]["action"] = ACTION_SELF_CONSUMPTION
+                hourly_plan[idx]["reason"] = (
+                    f"Battery depleted (SoC {initial_soc:.0f}%) — "
+                    f"self-consumption (was discharge at {hourly_plan[idx]['price']:.2f})"
+                )
+            return hourly_plan
+
+        # Walk through discharge hours most-expensive-first, deducting
+        # predicted consumption.  Once the budget is exhausted the
+        # remaining (cheaper) hours are downgraded.
+        keep_set: set[int] = set()
+        remaining_kwh = available_kwh
+
+        for idx, price in discharge_indices:
+            # How much energy this hour needs (predicted consumption)
+            consumption = (
+                predicted_consumption[idx]
+                if idx < len(predicted_consumption)
+                else 1.0
+            )
+            # Minimum 0.5 kWh per discharge hour for planning safety
+            hour_need = max(consumption, 0.5)
+
+            if remaining_kwh >= hour_need:
+                keep_set.add(idx)
+                remaining_kwh -= hour_need
+            else:
+                # Not enough battery left — downgrade to self_consumption
+                hourly_plan[idx]["action"] = ACTION_SELF_CONSUMPTION
+                hourly_plan[idx]["reason"] = (
+                    f"Battery capacity limited — self-consumption "
+                    f"(price {price:.2f}, saving battery for more expensive hours)"
+                )
+
+        _LOGGER.debug(
+            "Discharge limiting: %d/%d hours retained, %.1f/%.1f kWh used",
+            len(keep_set),
+            len(discharge_indices),
+            available_kwh - remaining_kwh,
+            available_kwh,
+        )
+
+        return hourly_plan
 
     # ------------------------------------------------------------------
     # SoC simulation

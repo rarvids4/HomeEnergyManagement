@@ -948,3 +948,248 @@ class TestSolarSurplusBatteryCharging:
             if a["entity_id"] == "script.sg_set_forced_discharge_battery_mode"
         ]
         assert len(fd_actions) == 0
+
+
+class TestSoCAwaredDischarge:
+    """Tests for SoC-aware discharge limiting.
+
+    The optimizer should only plan discharge for the N most expensive
+    hours that the battery can actually cover, based on available
+    capacity (SoC - min_soc) and predicted consumption per hour.
+    """
+
+    def test_discharge_limited_to_battery_capacity(
+        self, default_params, default_outputs
+    ):
+        """With small battery and many expensive hours, only the most
+        expensive should get discharge_battery."""
+        # 5 kWh battery at 60% SoC, min_soc=10%
+        # Available: (60-10)/100 * 5 = 2.5 kWh
+        # With 1 kWh/hour consumption, only ~2 hours of discharge
+        outputs = {**default_outputs}
+        outputs["sungrow"] = {**default_outputs["sungrow"], "capacity_kwh": 5.0}
+        opt = Optimizer(default_params, outputs)
+
+        # 6 cheap hours then 6 expensive hours (1.20-1.70), rest mid
+        prices = {
+            "today": [0.10, 0.12, 0.15, 0.11, 0.13, 0.14,  # cheap 0-5
+                      0.50, 0.55, 0.60, 0.65,                # mid 6-9
+                      0.70, 0.75,                              # mid-high 10-11
+                      1.20, 1.40, 1.70, 1.50, 1.30, 1.25,    # expensive 12-17
+                      0.80, 0.70, 0.60, 0.50, 0.40, 0.30],   # declining 18-23
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=60,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
+
+        # With only 2.5 kWh available and 1 kWh/h consumption,
+        # should NOT discharge for all 6 expensive hours
+        assert len(discharge_hours) <= 4, (
+            f"Expected limited discharge hours, got {len(discharge_hours)}"
+        )
+
+        # The most expensive hour (1.70 at index 14) MUST be among the kept
+        kept_prices = [h["price"] for h in discharge_hours]
+        assert 1.70 in kept_prices, "Most expensive hour should be prioritized"
+
+    def test_most_expensive_hours_prioritized(
+        self, default_params, default_outputs
+    ):
+        """Discharge hours should be ranked: most expensive get priority."""
+        # 10 kWh battery at 40%, min_soc=10% → available 3.0 kWh
+        opt = Optimizer(default_params, default_outputs)  # capacity=10
+
+        # Expensive hours at indices 8-13 with distinct prices
+        prices = {
+            "today": [0.10, 0.10, 0.10, 0.10, 0.10, 0.10,  # cheap 0-5
+                      0.50, 0.50,                              # mid 6-7
+                      1.50, 1.20, 1.80, 1.60, 1.30, 1.10,    # expensive 8-13
+                      0.50, 0.50, 0.50, 0.50, 0.50, 0.50,    # mid
+                      0.50, 0.50, 0.50, 0.50],
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=40,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
+        kept_prices = sorted([h["price"] for h in discharge_hours], reverse=True)
+
+        # The kept hours should be the most expensive ones
+        if len(discharge_hours) > 0:
+            # Verify 1.80 is retained (the absolute most expensive)
+            assert 1.80 in [h["price"] for h in discharge_hours], (
+                "1.80 SEK hour must be retained"
+            )
+
+    def test_all_discharge_hours_kept_when_sufficient_capacity(
+        self, default_params, default_outputs
+    ):
+        """When battery has plenty of capacity, all discharge hours are kept."""
+        # 10 kWh at 90%, min=10% → 8 kWh available, 1 kWh/h consumption
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [0.10] * 6 + [0.50] * 6 + [1.50, 1.60, 1.70] + [0.50] * 9,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=90,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
+
+        # 3 expensive hours, 8 kWh available → all 3 should be kept
+        assert len(discharge_hours) >= 3, (
+            f"With 8 kWh available, all 3 expensive hours should discharge, "
+            f"got {len(discharge_hours)}"
+        )
+
+    def test_no_discharge_when_battery_depleted(
+        self, default_params, default_outputs
+    ):
+        """At min_soc, no hours should be discharge_battery."""
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [0.10] * 6 + [2.00] * 12 + [0.10] * 6,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=10,  # min_soc
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
+
+        # Battery at min_soc → no discharge (the initial classify already
+        # skips discharge, but the limiter also handles this)
+        assert len(discharge_hours) == 0
+
+    def test_downgraded_hours_become_self_consumption(
+        self, default_params, default_outputs
+    ):
+        """Hours that lose discharge status should become self_consumption
+        with an appropriate reason."""
+        outputs = {**default_outputs}
+        outputs["sungrow"] = {**default_outputs["sungrow"], "capacity_kwh": 5.0}
+        opt = Optimizer(default_params, outputs)
+
+        # Many expensive hours, small battery
+        prices = {
+            "today": [0.10] * 6 + [0.50] * 4 + [1.50, 1.60, 1.70, 1.80, 1.40, 1.30] + [0.50] * 8,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,  # (50-10)/100 * 5 = 2.0 kWh
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+
+        # Some expensive hours should be downgraded to self_consumption
+        downgraded = [
+            h for h in plan
+            if h["action"] == ACTION_SELF_CONSUMPTION
+            and "capacity limited" in h.get("reason", "")
+        ]
+        assert len(downgraded) > 0, "Some hours should be downgraded due to capacity"
+
+    def test_consumption_prediction_affects_discharge_count(
+        self, default_params, default_outputs
+    ):
+        """Higher consumption predictions should reduce the number of
+        affordable discharge hours."""
+        outputs = {**default_outputs}
+        outputs["sungrow"] = {**default_outputs["sungrow"], "capacity_kwh": 10.0}
+        opt = Optimizer(default_params, outputs)
+
+        prices = {
+            "today": [0.10] * 6 + [0.50] * 4 + [1.50, 1.60, 1.70, 1.80, 1.40, 1.30] + [0.50] * 8,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        # Low consumption → more hours affordable
+        result_low = opt.optimize(
+            prices=prices,
+            predicted_consumption=[0.5] * 24,
+            battery_soc=50,  # (50-10)/100*10 = 4.0 kWh
+            ev_connected=False,
+        )
+        # High consumption → fewer hours affordable
+        result_high = opt.optimize(
+            prices=prices,
+            predicted_consumption=[3.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+        )
+
+        low_discharge = len([h for h in result_low["hourly_plan"]
+                            if h["action"] == ACTION_DISCHARGE_BATTERY])
+        high_discharge = len([h for h in result_high["hourly_plan"]
+                             if h["action"] == ACTION_DISCHARGE_BATTERY])
+
+        assert low_discharge >= high_discharge, (
+            f"Lower consumption ({low_discharge} discharge hours) should allow "
+            f"at least as many discharge hours as higher consumption ({high_discharge})"
+        )
+
+    def test_large_battery_covers_all_expensive_hours(self, default_params, default_outputs):
+        """A very large battery should cover all expensive hours without limiting."""
+        outputs = {**default_outputs}
+        outputs["sungrow"] = {**default_outputs["sungrow"], "capacity_kwh": 24.0}
+        opt = Optimizer(default_params, outputs)
+
+        # 6 expensive hours at 1 kWh each → 6 kWh needed
+        # Battery: (80-10)/100*24 = 16.8 kWh available → easily covers all 6
+        prices = {
+            "today": [0.10] * 6 + [0.50] * 6 + [1.50, 1.60, 1.70, 1.80, 1.40, 1.30] + [0.50] * 6,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=80,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
+
+        # All 6 expensive hours should be kept
+        assert len(discharge_hours) >= 6, (
+            f"Large battery should cover all expensive hours, got {len(discharge_hours)}"
+        )

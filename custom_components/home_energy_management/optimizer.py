@@ -43,6 +43,8 @@ from .const import (
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_EV_CHEAP_PRICE_THRESHOLD,
     DEFAULT_EV_TARGET_SOC,
+    DEFAULT_GRID_CHARGE_MAX_PRICE,
+    DEFAULT_GRID_CHARGE_MAX_SOC,
     DEFAULT_MAX_AMPS,
     DEFAULT_MAX_SOC,
     DEFAULT_MIN_AMPS,
@@ -83,6 +85,15 @@ class Optimizer:
         self.min_soc = sg_out.get("min_soc", DEFAULT_MIN_SOC)
         self.max_soc = sg_out.get("max_soc", DEFAULT_MAX_SOC)
         self.battery_capacity = sg_out.get("capacity_kwh", DEFAULT_BATTERY_CAPACITY)
+
+        # Grid charge limits — only pull from grid up to this SoC,
+        # and only when price is below the absolute cap.
+        self.grid_charge_max_soc = params.get(
+            "grid_charge_max_soc", DEFAULT_GRID_CHARGE_MAX_SOC
+        )
+        self.grid_charge_max_price = params.get(
+            "grid_charge_max_price", DEFAULT_GRID_CHARGE_MAX_PRICE
+        )
 
         # EV smart charging thresholds
         self.ev_cheap_price_threshold = params.get(
@@ -352,8 +363,23 @@ class Optimizer:
         # Expensive hour: price is in the top 30%
         expensive_threshold = max_price - price_spread * 0.30
 
-        if self.enable_battery and price <= cheap_threshold and battery_soc < self.max_soc:
-            return ACTION_CHARGE_BATTERY, f"Cheap price ({price:.2f}), charging battery"
+        # Grid charging is limited:
+        #   - Price must be below the absolute cap (grid_charge_max_price)
+        #   - SoC must be below the grid charge target (grid_charge_max_soc)
+        # This prevents filling the battery from the grid when solar
+        # can do it for free during the day.  We only pull enough to
+        # survive the expensive morning/evening peaks.
+        if (
+            self.enable_battery
+            and price <= cheap_threshold
+            and price <= self.grid_charge_max_price
+            and battery_soc < self.grid_charge_max_soc
+        ):
+            return (
+                ACTION_CHARGE_BATTERY,
+                f"Cheap price ({price:.2f} ≤ {self.grid_charge_max_price:.2f}), "
+                f"charging battery (SoC {battery_soc:.0f}% → {self.grid_charge_max_soc}%)",
+            )
 
         if self.enable_battery and price >= expensive_threshold and battery_soc > self.min_soc:
             return ACTION_DISCHARGE_BATTERY, f"Expensive price ({price:.2f}), discharging battery"
@@ -390,8 +416,7 @@ class Optimizer:
             if entry["action"] == ACTION_DISCHARGE_BATTERY
         ]
 
-        if len(discharge_indices) <= 1:
-            # Zero or one discharge hour — nothing to optimise
+        if len(discharge_indices) == 0:
             return hourly_plan
 
         # Sort by price descending → most expensive first
@@ -400,13 +425,17 @@ class Optimizer:
         # Calculate available energy (kWh) the battery can deliver
         available_kwh = (initial_soc - self.min_soc) / 100.0 * self.battery_capacity
         if available_kwh <= 0:
-            # Nothing to discharge — downgrade all discharge hours
+            # Nothing to discharge — downgrade ALL discharge hours
             for idx, _ in discharge_indices:
                 hourly_plan[idx]["action"] = ACTION_SELF_CONSUMPTION
                 hourly_plan[idx]["reason"] = (
                     f"Battery depleted (SoC {initial_soc:.0f}%) — "
                     f"self-consumption (was discharge at {hourly_plan[idx]['price']:.2f})"
                 )
+            return hourly_plan
+
+        if len(discharge_indices) == 1:
+            # Single discharge hour with available energy — keep it
             return hourly_plan
 
         # Walk through discharge hours most-expensive-first, deducting
@@ -630,7 +659,8 @@ class Optimizer:
         surplus_delta_pct = (1.0 / self.battery_capacity) * 100
 
         if action == ACTION_CHARGE_BATTERY:
-            return min(self.max_soc, soc + delta_pct)
+            # Grid charging caps at grid_charge_max_soc (solar fills the rest)
+            return min(self.grid_charge_max_soc, soc + delta_pct)
         elif action == ACTION_MAXIMIZE_LOAD:
             # Self-consumption: battery absorbs surplus only (not grid)
             return min(self.max_soc, soc + surplus_delta_pct)

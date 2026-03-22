@@ -51,6 +51,12 @@ DEFAULT_MIN_SOC = 10  # %
 DEFAULT_MAX_SOC = 100  # %
 DEFAULT_BATTERY_CAPACITY = 10.0  # kWh
 
+# --- Grid charge limits ---
+# Only charge from grid up to this SoC (%) — let solar fill the rest
+DEFAULT_GRID_CHARGE_MAX_SOC = 15  # %
+# Never charge from grid if price exceeds this (SEK/kWh)
+DEFAULT_GRID_CHARGE_MAX_PRICE = 0.40  # SEK/kWh
+
 # --- Charger limits ---
 DEFAULT_MIN_AMPS = 6
 DEFAULT_MAX_AMPS = 32

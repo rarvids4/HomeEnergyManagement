@@ -679,7 +679,7 @@ class TestForcedPowerSetting:
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=30,
+            battery_soc=10,  # below grid_charge_max_soc (15%)
             ev_connected=False,
         )
 
@@ -933,7 +933,7 @@ class TestForcedPowerSetting:
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=30,
+            battery_soc=10,  # below grid_charge_max_soc (15%)
             ev_connected=False,
         )
 
@@ -1248,7 +1248,7 @@ class TestSolarSurplusBatteryCharging:
         result_no_solar = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=30,
+            battery_soc=10,  # below grid_charge_max_soc (15%)
             ev_connected=False,
             grid_export_power=0.0,
         )
@@ -1258,7 +1258,7 @@ class TestSolarSurplusBatteryCharging:
         result_solar = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=30,
+            battery_soc=10,  # below grid_charge_max_soc (15%)
             ev_connected=False,
             grid_export_power=3000.0,  # 3 kW export
         )
@@ -1532,15 +1532,18 @@ class TestSoCAwaredDischarge:
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=10,  # min_soc
+            battery_soc=5,  # below min_soc (10%) — can't discharge OR charge
             ev_connected=False,
         )
 
         plan = result["hourly_plan"]
         discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
 
-        # Battery at min_soc → no discharge (the initial classify already
-        # skips discharge, but the limiter also handles this)
+        # Battery below min_soc → no discharge.  Grid charge target (15%)
+        # is above min_soc, but _classify_hour requires soc < grid_charge_max_soc
+        # AND price ≤ max_price.  Even if 1 charge hour runs (5 → 15%),
+        # the limiter should downgrade any resulting discharge since
+        # initial_soc=5 < min_soc=10 → available_kwh ≤ 0.
         assert len(discharge_hours) == 0
 
     def test_downgraded_hours_become_self_consumption(
@@ -1548,9 +1551,14 @@ class TestSoCAwaredDischarge:
     ):
         """Hours that lose discharge status should become self_consumption
         with an appropriate reason."""
+        params = {
+            **default_params,
+            "grid_charge_max_soc": 100,  # allow full grid charging for this test
+            "grid_charge_max_price": 1.0,
+        }
         outputs = {**default_outputs}
         outputs["sungrow"] = {**default_outputs["sungrow"], "capacity_kwh": 5.0}
-        opt = Optimizer(default_params, outputs)
+        opt = Optimizer(params, outputs)
 
         # Many expensive hours, small battery
         prices = {
@@ -1643,6 +1651,199 @@ class TestSoCAwaredDischarge:
         # All 6 expensive hours should be kept
         assert len(discharge_hours) >= 6, (
             f"Large battery should cover all expensive hours, got {len(discharge_hours)}"
+        )
+
+
+class TestGridChargeLimits:
+    """Tests for grid charge limits — SoC cap and price cap.
+
+    The optimizer should only charge from the grid when:
+    1. Battery SoC is below grid_charge_max_soc (default 15%)
+    2. Price is at or below grid_charge_max_price (default 0.40 SEK/kWh)
+    Both conditions must be met simultaneously.
+    """
+
+    def test_grid_charge_skipped_when_price_too_high(
+        self, default_params, default_outputs
+    ):
+        """No grid charging when all cheap-band prices exceed the price cap."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # All prices above 0.40 SEK → no grid charging even at low SoC
+        prices = {
+            "today": [0.50] * 6 + [1.50] * 12 + [0.50] * 6,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=10,  # below grid_charge_max_soc (15%)
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        charge_hours = [h for h in plan if h["action"] == ACTION_CHARGE_BATTERY]
+
+        assert len(charge_hours) == 0, (
+            f"No grid charging expected when price > 0.40 SEK, "
+            f"got {len(charge_hours)} charge hours"
+        )
+
+    def test_grid_charge_skipped_when_soc_above_target(
+        self, default_params, default_outputs
+    ):
+        """No grid charging when SoC is already at or above grid_charge_max_soc."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Cheap prices in morning but SoC already above 15%.
+        # Evening prices above 0.40 to avoid re-charging after discharge.
+        prices = {
+            "today": [0.10] * 6 + [1.50] * 12 + [0.50] * 6,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=20,  # above grid_charge_max_soc (15%)
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        charge_hours = [h for h in plan if h["action"] == ACTION_CHARGE_BATTERY]
+
+        assert len(charge_hours) == 0, (
+            f"No grid charging expected when SoC ({20}%) >= target ({15}%), "
+            f"got {len(charge_hours)} charge hours"
+        )
+
+    def test_grid_charge_happens_when_both_conditions_met(
+        self, default_params, default_outputs
+    ):
+        """Grid charging should occur when price ≤ 0.40 AND SoC < 15%."""
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [0.10] * 6 + [1.50] * 12 + [0.10] * 6,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=10,  # below grid_charge_max_soc (15%)
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        charge_hours = [h for h in plan if h["action"] == ACTION_CHARGE_BATTERY]
+
+        assert len(charge_hours) >= 1, (
+            "Grid charging expected when price ≤ 0.40 AND SoC < 15%"
+        )
+
+    def test_grid_charge_stops_at_soc_target(
+        self, default_params, default_outputs
+    ):
+        """Grid charging should stop once SoC reaches grid_charge_max_soc,
+        even if more cheap hours are available."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # 6 consecutive very cheap hours — only 1 should be needed to reach 15%
+        prices = {
+            "today": [0.10] * 6 + [1.50] * 12 + [0.10] * 6,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=10,  # 10% → 15% needs only ~0.5 kWh on 10 kWh battery
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        charge_hours = [h for h in plan if h["action"] == ACTION_CHARGE_BATTERY]
+
+        # With a 10 kWh battery at 5 kW charge rate, 1 hour charges
+        # (5/10)*100 = 50%. So just 1 hour is enough to go from 10% to 15%.
+        assert len(charge_hours) <= 2, (
+            f"Expected at most 2 charge hours to reach 15% SoC, "
+            f"got {len(charge_hours)}"
+        )
+
+    def test_grid_charge_limits_configurable(
+        self, default_params, default_outputs
+    ):
+        """Custom grid charge params should override defaults."""
+        params = {
+            **default_params,
+            "grid_charge_max_soc": 50,
+            "grid_charge_max_price": 0.80,
+        }
+        opt = Optimizer(params, default_outputs)
+
+        prices = {
+            "today": [0.60] * 6 + [1.50] * 12 + [0.60] * 6,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=30,  # below custom 50% target, price 0.60 < 0.80
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        charge_hours = [h for h in plan if h["action"] == ACTION_CHARGE_BATTERY]
+
+        assert len(charge_hours) >= 1, (
+            "Grid charging expected with custom params: "
+            "price 0.60 ≤ 0.80 AND SoC 30% < 50%"
+        )
+
+    def test_solar_still_charges_above_grid_target(
+        self, default_params, default_outputs
+    ):
+        """Self-consumption mode should still absorb solar even when SoC > 15%.
+
+        The grid charge limit only restricts forced grid charging, not
+        solar charging via self_consumption mode.
+        """
+        opt = Optimizer(default_params, default_outputs)
+
+        # All prices above 0.40 so no grid charging can occur at any SoC.
+        prices = {
+            "today": [0.50] * 6 + [1.00] * 12 + [0.50] * 6,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,  # above grid target, but solar should still work
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        # Verify self_consumption hours exist (where solar can charge battery)
+        sc_hours = [h for h in plan if h["action"] == ACTION_SELF_CONSUMPTION]
+        assert len(sc_hours) > 0, (
+            "Self-consumption hours should exist to absorb solar "
+            "even when SoC > grid charge target"
+        )
+        # Verify no forced grid charging
+        charge_hours = [h for h in plan if h["action"] == ACTION_CHARGE_BATTERY]
+        assert len(charge_hours) == 0, (
+            f"No forced grid charging at SoC 50% > 15%, got {len(charge_hours)}"
         )
 
 

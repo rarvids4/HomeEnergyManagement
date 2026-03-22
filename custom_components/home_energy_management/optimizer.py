@@ -18,7 +18,10 @@ Key strategies:
     first to create room so it can absorb surplus during the negative
     window.
   - **Cheap hours (no solar)**: Charge battery from grid.
-  - **Expensive hours**: Discharge battery to avoid grid import.
+  - **Expensive hours**: Self-consumption mode — the inverter covers
+    house load from battery automatically, avoiding grid import.
+    This is more efficient and gentler on the battery than forced
+    discharge, which would dump power to the grid unnecessarily.
   - **Normal hours**: Self-consumption mode.
 """
 
@@ -718,20 +721,25 @@ class Optimizer:
                     })
 
             elif action == ACTION_DISCHARGE_BATTERY:
-                cfg = sg_out.get("force_discharge", {})
+                # Expensive hour → self-consumption mode.
+                # The inverter dynamically covers house load from the
+                # battery (second-by-second), avoiding grid import.
+                # This is gentler on the battery than forced discharge
+                # and avoids dumping excess power to the grid.
+                cfg = sg_out.get("self_consumption", {})
                 if cfg.get("service") and cfg.get("entity_id"):
                     actions.append({
                         "service": cfg["service"],
                         "entity_id": cfg["entity_id"],
                         "data": {},
                     })
-                # Set forced charge/discharge power to maximum
+                # Reset forced power to 0 (self-consumption handles it)
                 pwr_cfg = sg_out.get("set_forced_power", {})
                 if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
                     actions.append({
                         "service": pwr_cfg["service"],
                         "entity_id": pwr_cfg["entity_id"],
-                        "data": {"value": pwr_cfg.get("max", 5000)},
+                        "data": {"value": 0},
                     })
 
             else:

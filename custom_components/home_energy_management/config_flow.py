@@ -14,7 +14,15 @@ from .const import CONF_MAPPING_PATH, DEFAULT_MAPPING_PATH, DOMAIN
 
 async def _validate_mapping(hass: HomeAssistant, path: str) -> dict | None:
     """Validate that the mapping file exists and is valid YAML."""
-    abs_path = path if os.path.isabs(path) else os.path.join(hass.config.config_dir, path)
+    if os.path.isabs(path):
+        abs_path = path
+    else:
+        # First try inside the component directory (bundled default)
+        component_dir = os.path.dirname(os.path.abspath(__file__))
+        abs_path = os.path.join(component_dir, path)
+        if not os.path.exists(abs_path):
+            # Fall back to HA config dir
+            abs_path = os.path.join(hass.config.config_dir, path)
 
     def _read():
         with open(abs_path, "r", encoding="utf-8") as fh:

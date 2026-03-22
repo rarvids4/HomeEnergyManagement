@@ -55,6 +55,12 @@ DEFAULT_BATTERY_CAPACITY = 10.0  # kWh
 DEFAULT_MIN_AMPS = 6
 DEFAULT_MAX_AMPS = 32
 
+# --- EV smart charging thresholds ---
+# Always charge EVs when price is below this (SEK/kWh), regardless of battery action
+DEFAULT_EV_CHEAP_PRICE_THRESHOLD = 0.10
+# Charge EVs when grid export exceeds this (W) — absorb solar surplus
+DEFAULT_SOLAR_SURPLUS_THRESHOLD = 2000
+
 # --- Nordpool ---
 DEFAULT_ENTRIES_PER_HOUR = 1  # 1 = hourly prices, 4 = 15-min
 

@@ -263,9 +263,12 @@ class ChargerPlanSensor(EnergyManagementSensor):
     def extra_state_attributes(self) -> dict[str, Any]:
         data = self.coordinator.data or {}
         sensor = data.get("sensor_data", {})
+        ev_power_w = sensor.get("ev_power", 0)
         return {
             "ev_connected": sensor.get("ev_connected", False),
-            "ev_power_kw": sensor.get("ev_power", 0),
+            "ev_power_kw": round(ev_power_w / 1000, 2) if ev_power_w else 0,
+            "ev_power_w": round(ev_power_w, 0),
+            "ev_chargers": sensor.get("ev_chargers", []),
             "ev_status": sensor.get("ev_status", "unknown"),
         }
 

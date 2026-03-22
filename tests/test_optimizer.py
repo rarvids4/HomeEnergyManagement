@@ -498,15 +498,17 @@ class TestNegativePriceOptimization:
         # Price = 0.00 is not negative → should not be maximize_load
         assert plan[0]["action"] != ACTION_MAXIMIZE_LOAD
 
-    def test_evs_stopped_during_pre_discharge_if_connected(
+    def test_evs_charge_during_pre_discharge_when_price_cheap(
         self, default_params, default_outputs
     ):
-        """During pre-discharge, EVs should be stopped to reduce load and
-        help push power back to grid."""
+        """During pre-discharge with cheap prices, EVs should CHARGE —
+        the battery discharges but EVs absorb cheap energy instead of
+        letting it export to grid for pennies."""
         opt = Optimizer(default_params, default_outputs)
 
+        # Hour 0: 0.05 SEK (cheap, positive) with negatives at hour 1-2
         prices = {
-            "today": [0.50, -0.10, -0.20] + [0.80] * 21,
+            "today": [0.05, -0.10, -0.20] + [0.80] * 21,
             "tomorrow": [],
             "currency": "SEK",
         }
@@ -518,7 +520,193 @@ class TestNegativePriceOptimization:
             ev_connected=True,
         )
 
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_PRE_DISCHARGE
+
         actions = result["immediate_actions"]
-        # Pre-discharge → EVs should be stopped
-        stop_actions = [a for a in actions if a["service"] == "switch.turn_off"]
-        assert len(stop_actions) >= 1  # At least one charger stopped
+        # Battery should discharge
+        discharge_actions = [
+            a for a in actions
+            if a["entity_id"] == "script.sg_set_forced_discharge_battery_mode"
+        ]
+        assert len(discharge_actions) == 1
+
+        # EVs should CHARGE (price 0.05 < threshold 0.10)
+        ev_on_actions = [a for a in actions if a["service"] == "switch.turn_on"
+                         and "charger" in a.get("entity_id", "")]
+        assert len(ev_on_actions) >= 1, (
+            "EVs should charge during pre_discharge when price is cheap"
+        )
+
+
+class TestSolarSurplusEVCharging:
+    """Tests for solar-surplus-aware EV charging."""
+
+    def test_evs_charge_on_solar_surplus_during_self_consumption(
+        self, default_params, default_outputs
+    ):
+        """When exporting heavily to grid during self_consumption,
+        EVs should charge to absorb the surplus."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Flat mid-range prices → self_consumption (spread < 0.30)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            grid_export_power=5000.0,  # 5 kW export = big surplus
+        )
+
+        actions = result["immediate_actions"]
+        ev_on = [a for a in actions if a["service"] == "switch.turn_on"
+                 and "charger" in a.get("entity_id", "")]
+        assert len(ev_on) >= 1, "EVs should charge when solar surplus is high"
+
+    def test_evs_dont_charge_on_surplus_during_expensive_hours(
+        self, default_params, default_outputs
+    ):
+        """Even with solar surplus, don't charge EVs during expensive hours
+        because we want to sell to grid at high prices."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Very wide spread: cheap=0.10, expensive=2.00
+        prices = {
+            "today": [2.00] * 12 + [0.10] * 12,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            grid_export_power=5000.0,
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_DISCHARGE_BATTERY
+
+        actions = result["immediate_actions"]
+        ev_off = [a for a in actions if a["service"] == "switch.turn_off"
+                  and "charger" in a.get("entity_id", "")]
+        assert len(ev_off) >= 1, "EVs should stop during expensive hours even with surplus"
+
+    def test_no_ev_action_without_surplus_at_mid_price(
+        self, default_params, default_outputs
+    ):
+        """When price is mid-range and no solar surplus, no EV action."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Flat mid-range prices (self_consumption)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            grid_export_power=500.0,  # Only 0.5 kW export, below threshold
+        )
+
+        actions = result["immediate_actions"]
+        ev_actions = [a for a in actions
+                      if "charger" in a.get("entity_id", "")]
+        assert len(ev_actions) == 0, "No EV action at mid-price without surplus"
+
+    def test_evs_charge_during_pre_discharge_with_surplus(
+        self, default_params, default_outputs
+    ):
+        """During pre_discharge with solar surplus, EVs should still charge."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Pre-discharge scenario: price 0.50 with negatives ahead
+        prices = {
+            "today": [0.50, -0.10, -0.20] + [0.80] * 21,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=80,
+            ev_connected=True,
+            grid_export_power=8000.0,  # Massive solar surplus
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_PRE_DISCHARGE
+
+        actions = result["immediate_actions"]
+        # Price is 0.50 > cheap threshold, but solar surplus is huge
+        ev_on = [a for a in actions if a["service"] == "switch.turn_on"
+                 and "charger" in a.get("entity_id", "")]
+        assert len(ev_on) >= 1, "EVs should charge on surplus even during pre_discharge"
+
+    def test_cheap_price_threshold_configurable(self, default_outputs):
+        """The ev_cheap_price_threshold should be configurable via params."""
+        params = {
+            "min_price_spread": 0.30,
+            "planning_horizon_hours": 24,
+            "enable_charger_control": True,
+            "enable_battery_control": True,
+            "ev_cheap_price_threshold": 0.20,  # Raised threshold
+        }
+        opt = Optimizer(params, default_outputs)
+
+        # Price = 0.15, which is above default 0.10 but below custom 0.20
+        prices = {
+            "today": [0.15] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+        )
+
+        actions = result["immediate_actions"]
+        ev_on = [a for a in actions if a["service"] == "switch.turn_on"
+                 and "charger" in a.get("entity_id", "")]
+        assert len(ev_on) >= 1, "EVs should charge at 0.15 when threshold is 0.20"
+
+    def test_evs_stop_only_during_expensive_hours(
+        self, default_params, default_outputs
+    ):
+        """EVs should only be stopped during discharge_battery (expensive).
+        Pre-discharge, self_consumption should NOT stop EVs."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Test self_consumption - no stop
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+        )
+
+        actions = result["immediate_actions"]
+        ev_off = [a for a in actions if a["service"] == "switch.turn_off"
+                  and "charger" in a.get("entity_id", "")]
+        assert len(ev_off) == 0, "EVs should NOT be stopped during self_consumption"

@@ -96,6 +96,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 predicted_consumption=predicted_consumption,
                 battery_soc=sensor_data.get("battery_soc", 50),
                 ev_connected=sensor_data.get("ev_connected", False),
+                grid_export_power=sensor_data.get("grid_export_power", 0.0),
             )
 
             # 6. Execute immediate actions

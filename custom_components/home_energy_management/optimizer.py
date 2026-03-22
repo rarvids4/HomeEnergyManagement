@@ -30,12 +30,14 @@ from .const import (
     ACTION_START_EV_CHARGE,
     ACTION_STOP_EV_CHARGE,
     DEFAULT_BATTERY_CAPACITY,
+    DEFAULT_EV_CHEAP_PRICE_THRESHOLD,
     DEFAULT_MAX_AMPS,
     DEFAULT_MAX_SOC,
     DEFAULT_MIN_AMPS,
     DEFAULT_MIN_PRICE_SPREAD,
     DEFAULT_MIN_SOC,
     DEFAULT_PLANNING_HORIZON,
+    DEFAULT_SOLAR_SURPLUS_THRESHOLD,
     OUTPUT_EV_CHARGERS,
     OUTPUT_EASEE,
     OUTPUT_SUNGROW,
@@ -66,6 +68,14 @@ class Optimizer:
         self.max_soc = sg_out.get("max_soc", DEFAULT_MAX_SOC)
         self.battery_capacity = sg_out.get("capacity_kwh", DEFAULT_BATTERY_CAPACITY)
 
+        # EV smart charging thresholds
+        self.ev_cheap_price_threshold = params.get(
+            "ev_cheap_price_threshold", DEFAULT_EV_CHEAP_PRICE_THRESHOLD
+        )
+        self.solar_surplus_threshold = params.get(
+            "solar_surplus_threshold_w", DEFAULT_SOLAR_SURPLUS_THRESHOLD
+        )
+
         # EV chargers — list-based config (new) or legacy "easee" dict
         self.ev_chargers_cfg = outputs.get(OUTPUT_EV_CHARGERS, [])
         if not self.ev_chargers_cfg:
@@ -79,8 +89,16 @@ class Optimizer:
         predicted_consumption: list[float],
         battery_soc: float,
         ev_connected: bool,
+        grid_export_power: float = 0.0,
     ) -> dict[str, Any]:
         """Produce an hour-by-hour schedule and immediate actions.
+
+        Parameters
+        ----------
+        grid_export_power : float
+            Current grid export in Watts.  Used to detect solar surplus
+            so EVs can absorb excess production instead of exporting
+            at rock-bottom prices.
 
         Returns
         -------
@@ -150,8 +168,13 @@ class Optimizer:
         if hourly_plan:
             current_plan = hourly_plan[0]
             immediate_actions = self._build_immediate_actions(
-                current_plan["action"],
-                ev_connected,
+                action=current_plan["action"],
+                ev_connected=ev_connected,
+                current_price=current_plan["price"],
+                avg_price=avg_price,
+                min_price=min_price,
+                price_spread=price_spread,
+                grid_export_w=grid_export_power,
             )
 
         # Summary
@@ -270,9 +293,27 @@ class Optimizer:
     # ------------------------------------------------------------------
 
     def _build_immediate_actions(
-        self, action: str, ev_connected: bool
+        self,
+        action: str,
+        ev_connected: bool,
+        current_price: float = 0.0,
+        avg_price: float = 0.0,
+        min_price: float = 0.0,
+        price_spread: float = 0.0,
+        grid_export_w: float = 0.0,
     ) -> list[dict[str, Any]]:
-        """Convert the current hour's action into HA service calls."""
+        """Convert the current hour's action into HA service calls.
+
+        Battery actions follow the optimizer's hourly plan directly.
+        EV charger actions are **decoupled** from the battery action
+        and decided by price / solar surplus:
+
+          - Negative price (maximize_load) → ALL EVs ON regardless
+          - Price ≤ ev_cheap_price_threshold → EVs ON (absorb cheap energy)
+          - Grid export ≥ solar_surplus_threshold → EVs ON (absorb surplus)
+          - Expensive hour (discharge_battery) → EVs OFF
+          - Otherwise → no EV change
+        """
         actions = []
         sg_out = self.outputs.get(OUTPUT_SUNGROW, {})
 
@@ -341,42 +382,98 @@ class Optimizer:
                         "data": {},
                     })
 
-        # --- EV charger actions (each charger independently) ---
+        # ---------------------------------------------------------------
+        # EV charger actions — DECOUPLED from battery action.
+        #
+        # The EVs make their own decision based on price and solar surplus.
+        # Rationale: during pre-discharge the battery empties itself, but
+        # any excess solar or cheap grid energy should still flow into the
+        # EVs instead of being exported for pennies.
+        # ---------------------------------------------------------------
         ev_chargers = self.ev_chargers_cfg if isinstance(self.ev_chargers_cfg, list) else []
 
-        if action == ACTION_MAXIMIZE_LOAD:
-            # Negative price → turn on ALL chargers regardless of ev_connected
-            # We want maximum load to profit from negative pricing
-            if self.enable_charger:
-                for charger_cfg in ev_chargers:
-                    start_cfg = charger_cfg.get("start_charging", {})
-                    if start_cfg.get("service"):
-                        actions.append({
-                            "service": start_cfg["service"],
-                            "entity_id": start_cfg["entity_id"],
-                            "data": {},
-                        })
+        if not self.enable_charger or not ev_chargers:
+            return actions
 
-        elif self.enable_charger and ev_connected:
+        # Compute cheap threshold: absolute or relative, whichever is higher.
+        # This ensures EVs charge when electricity is objectively cheap
+        # (below ev_cheap_price_threshold) OR relatively cheap within
+        # today's range (bottom 30%).
+        if price_spread > 0:
+            relative_cheap = min_price + price_spread * 0.30
+            cheap_threshold = max(self.ev_cheap_price_threshold, relative_cheap)
+        else:
+            # No price variation — use absolute threshold only
+            cheap_threshold = self.ev_cheap_price_threshold
+
+        # Determine whether to charge EVs
+        price_is_cheap = current_price <= cheap_threshold
+        price_is_negative = current_price < 0
+        solar_surplus = grid_export_w >= self.solar_surplus_threshold
+        price_is_expensive = action == ACTION_DISCHARGE_BATTERY
+
+        if price_is_negative:
+            # Negative price → ALL chargers ON regardless of ev_connected
+            _LOGGER.info(
+                "EV: Negative price (%.3f) — turning on ALL chargers",
+                current_price,
+            )
             for charger_cfg in ev_chargers:
-                if action in (ACTION_CHARGE_BATTERY,):
-                    # Cheap hour → enable EV charging
-                    start_cfg = charger_cfg.get("start_charging", {})
-                    if start_cfg.get("service"):
-                        actions.append({
-                            "service": start_cfg["service"],
-                            "entity_id": start_cfg["entity_id"],
-                            "data": {},
-                        })
-                elif action in (ACTION_DISCHARGE_BATTERY, ACTION_PRE_DISCHARGE):
-                    # Expensive / pre-discharge hour → disable EV charging
-                    stop_cfg = charger_cfg.get("stop_charging", {})
-                    if stop_cfg.get("service"):
-                        actions.append({
-                            "service": stop_cfg["service"],
-                            "entity_id": stop_cfg["entity_id"],
-                            "data": {},
-                        })
+                start_cfg = charger_cfg.get("start_charging", {})
+                if start_cfg.get("service"):
+                    actions.append({
+                        "service": start_cfg["service"],
+                        "entity_id": start_cfg["entity_id"],
+                        "data": {},
+                    })
+
+        elif ev_connected and price_is_cheap:
+            # Cheap price → charge EVs (even during pre_discharge or self_consumption)
+            _LOGGER.info(
+                "EV: Cheap price (%.3f ≤ %.3f) — charging EVs",
+                current_price,
+                cheap_threshold,
+            )
+            for charger_cfg in ev_chargers:
+                start_cfg = charger_cfg.get("start_charging", {})
+                if start_cfg.get("service"):
+                    actions.append({
+                        "service": start_cfg["service"],
+                        "entity_id": start_cfg["entity_id"],
+                        "data": {},
+                    })
+
+        elif ev_connected and solar_surplus and not price_is_expensive:
+            # Exporting a lot of power → let EVs absorb the surplus
+            _LOGGER.info(
+                "EV: Solar surplus (%.0f W export) — charging EVs",
+                grid_export_w,
+            )
+            for charger_cfg in ev_chargers:
+                start_cfg = charger_cfg.get("start_charging", {})
+                if start_cfg.get("service"):
+                    actions.append({
+                        "service": start_cfg["service"],
+                        "entity_id": start_cfg["entity_id"],
+                        "data": {},
+                    })
+
+        elif ev_connected and price_is_expensive:
+            # Expensive hour → stop EV charging to preserve battery/grid savings
+            _LOGGER.info(
+                "EV: Expensive price (%.3f) — stopping EVs",
+                current_price,
+            )
+            for charger_cfg in ev_chargers:
+                stop_cfg = charger_cfg.get("stop_charging", {})
+                if stop_cfg.get("service"):
+                    actions.append({
+                        "service": stop_cfg["service"],
+                        "entity_id": stop_cfg["entity_id"],
+                        "data": {},
+                    })
+
+        # else: no EV action (mid-range price, no surplus)
 
         return actions
 

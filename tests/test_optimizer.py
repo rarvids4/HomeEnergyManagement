@@ -523,11 +523,23 @@ class TestNegativePriceOptimization:
             "currency": "SEK",
         }
 
+        ev_vehicles = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+        }]
+
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
             battery_soc=80,
             ev_connected=True,
+            ev_vehicles=ev_vehicles,
         )
 
         plan = result["hourly_plan"]
@@ -1027,10 +1039,11 @@ class TestSolarSurplusEVCharging:
                   and "charger" in a.get("entity_id", "")]
         assert len(ev_off) >= 1, "EVs should stop during expensive hours even with surplus"
 
-    def test_no_ev_action_without_surplus_at_mid_price(
+    def test_evs_stopped_without_schedule_at_mid_price(
         self, default_params, default_outputs
     ):
-        """When price is mid-range and no solar surplus, no EV action."""
+        """When price is mid-range, no solar surplus, and no vehicle data,
+        EVs should be stopped (no schedule = no charging)."""
         opt = Optimizer(default_params, default_outputs)
 
         # Flat mid-range prices (self_consumption)
@@ -1049,9 +1062,10 @@ class TestSolarSurplusEVCharging:
         )
 
         actions = result["immediate_actions"]
-        ev_actions = [a for a in actions
-                      if "charger" in a.get("entity_id", "")]
-        assert len(ev_actions) == 0, "No EV action at mid-price without surplus"
+        ev_off = [a for a in actions if a["service"] == "switch.turn_off"
+                  and "charger" in a.get("entity_id", "")]
+        # Without vehicle SoC data → no schedule → EVs stopped
+        assert len(ev_off) >= 1, "EVs should be stopped when not scheduled"
 
     def test_evs_charge_during_pre_discharge_with_surplus(
         self, default_params, default_outputs
@@ -1095,18 +1109,25 @@ class TestSolarSurplusEVCharging:
                  and "charger" in a.get("entity_id", "")]
         assert len(ev_on) >= 1, "EVs should charge on surplus even during would-be pre_discharge"
 
-    def test_cheap_price_threshold_configurable(self, default_outputs):
-        """The ev_cheap_price_threshold should be configurable via params."""
-        params = {
-            "min_price_spread": 0.30,
-            "planning_horizon_hours": 24,
-            "enable_charger_control": True,
-            "enable_battery_control": True,
-            "ev_cheap_price_threshold": 0.20,  # Raised threshold
-        }
-        opt = Optimizer(params, default_outputs)
+    def test_ev_charges_when_scheduled_cheap_hour(
+        self, default_params, default_outputs
+    ):
+        """EVs should charge during the current hour if the schedule
+        planned charging (cheap hour with vehicle data)."""
+        ev_vehicles = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+        }]
 
-        # Price = 0.15, which is above default 0.10 but below custom 0.20
+        opt = Optimizer(default_params, default_outputs)
+
+        # Flat cheap prices → all hours are candidates for scheduling
         prices = {
             "today": [0.15] * 24,
             "tomorrow": [],
@@ -1118,21 +1139,32 @@ class TestSolarSurplusEVCharging:
             predicted_consumption=[1.0] * 24,
             battery_soc=50,
             ev_connected=True,
+            ev_vehicles=ev_vehicles,
         )
 
         actions = result["immediate_actions"]
         ev_on = [a for a in actions if a["service"] == "switch.turn_on"
                  and "charger" in a.get("entity_id", "")]
-        assert len(ev_on) >= 1, "EVs should charge at 0.15 when threshold is 0.20"
+        assert len(ev_on) >= 1, "EVs should charge when scheduled"
 
-    def test_evs_stop_only_during_expensive_hours(
+    def test_evs_charge_during_scheduled_self_consumption(
         self, default_params, default_outputs
     ):
-        """EVs should only be stopped during discharge_battery (expensive).
-        Pre-discharge, self_consumption should NOT stop EVs."""
+        """EVs with a schedule should charge even during self_consumption."""
+        ev_vehicles = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+        }]
+
         opt = Optimizer(default_params, default_outputs)
 
-        # Test self_consumption - no stop
+        # Flat prices → self_consumption
         prices = {
             "today": [0.50] * 24,
             "tomorrow": [],
@@ -1144,12 +1176,13 @@ class TestSolarSurplusEVCharging:
             predicted_consumption=[1.0] * 24,
             battery_soc=50,
             ev_connected=True,
+            ev_vehicles=ev_vehicles,
         )
 
         actions = result["immediate_actions"]
-        ev_off = [a for a in actions if a["service"] == "switch.turn_off"
-                  and "charger" in a.get("entity_id", "")]
-        assert len(ev_off) == 0, "EVs should NOT be stopped during self_consumption"
+        ev_on = [a for a in actions if a["service"] == "switch.turn_on"
+                 and "ex90" in a.get("entity_id", "")]
+        assert len(ev_on) >= 1, "EV with schedule should charge during self_consumption"
 
 
 class TestSolarSurplusBatteryCharging:
@@ -1712,8 +1745,8 @@ class TestEVChargePlanning:
         )
 
         plan = result["ev_charge_schedule"]
-        # EX90: (100 - 89) / 100 * 111 = 12.21 kWh
-        assert abs(plan["total_kwh_needed"] - 12.2) < 0.5
+        # EX90: (95 - 89) / 100 * 111 = 6.66 kWh (default target=95%)
+        assert abs(plan["total_kwh_needed"] - 6.7) < 0.5
 
     def test_ev_no_charging_when_at_target(self, default_params, default_outputs):
         """No EV charging scheduled when already at target SoC."""
@@ -1831,7 +1864,7 @@ class TestEVChargePlanning:
         )
 
         plan = result["ev_charge_schedule"]
-        total_scheduled = sum(h["power_kw"] for h in plan["schedule"] if h["charging"])
+        total_scheduled = sum(h["total_power_kw"] for h in plan["schedule"] if h["charging"])
         # Should cover (or slightly exceed) the kwh needed
         assert total_scheduled >= plan["total_kwh_needed"] - 0.1
 
@@ -1858,8 +1891,10 @@ class TestEVChargePlanning:
         assert len(vehicles) == 1
         assert vehicles[0]["name"] == "ex90"
         assert vehicles[0]["soc"] == 89
-        assert vehicles[0]["target_soc"] == 100
+        assert vehicles[0]["target_soc"] == 95  # optimizer default target
         assert vehicles[0]["capacity_kwh"] == 111
+        assert vehicles[0]["connected"] is True
+        assert "scheduled_hours" in vehicles[0]
 
     def test_summary_includes_ev_charge_count(
         self, default_params, default_outputs, ev_vehicle_ex90
@@ -2221,7 +2256,7 @@ class TestEVGridMinimization:
             "power_w": 11000,
             "status": "charging",
             "connected": True,
-            "vehicle_soc": 98,
+            "vehicle_soc": 90,  # Below 95% target so it needs charging
             "vehicle_capacity_kwh": 111,
             "vehicle_target_soc": 100,
             "vehicle_charging_power_w": 11000,

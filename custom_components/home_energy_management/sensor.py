@@ -275,6 +275,9 @@ class ChargerPlanSensor(EnergyManagementSensor):
         vehicles = ev_plan.get("vehicles", [])
         chargers = sensor.get("ev_chargers", [])
 
+        # Build graph-friendly schedule: each entry has per-vehicle kWh
+        raw_schedule = ev_plan.get("schedule", [])
+
         return {
             "ev_connected": sensor.get("ev_connected", False),
             "ev_power_kw": round(ev_power_w / 1000, 2) if ev_power_w else 0,
@@ -282,7 +285,8 @@ class ChargerPlanSensor(EnergyManagementSensor):
             "ev_chargers": chargers,
             "ev_status": sensor.get("ev_status", "unknown"),
             # EV charge schedule for dashboard graphs
-            "ev_charge_schedule": ev_plan.get("schedule", []),
+            # Each entry: {hour, price, charging, total_power_kw, vehicles: {name: kWh}}
+            "ev_charge_schedule": raw_schedule,
             "ev_kwh_needed": ev_plan.get("total_kwh_needed", 0),
             "ev_charging_power_kw": ev_plan.get("total_charging_power_kw", 0),
             "ev_hours_needed": ev_plan.get("hours_needed", 0),

@@ -42,6 +42,7 @@ from .const import (
     ACTION_STOP_EV_CHARGE,
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_EV_CHEAP_PRICE_THRESHOLD,
+    DEFAULT_EV_TARGET_SOC,
     DEFAULT_MAX_AMPS,
     DEFAULT_MAX_SOC,
     DEFAULT_MIN_AMPS,
@@ -99,6 +100,9 @@ class Optimizer:
         )
         self.ev_weekend_target_soc = params.get(
             "ev_weekend_target_soc", DEFAULT_EV_WEEKEND_TARGET_SOC
+        )
+        self.ev_default_target_soc = params.get(
+            "ev_default_target_soc", DEFAULT_EV_TARGET_SOC
         )
 
         # EV chargers — list-based config (new) or legacy "easee" dict
@@ -225,6 +229,7 @@ class Optimizer:
                 price_spread=price_spread,
                 grid_export_w=grid_export_power,
                 ev_vehicles=ev_vehicles or [],
+                ev_charge_plan=ev_charge_plan,
             )
 
         # Summary
@@ -451,31 +456,35 @@ class Optimizer:
         ev_vehicles: list[dict[str, Any]],
         start_hour: int,
     ) -> dict[str, Any]:
-        """Plan EV charging to minimize grid energy consumption.
+        """Plan EV charging per vehicle to minimize grid energy consumption.
 
-        Strategy:
-          1. Calculate kWh needed per vehicle (SoC → target).
+        Strategy per vehicle:
+          1. Calculate kWh needed (SoC → ``ev_default_target_soc``).
           2. On weekends, lower the target SoC — car is home all day
              and can top up from solar surplus during daytime.
-          3. Schedule charging in cheapest hours with night preference
-             (off-peak hours are less grid-intensive).
-          4. Exclude discharge_battery hours (selling to grid).
+          3. Schedule charging in cheapest available hours with night
+             preference (off-peak hours are less grid-intensive).
+          4. Exclude ``discharge_battery`` hours (selling to grid).
 
         Returns a dict with:
-          - schedule: per-hour list with charging flag + price
+          - schedule: per-hour list with per-vehicle kWh breakdown
           - total_kwh_needed, total_charging_power_kw, hours_needed
-          - vehicles: per-vehicle summary
+          - vehicles: per-vehicle summary with scheduled_hours
         """
-        empty_schedule = {
-            "schedule": [
-                {
-                    "hour": entry["hour"],
-                    "price": entry["price"],
-                    "charging": False,
-                    "power_kw": 0.0,
-                }
-                for entry in hourly_plan
-            ],
+        # Build base schedule
+        schedule = [
+            {
+                "hour": entry["hour"],
+                "price": entry["price"],
+                "charging": False,
+                "total_power_kw": 0.0,
+                "vehicles": {},
+            }
+            for entry in hourly_plan
+        ]
+
+        empty_result = {
+            "schedule": schedule,
             "total_kwh_needed": 0,
             "total_charging_power_kw": 0,
             "hours_needed": 0,
@@ -484,116 +493,124 @@ class Optimizer:
         }
 
         if not ev_vehicles:
-            return empty_schedule
+            return empty_result
 
-        # Weekend: car is parked at home → lower target, charge from solar later
         now_dt = datetime.now()
         is_weekend = now_dt.weekday() >= 5  # Saturday=5, Sunday=6
 
-        # Gather vehicles that need charging
-        vehicle_plans = []
-        total_kwh_needed = 0.0
-        total_charging_kw = 0.0
-
-        for ev in ev_vehicles:
-            if not ev.get("connected"):
-                continue
-
-            soc = ev.get("vehicle_soc", 0)
-            capacity = ev.get("vehicle_capacity_kwh", 0)
-            target = ev.get("vehicle_target_soc", 100)
-            charging_w = ev.get("vehicle_charging_power_w", 0)
-
-            # Weekend: lower target (parked at home, solar tops up later)
-            if is_weekend and self.ev_weekend_target_soc < target:
-                target = self.ev_weekend_target_soc
-
-            # Skip if no vehicle data available
-            if soc <= 0 or capacity <= 0:
-                continue
-            # Skip if already at target
-            if soc >= target:
-                continue
-
-            kwh_needed = (target - soc) / 100.0 * capacity
-            # Use actual charging power, fall back to charger power
-            charging_kw = (charging_w / 1000.0) if charging_w > 0 else (
-                ev.get("power_w", 7000) / 1000.0
-            )
-            if charging_kw <= 0:
-                charging_kw = 7.0  # fallback
-
-            total_kwh_needed += kwh_needed
-            total_charging_kw += charging_kw
-
-            vehicle_plans.append({
-                "name": ev.get("name", "ev"),
-                "soc": round(soc, 1),
-                "target_soc": round(target, 1),
-                "capacity_kwh": round(capacity, 1),
-                "kwh_needed": round(kwh_needed, 1),
-                "charging_power_kw": round(charging_kw, 1),
-            })
-
-        if not vehicle_plans or total_kwh_needed <= 0:
-            empty_schedule["vehicles"] = vehicle_plans
-            return empty_schedule
-
-        hours_needed = total_kwh_needed / total_charging_kw if total_charging_kw > 0 else 0
-
-        # Candidate hours: all plan hours ranked by price, cheapest first.
-        # Exclude discharge_battery hours (we want to sell to grid then).
+        # Build candidate hours (shared across vehicles):
+        # all plan hours except discharge_battery, ranked by night-adjusted price.
         candidates = []
         for i, entry in enumerate(hourly_plan):
             if entry["action"] == ACTION_DISCHARGE_BATTERY:
                 continue
             candidates.append((i, entry["price"]))
-        # Sort by night-adjusted price to minimize grid consumption:
-        # Night hours (off-peak) get a price bonus, making them preferred
-        # over daytime hours when no solar surplus is available.
-        def _night_adjusted_price(candidate: tuple) -> float:
+
+        def _night_adjusted(candidate: tuple) -> float:
             idx, price = candidate
             hour = hourly_plan[idx]["hour"]
             if hour >= self.ev_night_start or hour < self.ev_night_end:
                 return price - self.ev_night_preference
             return price
 
-        candidates.sort(key=_night_adjusted_price)
+        candidates.sort(key=_night_adjusted)
 
-        # Build the schedule
-        schedule = [
-            {
-                "hour": entry["hour"],
-                "price": entry["price"],
-                "charging": False,
-                "power_kw": 0.0,
-            }
-            for entry in hourly_plan
-        ]
+        # Per-vehicle scheduling
+        vehicle_plans = []
 
-        remaining_kwh = total_kwh_needed
-        for idx, _price in candidates:
-            if remaining_kwh <= 0:
-                break
-            charge_kwh = min(total_charging_kw, remaining_kwh)
-            schedule[idx]["charging"] = True
-            schedule[idx]["power_kw"] = round(charge_kwh, 2)
-            remaining_kwh -= charge_kwh
+        for ev in ev_vehicles:
+            name = ev.get("name", "ev")
+            soc = ev.get("vehicle_soc", 0)
+            capacity = ev.get("vehicle_capacity_kwh", 0)
+            charging_w = ev.get("vehicle_charging_power_w", 0)
+            connected = ev.get("connected", False)
+
+            # Use optimizer's default target (95%) — not the vehicle API target
+            target = self.ev_default_target_soc
+
+            # Weekend: lower target if weekend_target < default target
+            if is_weekend and self.ev_weekend_target_soc < target:
+                target = self.ev_weekend_target_soc
+
+            # Determine charging power (kW)
+            charging_kw = (charging_w / 1000.0) if charging_w > 0 else (
+                ev.get("power_w", 7000) / 1000.0
+            )
+            if charging_kw <= 0:
+                charging_kw = 7.0  # fallback
+
+            # Skip vehicles that don't need charging
+            needs_charge = (
+                connected
+                and soc > 0
+                and capacity > 0
+                and soc < target
+            )
+
+            if not needs_charge:
+                vehicle_plans.append({
+                    "name": name,
+                    "soc": round(soc, 1),
+                    "target_soc": round(target, 1),
+                    "capacity_kwh": round(capacity, 1),
+                    "kwh_needed": 0,
+                    "charging_power_kw": round(charging_kw, 1) if connected else 0,
+                    "hours_needed": 0,
+                    "connected": connected,
+                    "scheduled_hours": [],
+                })
+                continue
+
+            kwh_needed = (target - soc) / 100.0 * capacity
+
+            # Schedule this vehicle in cheapest available hours
+            remaining = kwh_needed
+            scheduled_hours = []
+            for idx, _price in candidates:
+                if remaining <= 0:
+                    break
+                charge_kwh = min(charging_kw, remaining)
+                schedule[idx]["vehicles"][name] = round(charge_kwh, 2)
+                schedule[idx]["total_power_kw"] += charge_kwh
+                schedule[idx]["charging"] = True
+                scheduled_hours.append(hourly_plan[idx]["hour"])
+                remaining -= charge_kwh
+
+            hours_needed_f = kwh_needed / charging_kw if charging_kw > 0 else 0
+
+            vehicle_plans.append({
+                "name": name,
+                "soc": round(soc, 1),
+                "target_soc": round(target, 1),
+                "capacity_kwh": round(capacity, 1),
+                "kwh_needed": round(kwh_needed, 1),
+                "charging_power_kw": round(charging_kw, 1),
+                "hours_needed": round(hours_needed_f, 1),
+                "connected": connected,
+                "scheduled_hours": sorted(scheduled_hours),
+            })
+
+        # Round totals in schedule
+        for entry in schedule:
+            entry["total_power_kw"] = round(entry["total_power_kw"], 2)
+
+        total_kwh = sum(v["kwh_needed"] for v in vehicle_plans)
+        total_kw = sum(v["charging_power_kw"] for v in vehicle_plans if v["kwh_needed"] > 0)
 
         _LOGGER.debug(
-            "EV charge plan: %.1f kWh needed, %.1f kW power, "
-            "%.1f hours, scheduled %d hours",
-            total_kwh_needed,
-            total_charging_kw,
-            hours_needed,
+            "EV charge plan: %d vehicles, %.1f kWh needed, %.1f kW total, "
+            "scheduled %d hours",
+            len(vehicle_plans),
+            total_kwh,
+            total_kw,
             len([s for s in schedule if s["charging"]]),
         )
 
         return {
             "schedule": schedule,
-            "total_kwh_needed": round(total_kwh_needed, 1),
-            "total_charging_power_kw": round(total_charging_kw, 1),
-            "hours_needed": round(hours_needed, 1),
+            "total_kwh_needed": round(total_kwh, 1),
+            "total_charging_power_kw": round(total_kw, 1),
+            "hours_needed": round(total_kwh / total_kw, 1) if total_kw > 0 else 0,
             "vehicles": vehicle_plans,
             "start_hour": start_hour,
         }
@@ -653,24 +670,20 @@ class Optimizer:
         price_spread: float = 0.0,
         grid_export_w: float = 0.0,
         ev_vehicles: list[dict[str, Any]] | None = None,
+        ev_charge_plan: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """Convert the current hour's action into HA service calls.
 
         Battery actions follow the optimizer's hourly plan directly.
-        EV charger actions are **decoupled** from the battery action
-        and decided per-charger by price / solar / vehicle SoC:
+        EV charger actions are driven by the pre-computed EV charge
+        schedule (cheapest hours, night preference, per-vehicle kWh).
 
-        Objective: **minimize grid energy consumption**.
-
+        Overrides (real-time):
           - Vehicle at target SoC → STOP (ramp-down)
-          - Negative price → EVs ON (unless already at full target)
-          - Price ≤ ev_cheap_price_threshold → EVs ON (cheap energy)
-          - Grid export ≥ solar_surplus_threshold → EVs ON (absorb surplus)
-          - Expensive hour → EVs OFF
-          - Otherwise → no EV change
-
-        Weekend: target SoC is lowered (car parked at home, will
-        charge from daytime solar surplus instead of grid).
+          - Negative price → EVs ON (charge everything)
+          - Solar surplus → EVs ON (absorb free energy)
+          - Scheduled this hour → EVs ON
+          - Not scheduled + expensive → EVs OFF
         """
         actions = []
         sg_out = self.outputs.get(OUTPUT_SUNGROW, {})
@@ -787,28 +800,28 @@ class Optimizer:
                     })
 
         # ---------------------------------------------------------------
-        # EV charger actions — DECOUPLED from battery action.
+        # EV charger actions — driven by the pre-computed schedule.
         #
-        # Objective: MINIMIZE GRID ENERGY CONSUMPTION.
-        # Per-charger decision with ramp-down when vehicle is at target.
-        # Weekend: lower target SoC (car home all day, solar later).
+        # The schedule already optimised for cheapest hours with night
+        # preference.  Real-time overrides: ramp-down (vehicle at
+        # target), negative prices, and solar surplus.
         # ---------------------------------------------------------------
         ev_chargers = self.ev_chargers_cfg if isinstance(self.ev_chargers_cfg, list) else []
 
         if not self.enable_charger or not ev_chargers:
             return actions
 
-        # Compute cheap threshold: absolute or relative, whichever is higher.
-        if price_spread > 0:
-            relative_cheap = min_price + price_spread * 0.30
-            cheap_threshold = max(self.ev_cheap_price_threshold, relative_cheap)
-        else:
-            cheap_threshold = self.ev_cheap_price_threshold
-
-        price_is_cheap = current_price <= cheap_threshold
         price_is_negative = current_price < 0
         solar_surplus = grid_export_w >= self.solar_surplus_threshold
         price_is_expensive = action == ACTION_DISCHARGE_BATTERY
+
+        # Current hour's schedule entry (index 0 = now)
+        schedule_entry = {}
+        if ev_charge_plan:
+            sched_list = ev_charge_plan.get("schedule", [])
+            if sched_list:
+                schedule_entry = sched_list[0]
+        scheduled_vehicles = schedule_entry.get("vehicles", {})
 
         # Build vehicle lookup for ramp-down + per-charger SoC checks
         vehicle_map: dict[str, dict[str, Any]] = {}
@@ -816,7 +829,7 @@ class Optimizer:
             vehicle_map[v.get("name", "")] = v
 
         now = datetime.now()
-        is_weekend = now.weekday() >= 5  # Saturday=5, Sunday=6
+        is_weekend = now.weekday() >= 5
 
         for charger_cfg in ev_chargers:
             charger_name = charger_cfg.get("name", "")
@@ -830,16 +843,16 @@ class Optimizer:
             # --- RAMP-DOWN: stop if vehicle reports SoC >= target ---
             if vehicle:
                 vehicle_soc = vehicle.get("vehicle_soc", 0)
-                vehicle_target = vehicle.get("vehicle_target_soc", 100)
 
-                # Weekend: lower target (car parked at home all day)
-                effective_target = vehicle_target
-                if is_weekend and self.ev_weekend_target_soc < vehicle_target:
+                # Use optimizer's default target (matches the schedule)
+                effective_target = self.ev_default_target_soc
+                if is_weekend and self.ev_weekend_target_soc < effective_target:
                     effective_target = self.ev_weekend_target_soc
 
                 if vehicle_soc > 0 and vehicle_soc >= effective_target:
                     # Exception: during negative prices, charge to full
-                    # vehicle target (we get paid to consume electricity)
+                    # capacity (we get paid to consume electricity)
+                    vehicle_target = vehicle.get("vehicle_target_soc", 100)
                     if price_is_negative and vehicle_soc < vehicle_target:
                         pass  # Don't stop — exploit negative prices
                     else:
@@ -855,26 +868,15 @@ class Optimizer:
                                 "entity_id": stop_cfg["entity_id"],
                                 "data": {},
                             })
-                        continue  # Skip price logic for this charger
+                        continue  # Skip further logic for this charger
 
-            # --- Price-based charging decision ---
+            # --- Schedule-based + real-time override decisions ---
+            is_scheduled = charger_name in scheduled_vehicles
+
             if price_is_negative:
                 _LOGGER.info(
                     "EV %s: Negative price (%.3f) — charging",
                     charger_name, current_price,
-                )
-                start_cfg = charger_cfg.get("start_charging", {})
-                if start_cfg.get("service"):
-                    actions.append({
-                        "service": start_cfg["service"],
-                        "entity_id": start_cfg["entity_id"],
-                        "data": {},
-                    })
-
-            elif charger_connected and price_is_cheap:
-                _LOGGER.info(
-                    "EV %s: Cheap price (%.3f ≤ %.3f) — charging",
-                    charger_name, current_price, cheap_threshold,
                 )
                 start_cfg = charger_cfg.get("start_charging", {})
                 if start_cfg.get("service"):
@@ -897,6 +899,19 @@ class Optimizer:
                         "data": {},
                     })
 
+            elif charger_connected and is_scheduled:
+                _LOGGER.info(
+                    "EV %s: Scheduled for charging this hour (%.2f kWh)",
+                    charger_name, scheduled_vehicles.get(charger_name, 0),
+                )
+                start_cfg = charger_cfg.get("start_charging", {})
+                if start_cfg.get("service"):
+                    actions.append({
+                        "service": start_cfg["service"],
+                        "entity_id": start_cfg["entity_id"],
+                        "data": {},
+                    })
+
             elif charger_connected and price_is_expensive:
                 _LOGGER.info(
                     "EV %s: Expensive price (%.3f) — stopping",
@@ -910,7 +925,19 @@ class Optimizer:
                         "data": {},
                     })
 
-            # else: no EV action (mid-range price, no surplus)
+            elif charger_connected and not is_scheduled:
+                # Not scheduled and not a special case → stop to save grid
+                _LOGGER.info(
+                    "EV %s: Not scheduled this hour — stopping",
+                    charger_name, 
+                )
+                stop_cfg = charger_cfg.get("stop_charging", {})
+                if stop_cfg.get("service"):
+                    actions.append({
+                        "service": stop_cfg["service"],
+                        "entity_id": stop_cfg["entity_id"],
+                        "data": {},
+                    })
 
         return actions
 

@@ -3,6 +3,15 @@
 The optimizer takes Nordpool hourly prices, predicted consumption,
 battery state, and EV connection status, and produces an hour-by-hour
 schedule of actions (charge battery, discharge, start EV, etc.).
+
+Key strategies:
+  - **Negative prices**: Maximize load (charge battery + all EVs).
+    We are literally paid to consume electricity.
+  - **Pre-discharge**: When negative prices are approaching in the next
+    few hours, discharge the battery first to create room for free charging.
+  - **Cheap hours**: Charge battery from grid.
+  - **Expensive hours**: Discharge battery to avoid grid import.
+  - **Normal hours**: Self-consumption mode.
 """
 
 from __future__ import annotations
@@ -14,6 +23,8 @@ from typing import Any
 from .const import (
     ACTION_CHARGE_BATTERY,
     ACTION_DISCHARGE_BATTERY,
+    ACTION_MAXIMIZE_LOAD,
+    ACTION_PRE_DISCHARGE,
     ACTION_SELF_CONSUMPTION,
     ACTION_SET_EV_AMPS,
     ACTION_START_EV_CHARGE,
@@ -25,11 +36,16 @@ from .const import (
     DEFAULT_MIN_PRICE_SPREAD,
     DEFAULT_MIN_SOC,
     DEFAULT_PLANNING_HORIZON,
+    OUTPUT_EV_CHARGERS,
     OUTPUT_EASEE,
     OUTPUT_SUNGROW,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+# How many hours ahead to look for upcoming negative prices
+# when deciding whether to pre-discharge the battery.
+PRE_DISCHARGE_LOOKAHEAD = 4
 
 
 class Optimizer:
@@ -44,17 +60,18 @@ class Optimizer:
         self.enable_charger = params.get("enable_charger_control", True)
         self.enable_battery = params.get("enable_battery_control", True)
 
-        # Battery config from output mapping
+        # Battery config from output mapping (master inverter only)
         sg_out = outputs.get(OUTPUT_SUNGROW, {})
         self.min_soc = sg_out.get("min_soc", DEFAULT_MIN_SOC)
         self.max_soc = sg_out.get("max_soc", DEFAULT_MAX_SOC)
         self.battery_capacity = sg_out.get("capacity_kwh", DEFAULT_BATTERY_CAPACITY)
 
-        # Charger config
-        easee_out = outputs.get(OUTPUT_EASEE, {})
-        charge_cfg = easee_out.get("set_current_limit", {})
-        self.min_amps = charge_cfg.get("min_amps", DEFAULT_MIN_AMPS)
-        self.max_amps = charge_cfg.get("max_amps", DEFAULT_MAX_AMPS)
+        # EV chargers — list-based config (new) or legacy "easee" dict
+        self.ev_chargers_cfg = outputs.get(OUTPUT_EV_CHARGERS, [])
+        if not self.ev_chargers_cfg:
+            legacy = outputs.get(OUTPUT_EASEE, {})
+            if legacy:
+                self.ev_chargers_cfg = [legacy]
 
     def optimize(
         self,
@@ -90,19 +107,22 @@ class Optimizer:
         if not horizon_prices:
             horizon_prices = all_prices[current_hour:]
 
-        # Compute price statistics
+        # Compute price statistics (over positive prices only for thresholds)
         avg_price = sum(horizon_prices) / len(horizon_prices) if horizon_prices else 0
         min_price = min(horizon_prices) if horizon_prices else 0
         max_price = max(horizon_prices) if horizon_prices else 0
         price_spread = max_price - min_price
 
-        # Classify each hour
+        # Classify each hour with look-ahead for negative prices
         hourly_plan = []
         immediate_actions = []
 
         for i, price in enumerate(horizon_prices):
             hour = (current_hour + i) % 24
             consumption = predicted_consumption[i] if i < len(predicted_consumption) else 0
+
+            # Look ahead: are there negative prices coming soon?
+            upcoming_prices = horizon_prices[i + 1 : i + 1 + PRE_DISCHARGE_LOOKAHEAD]
 
             action, reason = self._classify_hour(
                 price=price,
@@ -112,6 +132,7 @@ class Optimizer:
                 price_spread=price_spread,
                 battery_soc=battery_soc,
                 consumption=consumption,
+                upcoming_prices=upcoming_prices,
             )
 
             hourly_plan.append({
@@ -134,11 +155,15 @@ class Optimizer:
             )
 
         # Summary
+        neg_hours = [h for h in hourly_plan if h["action"] == ACTION_MAXIMIZE_LOAD]
+        pre_dis_hours = [h for h in hourly_plan if h["action"] == ACTION_PRE_DISCHARGE]
         cheap_hours = [h for h in hourly_plan if h["action"] == ACTION_CHARGE_BATTERY]
         expensive_hours = [h for h in hourly_plan if h["action"] == ACTION_DISCHARGE_BATTERY]
 
         summary = (
-            f"Plan: {len(cheap_hours)} charge hours, "
+            f"Plan: {len(neg_hours)} negative-price (maximize), "
+            f"{len(pre_dis_hours)} pre-discharge, "
+            f"{len(cheap_hours)} charge, "
             f"{len(expensive_hours)} discharge hours. "
             f"Price range: {min_price:.2f}–{max_price:.2f} {prices.get('currency', 'SEK')}/kWh. "
             f"Spread: {price_spread:.2f}."
@@ -156,6 +181,10 @@ class Optimizer:
             },
         }
 
+    # ------------------------------------------------------------------
+    # Hour classification
+    # ------------------------------------------------------------------
+
     def _classify_hour(
         self,
         price: float,
@@ -165,9 +194,45 @@ class Optimizer:
         price_spread: float,
         battery_soc: float,
         consumption: float,
+        upcoming_prices: list[float] | None = None,
     ) -> tuple[str, str]:
-        """Decide what to do in a given hour based on price position."""
+        """Decide what to do in a given hour based on price position.
 
+        Priority order:
+          1. Negative price  → MAXIMIZE_LOAD (charge everything)
+          2. Pre-discharge   → empty battery before upcoming negatives
+          3. Cheap hour      → charge battery
+          4. Expensive hour  → discharge battery
+          5. Otherwise       → self-consumption
+        """
+        if upcoming_prices is None:
+            upcoming_prices = []
+
+        # --- 1. NEGATIVE PRICE: maximize consumption ---
+        if price < 0:
+            return (
+                ACTION_MAXIMIZE_LOAD,
+                f"Negative price ({price:.3f}), maximizing load — "
+                f"charge battery + all EVs",
+            )
+
+        # --- 2. PRE-DISCHARGE before upcoming negative prices ---
+        # If any of the next few hours are negative, we want to empty
+        # the battery *now* so we have room to charge for free later.
+        has_negative_ahead = any(p < 0 for p in upcoming_prices)
+        if (
+            has_negative_ahead
+            and self.enable_battery
+            and battery_soc > self.min_soc
+            and price > 0
+        ):
+            return (
+                ACTION_PRE_DISCHARGE,
+                f"Pre-discharging at {price:.2f} — negative prices ahead, "
+                f"making room in battery (SoC {battery_soc:.0f}%)",
+            )
+
+        # --- 3–5. Normal positive-price logic ---
         # If spread is too small, don't bother cycling the battery
         if price_spread < self.min_price_spread:
             return ACTION_SELF_CONSUMPTION, "Price spread too small to optimise"
@@ -185,16 +250,24 @@ class Optimizer:
 
         return ACTION_SELF_CONSUMPTION, f"Normal price ({price:.2f}), self-consumption mode"
 
+    # ------------------------------------------------------------------
+    # SoC simulation
+    # ------------------------------------------------------------------
+
     def _simulate_soc_change(self, soc: float, action: str) -> float:
         """Rough SoC simulation for planning purposes."""
         # Assume ~2 kW charge/discharge rate per hour as % of capacity
         delta_pct = (2.0 / self.battery_capacity) * 100
 
-        if action == ACTION_CHARGE_BATTERY:
+        if action in (ACTION_CHARGE_BATTERY, ACTION_MAXIMIZE_LOAD):
             return min(self.max_soc, soc + delta_pct)
-        elif action == ACTION_DISCHARGE_BATTERY:
+        elif action in (ACTION_DISCHARGE_BATTERY, ACTION_PRE_DISCHARGE):
             return max(self.min_soc, soc - delta_pct)
         return soc
+
+    # ------------------------------------------------------------------
+    # Service call builder
+    # ------------------------------------------------------------------
 
     def _build_immediate_actions(
         self, action: str, ev_connected: bool
@@ -202,62 +275,108 @@ class Optimizer:
         """Convert the current hour's action into HA service calls."""
         actions = []
         sg_out = self.outputs.get(OUTPUT_SUNGROW, {})
-        easee_out = self.outputs.get(OUTPUT_EASEE, {})
 
-        # Battery actions
+        # --- Battery actions (master inverter only, slave follows) ---
         if self.enable_battery:
-            if action == ACTION_CHARGE_BATTERY:
+            if action == ACTION_MAXIMIZE_LOAD:
+                # Negative price → force-charge battery at max power
                 cfg = sg_out.get("force_charge", {})
                 if cfg.get("service") and cfg.get("entity_id"):
                     actions.append({
                         "service": cfg["service"],
                         "entity_id": cfg["entity_id"],
-                        "data": {"option": cfg.get("mode_value", "force_charge")},
+                        "data": {},
                     })
+                # Also ramp charge power to maximum
+                pwr_cfg = sg_out.get("set_charge_power", {})
+                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                    actions.append({
+                        "service": pwr_cfg["service"],
+                        "entity_id": pwr_cfg["entity_id"],
+                        "data": {"value": pwr_cfg.get("max", 5000)},
+                    })
+
+            elif action == ACTION_PRE_DISCHARGE:
+                # Discharge battery to make room before negative prices
+                cfg = sg_out.get("force_discharge", {})
+                if cfg.get("service") and cfg.get("entity_id"):
+                    actions.append({
+                        "service": cfg["service"],
+                        "entity_id": cfg["entity_id"],
+                        "data": {},
+                    })
+                # Ramp discharge power to maximum
+                pwr_cfg = sg_out.get("set_discharge_power", {})
+                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                    actions.append({
+                        "service": pwr_cfg["service"],
+                        "entity_id": pwr_cfg["entity_id"],
+                        "data": {"value": pwr_cfg.get("max", 5000)},
+                    })
+
+            elif action == ACTION_CHARGE_BATTERY:
+                cfg = sg_out.get("force_charge", {})
+                if cfg.get("service") and cfg.get("entity_id"):
+                    actions.append({
+                        "service": cfg["service"],
+                        "entity_id": cfg["entity_id"],
+                        "data": {},
+                    })
+
             elif action == ACTION_DISCHARGE_BATTERY:
                 cfg = sg_out.get("force_discharge", {})
                 if cfg.get("service") and cfg.get("entity_id"):
                     actions.append({
                         "service": cfg["service"],
                         "entity_id": cfg["entity_id"],
-                        "data": {"option": cfg.get("mode_value", "force_discharge")},
+                        "data": {},
                     })
+
             else:
                 cfg = sg_out.get("self_consumption", {})
                 if cfg.get("service") and cfg.get("entity_id"):
                     actions.append({
                         "service": cfg["service"],
                         "entity_id": cfg["entity_id"],
-                        "data": {"option": cfg.get("mode_value", "self_consumption")},
+                        "data": {},
                     })
 
-        # EV charger actions — charge during cheap hours if connected
-        if self.enable_charger and ev_connected:
-            if action == ACTION_CHARGE_BATTERY:
-                # Cheap hour → also charge EV at max amps
-                start_cfg = easee_out.get("start_charging", {})
-                if start_cfg.get("service"):
-                    actions.append({
-                        "service": start_cfg["service"],
-                        "entity_id": start_cfg["entity_id"],
-                        "data": {},
-                    })
-                limit_cfg = easee_out.get("set_current_limit", {})
-                if limit_cfg.get("service"):
-                    actions.append({
-                        "service": limit_cfg["service"],
-                        "entity_id": limit_cfg["entity_id"],
-                        "data": {"value": self.max_amps},
-                    })
-            elif action == ACTION_DISCHARGE_BATTERY:
-                # Expensive hour → stop EV charging
-                stop_cfg = easee_out.get("stop_charging", {})
-                if stop_cfg.get("service"):
-                    actions.append({
-                        "service": stop_cfg["service"],
-                        "entity_id": stop_cfg["entity_id"],
-                        "data": {},
-                    })
+        # --- EV charger actions (each charger independently) ---
+        ev_chargers = self.ev_chargers_cfg if isinstance(self.ev_chargers_cfg, list) else []
+
+        if action == ACTION_MAXIMIZE_LOAD:
+            # Negative price → turn on ALL chargers regardless of ev_connected
+            # We want maximum load to profit from negative pricing
+            if self.enable_charger:
+                for charger_cfg in ev_chargers:
+                    start_cfg = charger_cfg.get("start_charging", {})
+                    if start_cfg.get("service"):
+                        actions.append({
+                            "service": start_cfg["service"],
+                            "entity_id": start_cfg["entity_id"],
+                            "data": {},
+                        })
+
+        elif self.enable_charger and ev_connected:
+            for charger_cfg in ev_chargers:
+                if action in (ACTION_CHARGE_BATTERY,):
+                    # Cheap hour → enable EV charging
+                    start_cfg = charger_cfg.get("start_charging", {})
+                    if start_cfg.get("service"):
+                        actions.append({
+                            "service": start_cfg["service"],
+                            "entity_id": start_cfg["entity_id"],
+                            "data": {},
+                        })
+                elif action in (ACTION_DISCHARGE_BATTERY, ACTION_PRE_DISCHARGE):
+                    # Expensive / pre-discharge hour → disable EV charging
+                    stop_cfg = charger_cfg.get("stop_charging", {})
+                    if stop_cfg.get("service"):
+                        actions.append({
+                            "service": stop_cfg["service"],
+                            "entity_id": stop_cfg["entity_id"],
+                            "data": {},
+                        })
 
         return actions
 

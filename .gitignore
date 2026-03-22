@@ -7,3 +7,10 @@ __pycache__/
 dist/
 build/
 .env
+
+# --- Local RPi configuration (NEVER commit) ---
+# The actual mapping with your real entity IDs
+config/variable_mapping.local.yaml
+# Any local secrets / tokens
+.ha_token
+secrets.yaml

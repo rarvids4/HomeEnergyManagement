@@ -15,10 +15,13 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
+    DEFAULT_ENTRIES_PER_HOUR,
     DEFAULT_UPDATE_INTERVAL,
     INPUT_EASEE,
+    INPUT_EV_CHARGERS,
     INPUT_NORDPOOL,
     INPUT_SUNGROW,
+    INPUT_SUNGROW_2,
     INPUT_SMART_METER,
     INPUT_WEATHER,
     MAPPING_INPUTS,
@@ -197,7 +200,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         """Read all mapped input sensors from HA state."""
         data: dict[str, Any] = {}
 
-        # Sungrow
+        # Sungrow (primary)
         sg = self.inputs.get(INPUT_SUNGROW, {})
         data["battery_soc"] = self._get_state_float(sg.get("battery_soc"))
         data["battery_power"] = self._get_state_float(sg.get("battery_power"))
@@ -206,13 +209,57 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         data["grid_export_power"] = self._get_state_float(sg.get("grid_export_power"))
         data["house_load"] = self._get_state_float(sg.get("house_load"))
 
-        # Easee
-        easee = self.inputs.get(INPUT_EASEE, {})
-        data["ev_power"] = self._get_state_float(easee.get("power"))
-        data["ev_status"] = self._get_state_str(easee.get("status"))
-        data["ev_connected"] = self._get_state_str(
-            easee.get("cable_connected")
-        ) in ("on", "true", "True")
+        # Sungrow 2 (optional — add to totals if available)
+        sg2 = self.inputs.get(INPUT_SUNGROW_2, {})
+        if sg2:
+            sg2_pv = self._get_state_float(sg2.get("pv_power"))
+            sg2_load = self._get_state_float(sg2.get("house_load"))
+            sg2_batt = self._get_state_float(sg2.get("battery_power"))
+            # Only add if the sensor returned a real value (not 0 from "unknown")
+            if sg2_pv > 0:
+                data["pv_power"] += sg2_pv
+            if sg2_load > 0:
+                data["house_load"] += sg2_load
+            data["battery_power_2"] = sg2_batt
+            data["battery_soc_2"] = self._get_state_float(sg2.get("battery_soc"))
+
+        # EV Chargers — read from list-based config (new) or legacy "easee" dict
+        ev_chargers_cfg = self.inputs.get(INPUT_EV_CHARGERS, [])
+        # Backward compat: if old "easee" key exists and ev_chargers is empty
+        if not ev_chargers_cfg:
+            legacy = self.inputs.get(INPUT_EASEE, {})
+            if legacy:
+                ev_chargers_cfg = [legacy]
+
+        total_ev_power = 0.0
+        ev_any_connected = False
+        ev_details = []
+        for charger in (ev_chargers_cfg if isinstance(ev_chargers_cfg, list) else []):
+            name = charger.get("name", "ev")
+            power_raw = self._get_state_float(charger.get("power"))
+            power_unit = charger.get("power_unit", "W")
+            # Convert kW → W if needed
+            power_w = power_raw * 1000 if power_unit == "kW" else power_raw
+            status = self._get_state_str(charger.get("status"))
+            switch_state = self._get_state_str(charger.get("charger_switch"))
+            is_connected = status in ("charging", "awaiting_start", "connected")
+            if switch_state == "on":
+                is_connected = True
+
+            total_ev_power += power_w
+            if is_connected:
+                ev_any_connected = True
+
+            ev_details.append({
+                "name": name,
+                "power_w": power_w,
+                "status": status,
+                "connected": is_connected,
+            })
+
+        data["ev_power"] = total_ev_power
+        data["ev_connected"] = ev_any_connected
+        data["ev_chargers"] = ev_details
 
         # Smart meter
         sm = self.inputs.get(INPUT_SMART_METER, {})
@@ -221,12 +268,31 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
 
         # Weather (optional)
         weather = self.inputs.get(INPUT_WEATHER, {})
-        data["temperature"] = self._get_state_float(weather.get("temperature"))
+        weather_entity = weather.get("entity")
+        temp_entity = weather.get("temperature")
+
+        if temp_entity:
+            data["temperature"] = self._get_state_float(temp_entity)
+        elif weather_entity:
+            # Read temperature from weather entity's attributes
+            state = self.hass.states.get(weather_entity)
+            if state:
+                data["temperature"] = _safe_float(
+                    state.attributes.get("temperature", 0), 0.0
+                )
+        else:
+            data["temperature"] = 0.0
 
         return data
 
     def _read_prices(self) -> dict[str, Any]:
-        """Read Nordpool price data from HA."""
+        """Read Nordpool price data from HA.
+
+        Handles both hourly (24 entries/day) and sub-hourly
+        (e.g. 96 entries/day for 15-min intervals) price data.
+        Aggregates sub-hourly prices to hourly averages for the
+        optimizer and predictor.
+        """
         np_cfg = self.inputs.get(INPUT_NORDPOOL, {})
         entity_id = np_cfg.get("current_price")
         if not entity_id:
@@ -240,14 +306,23 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         current = _safe_float(state.state, 0)
         today_attr = np_cfg.get("today_prices_attribute", "today")
         tomorrow_attr = np_cfg.get("tomorrow_prices_attribute", "tomorrow")
+        entries_per_hour = np_cfg.get("entries_per_hour", DEFAULT_ENTRIES_PER_HOUR)
 
-        today_prices = state.attributes.get(today_attr, [])
-        tomorrow_prices = state.attributes.get(tomorrow_attr, [])
+        raw_today = state.attributes.get(today_attr, [])
+        raw_tomorrow = state.attributes.get(tomorrow_attr, [])
+
+        # Convert to float lists
+        today_floats = [_safe_float(p, current) for p in raw_today] if raw_today else []
+        tomorrow_floats = [_safe_float(p, current) for p in raw_tomorrow] if raw_tomorrow else []
+
+        # Aggregate to hourly if sub-hourly
+        today_prices = _aggregate_to_hourly(today_floats, entries_per_hour)
+        tomorrow_prices = _aggregate_to_hourly(tomorrow_floats, entries_per_hour)
 
         return {
             "current": current,
-            "today": [_safe_float(p, current) for p in today_prices] if today_prices else [],
-            "tomorrow": [_safe_float(p, current) for p in tomorrow_prices] if tomorrow_prices else [],
+            "today": today_prices,
+            "tomorrow": tomorrow_prices,
             "currency": np_cfg.get("currency", "SEK"),
         }
 
@@ -314,3 +389,21 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
         return float(value)
     except (ValueError, TypeError):
         return default
+
+
+def _aggregate_to_hourly(prices: list[float], entries_per_hour: int) -> list[float]:
+    """Aggregate sub-hourly prices to hourly averages.
+
+    If entries_per_hour is 1, returns the list unchanged.
+    If entries_per_hour is 4 (15-min), groups every 4 entries
+    and returns their average.
+    """
+    if entries_per_hour <= 1 or not prices:
+        return prices
+
+    hourly = []
+    for i in range(0, len(prices), entries_per_hour):
+        chunk = prices[i : i + entries_per_hour]
+        if chunk:
+            hourly.append(sum(chunk) / len(chunk))
+    return hourly

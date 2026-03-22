@@ -9,11 +9,24 @@ MAPPING_PATH = os.path.join(
     os.path.dirname(__file__), "..", "config", "variable_mapping.yaml"
 )
 
+LOCAL_MAPPING_PATH = os.path.join(
+    os.path.dirname(__file__), "..", "config", "variable_mapping.local.yaml"
+)
+
 
 @pytest.fixture
 def mapping():
     """Load the variable mapping YAML file."""
     with open(MAPPING_PATH, "r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+@pytest.fixture
+def local_mapping():
+    """Load the local variable mapping YAML file if it exists."""
+    if not os.path.exists(LOCAL_MAPPING_PATH):
+        pytest.skip("local mapping file not present")
+    with open(LOCAL_MAPPING_PATH, "r", encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
@@ -37,8 +50,8 @@ class TestMappingStructure:
     def test_inputs_has_nordpool(self, mapping):
         assert "nordpool" in mapping["inputs"], "Inputs must include 'nordpool'"
 
-    def test_inputs_has_easee(self, mapping):
-        assert "easee" in mapping["inputs"], "Inputs must include 'easee'"
+    def test_inputs_has_ev_chargers(self, mapping):
+        assert "ev_chargers" in mapping["inputs"], "Inputs must include 'ev_chargers'"
 
     def test_inputs_has_sungrow(self, mapping):
         assert "sungrow" in mapping["inputs"], "Inputs must include 'sungrow'"
@@ -60,6 +73,11 @@ class TestMappingStructure:
         np = mapping["inputs"]["nordpool"]
         assert "tomorrow_prices_attribute" in np
 
+    def test_nordpool_has_entries_per_hour(self, mapping):
+        np = mapping["inputs"]["nordpool"]
+        assert "entries_per_hour" in np
+        assert np["entries_per_hour"] in (1, 2, 4)
+
     # --- Sungrow required fields ---
 
     def test_sungrow_has_battery_soc(self, mapping):
@@ -78,20 +96,23 @@ class TestMappingStructure:
         sg = mapping["inputs"]["sungrow"]
         assert "house_load" in sg
 
-    # --- Easee required fields ---
+    # --- EV Chargers (list-based) ---
 
-    def test_easee_has_status(self, mapping):
-        easee = mapping["inputs"]["easee"]
-        assert "status" in easee
+    def test_ev_chargers_is_list(self, mapping):
+        ev = mapping["inputs"]["ev_chargers"]
+        assert isinstance(ev, list), "ev_chargers must be a list"
+        assert len(ev) >= 1, "Must have at least one EV charger"
 
-    def test_easee_has_power(self, mapping):
-        easee = mapping["inputs"]["easee"]
-        assert "power" in easee
+    def test_ev_charger_has_required_fields(self, mapping):
+        for charger in mapping["inputs"]["ev_chargers"]:
+            assert "name" in charger, "Each EV charger must have a 'name'"
+            assert "power" in charger, "Each EV charger must have a 'power' sensor"
+            assert "charger_switch" in charger, "Each EV charger must have a 'charger_switch'"
 
     # --- Output sections ---
 
-    def test_outputs_has_easee(self, mapping):
-        assert "easee" in mapping["outputs"]
+    def test_outputs_has_ev_chargers(self, mapping):
+        assert "ev_chargers" in mapping["outputs"]
 
     def test_outputs_has_sungrow(self, mapping):
         assert "sungrow" in mapping["outputs"]
@@ -123,25 +144,16 @@ class TestMappingStructure:
         assert "capacity_kwh" in sg
         assert sg["capacity_kwh"] > 0
 
-    # --- Easee output actions ---
+    # --- EV Charger output actions ---
 
-    def test_easee_output_has_start_charging(self, mapping):
-        easee = mapping["outputs"]["easee"]
-        assert "start_charging" in easee
-        assert "service" in easee["start_charging"]
-
-    def test_easee_output_has_stop_charging(self, mapping):
-        easee = mapping["outputs"]["easee"]
-        assert "stop_charging" in easee
-        assert "service" in easee["stop_charging"]
-
-    def test_easee_output_has_current_limit(self, mapping):
-        easee = mapping["outputs"]["easee"]
-        assert "set_current_limit" in easee
-        limit = easee["set_current_limit"]
-        assert "min_amps" in limit
-        assert "max_amps" in limit
-        assert limit["min_amps"] < limit["max_amps"]
+    def test_ev_charger_output_has_start_stop(self, mapping):
+        ev_list = mapping["outputs"]["ev_chargers"]
+        assert isinstance(ev_list, list), "ev_chargers outputs must be a list"
+        for charger in ev_list:
+            assert "start_charging" in charger, f"Charger {charger.get('name')} must have start_charging"
+            assert "stop_charging" in charger, f"Charger {charger.get('name')} must have stop_charging"
+            assert "service" in charger["start_charging"]
+            assert "service" in charger["stop_charging"]
 
     # --- Parameters ---
 
@@ -165,3 +177,27 @@ class TestMappingStructure:
         assert "prediction_history_days" in params
         assert "prediction_recency_weight" in params
         assert 0 <= params["prediction_recency_weight"] <= 1
+
+
+class TestLocalMapping:
+    """Validate the local mapping has no CHANGE_ME placeholders."""
+
+    def test_no_change_me_in_local(self, local_mapping):
+        """Ensure no CHANGE_ME placeholders remain in the local file."""
+        yaml_str = yaml.dump(local_mapping)
+        assert "CHANGE_ME" not in yaml_str, (
+            "Local mapping still contains CHANGE_ME placeholders"
+        )
+
+    def test_local_has_same_structure(self, local_mapping):
+        """Local mapping should have the same top-level sections."""
+        assert "inputs" in local_mapping
+        assert "outputs" in local_mapping
+        assert "parameters" in local_mapping
+
+    def test_local_ev_chargers_configured(self, local_mapping):
+        ev = local_mapping["inputs"]["ev_chargers"]
+        assert isinstance(ev, list)
+        assert len(ev) >= 1
+        for charger in ev:
+            assert "CHANGE_ME" not in str(charger)

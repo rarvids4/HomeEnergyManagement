@@ -1,6 +1,6 @@
 """Home Energy Management — Custom Integration for Home Assistant.
 
-Optimises charging/discharging of Easee charger and Sungrow battery
+Optimises charging/discharging of EV chargers and Sungrow battery
 based on Nordpool energy prices and predicted consumption patterns.
 """
 
@@ -17,6 +17,7 @@ from .const import (
     CONF_MAPPING_PATH,
     DEFAULT_MAPPING_PATH,
     DOMAIN,
+    LOCAL_MAPPING_PATH,
     PLATFORMS,
 )
 from .coordinator import EnergyManagementCoordinator
@@ -28,18 +29,38 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Home Energy Management from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    # Load variable mapping
+    # Load variable mapping — prefer local override, fall back to template
     mapping_path = entry.data.get(CONF_MAPPING_PATH, DEFAULT_MAPPING_PATH)
+    local_path = LOCAL_MAPPING_PATH
+
+    # Resolve relative paths
     if not os.path.isabs(mapping_path):
         mapping_path = os.path.join(hass.config.config_dir, mapping_path)
+    if not os.path.isabs(local_path):
+        local_path = os.path.join(hass.config.config_dir, local_path)
 
-    mapping = await hass.async_add_executor_job(_load_mapping, mapping_path)
+    # Try local first, then template
+    mapping = None
+    if os.path.exists(local_path):
+        mapping = await hass.async_add_executor_job(_load_mapping, local_path)
+        if mapping:
+            _LOGGER.info("Loaded LOCAL variable mapping from %s", local_path)
+
     if mapping is None:
-        _LOGGER.error("Failed to load variable mapping from %s", mapping_path)
+        mapping = await hass.async_add_executor_job(_load_mapping, mapping_path)
+        if mapping:
+            _LOGGER.info("Loaded variable mapping from %s", mapping_path)
+
+    if mapping is None:
+        _LOGGER.error(
+            "Failed to load variable mapping from %s or %s",
+            local_path,
+            mapping_path,
+        )
         return False
 
     _LOGGER.info(
-        "Loaded variable mapping with %d inputs, %d outputs",
+        "Variable mapping: %d inputs, %d outputs",
         len(mapping.get("inputs", {})),
         len(mapping.get("outputs", {})),
     )

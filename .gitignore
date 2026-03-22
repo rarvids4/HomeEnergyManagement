@@ -14,3 +14,6 @@ config/variable_mapping.local.yaml
 # Any local secrets / tokens
 .ha_token
 secrets.yaml
+check_ssh.py
+deploy.py
+ha_deploy_commands.sh

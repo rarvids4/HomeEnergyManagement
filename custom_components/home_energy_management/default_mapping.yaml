@@ -1,0 +1,191 @@
+# ============================================================
+# Home Energy Management — Variable Mapping (Template)
+# ============================================================
+#
+# This file maps generic variable names used by the integration
+# to YOUR specific Home Assistant entity IDs.
+#
+# HOW TO USE:
+#   1. Copy this file to  config/variable_mapping.local.yaml
+#   2. Replace every "CHANGE_ME_*" placeholder with your real entity ID
+#   3. Delete any sections that don't apply (e.g. sungrow_2, second EV)
+#   4. Restart Home Assistant after editing
+#
+# The integration loads variable_mapping.local.yaml first (gitignored),
+# falling back to this file if the local copy doesn't exist.
+#
+# ============================================================
+
+# ----------------------------------------------------------
+# INPUT VARIABLES (sensors the integration READS)
+# ----------------------------------------------------------
+inputs:
+
+  # --- Nordpool electricity prices ---
+  nordpool:
+    # The Nordpool sensor entity
+    current_price: "sensor.CHANGE_ME_nordpool_kwh_se3_sek_3_10_025"
+    # Attribute on the sensor that holds today's price list
+    today_prices_attribute: "today"
+    # Attribute for tomorrow's prices (available after ~13:00)
+    tomorrow_prices_attribute: "tomorrow"
+    # Optional: raw attributes with {start, end, value} objects
+    raw_today_attribute: "raw_today"
+    raw_tomorrow_attribute: "raw_tomorrow"
+    # Number of price entries per hour (1 = hourly, 4 = 15-min)
+    entries_per_hour: 4
+    # Currency & unit
+    currency: "SEK"
+    price_unit: "kWh"
+
+  # --- EV Chargers ---
+  # List of chargers. Each charger is controlled via a switch entity.
+  # Add or remove entries to match your setup.
+  ev_chargers:
+    - name: "my_ev"
+      friendly_name: "My Electric Vehicle"
+      status: "sensor.CHANGE_ME_ev_status"
+      power: "sensor.CHANGE_ME_ev_power"
+      # Power unit: "kW" or "W"
+      power_unit: "kW"
+      session_energy: "sensor.CHANGE_ME_ev_session_energy"
+      lifetime_energy: "sensor.CHANGE_ME_ev_lifetime_energy"
+      # Switch to enable/disable charging
+      charger_switch: "switch.CHANGE_ME_ev_charger_enabled"
+
+  # --- Sungrow Inverter / Battery (primary) ---
+  sungrow:
+    battery_soc: "sensor.CHANGE_ME_battery_level"
+    # Signed battery power: positive = charging, negative = discharging (W)
+    battery_power: "sensor.CHANGE_ME_signed_battery_power"
+    pv_power: "sensor.CHANGE_ME_total_dc_power"
+    grid_import_power: "sensor.CHANGE_ME_import_power"
+    grid_export_power: "sensor.CHANGE_ME_export_power"
+    house_load: "sensor.CHANGE_ME_load_power"
+    daily_pv_energy: "sensor.CHANGE_ME_daily_pv_generation"
+    daily_grid_import: "sensor.CHANGE_ME_daily_imported_energy"
+    daily_grid_export: "sensor.CHANGE_ME_daily_exported_energy"
+    daily_battery_charge: "sensor.CHANGE_ME_daily_battery_charge"
+    daily_battery_discharge: "sensor.CHANGE_ME_daily_battery_discharge"
+    battery_soh: "sensor.CHANGE_ME_battery_state_of_health"
+    battery_capacity_kwh: 10.0
+    # MPPT channels (optional)
+    mppt1_power: "sensor.CHANGE_ME_mppt1_power"
+    mppt2_power: "sensor.CHANGE_ME_mppt2_power"
+
+  # --- Sungrow Inverter 2 (optional — delete if you only have one) ---
+  # sungrow_2:
+  #   battery_soc: "sensor.CHANGE_ME_battery_level_2"
+  #   battery_power: "sensor.CHANGE_ME_signed_battery_power_2"
+  #   pv_power: "sensor.CHANGE_ME_total_dc_power_2"
+  #   grid_import_power: "sensor.CHANGE_ME_import_power_2"
+  #   grid_export_power: "sensor.CHANGE_ME_export_power_2"
+  #   house_load: "sensor.CHANGE_ME_load_power_2"
+
+  # --- Smart Meter / Grid ---
+  smart_meter:
+    total_import: "sensor.CHANGE_ME_total_grid_import"
+    total_export: "sensor.CHANGE_ME_total_grid_export"
+    import_power: "sensor.CHANGE_ME_grid_import_power"
+    export_power: "sensor.CHANGE_ME_grid_export_power"
+    # Optional: surplus charging switch
+    # surplus_charging: "switch.CHANGE_ME_surplus_charging"
+
+  # --- Weather (optional, improves PV prediction) ---
+  weather:
+    entity: "weather.CHANGE_ME_home"
+    # Outdoor temperature sensor (null to read from weather entity)
+    temperature: null
+
+
+# ----------------------------------------------------------
+# OUTPUT VARIABLES (entities/services the integration CONTROLS)
+# ----------------------------------------------------------
+outputs:
+
+  # --- EV Charger Control ---
+  # Each charger uses switch.turn_on / switch.turn_off
+  ev_chargers:
+    - name: "my_ev"
+      start_charging:
+        service: "switch.turn_on"
+        entity_id: "switch.CHANGE_ME_ev_charger_enabled"
+      stop_charging:
+        service: "switch.turn_off"
+        entity_id: "switch.CHANGE_ME_ev_charger_enabled"
+
+  # --- Sungrow Battery Control ---
+  sungrow:
+    # Script-based mode switching (recommended for Sungrow)
+    force_charge:
+      service: "script.turn_on"
+      entity_id: "script.CHANGE_ME_sg_set_forced_charge_battery_mode"
+    force_discharge:
+      service: "script.turn_on"
+      entity_id: "script.CHANGE_ME_sg_set_forced_discharge_battery_mode"
+    self_consumption:
+      service: "script.turn_on"
+      entity_id: "script.CHANGE_ME_sg_set_self_consumption_mode"
+    # Optional additional modes
+    # self_consumption_limited:
+    #   service: "script.turn_on"
+    #   entity_id: "script.CHANGE_ME_sg_set_self_consumption_limited_discharge"
+    # battery_bypass:
+    #   service: "script.turn_on"
+    #   entity_id: "script.CHANGE_ME_sg_set_battery_bypass_mode"
+
+    # Alternative: input_select for battery mode
+    battery_mode_select: "input_select.CHANGE_ME_battery_forced_charge_discharge_cmd"
+    battery_mode_options:
+      stop: "Stop (default)"
+      force_charge: "Forced charge"
+      force_discharge: "Forced discharge"
+
+    # Power limits
+    set_charge_power:
+      service: "input_number.set_value"
+      entity_id: "input_number.CHANGE_ME_battery_max_charge_power"
+      min: 100
+      max: 5000
+      step: 100
+    set_discharge_power:
+      service: "input_number.set_value"
+      entity_id: "input_number.CHANGE_ME_battery_max_discharge_power"
+      min: 10
+      max: 5000
+      step: 100
+
+    # SoC limits
+    set_min_soc:
+      service: "input_number.set_value"
+      entity_id: "input_number.CHANGE_ME_min_soc"
+    set_max_soc:
+      service: "input_number.set_value"
+      entity_id: "input_number.CHANGE_ME_max_soc"
+
+    # Operational battery limits
+    min_soc: 10
+    max_soc: 100
+    capacity_kwh: 10.0
+
+
+# ----------------------------------------------------------
+# SYSTEM PARAMETERS (tuning knobs — not entity IDs)
+# ----------------------------------------------------------
+parameters:
+  # How often to re-run the optimizer (minutes)
+  optimization_interval_minutes: 15
+  # How many hours ahead to plan
+  planning_horizon_hours: 24
+  # Minimum price difference (SEK/kWh) to justify a charge/discharge cycle
+  min_price_spread: 0.30
+  # Number of days of history to use for consumption prediction
+  prediction_history_days: 14
+  # Weight for recent days in prediction (0.0–1.0, higher = more weight on recent)
+  prediction_recency_weight: 0.7
+  # Enable/disable EV charger control
+  enable_charger_control: true
+  # Enable/disable battery control
+  enable_battery_control: true
+  # Log level for internal prediction log (debug / info / warning)
+  log_level: "info"

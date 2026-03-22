@@ -2,3 +2,18 @@ force_replan:
   name: Force replan
   description: Force the optimizer to re-run immediately.
   fields: {}
+
+write_local_config:
+  name: Write local config
+  description: >-
+    Write the local variable mapping file with your real entity IDs.
+    Paste the full YAML content of your variable_mapping.local.yaml.
+    After writing, restart Home Assistant to pick up the changes.
+  fields:
+    content:
+      name: YAML content
+      description: The full YAML content of variable_mapping.local.yaml
+      required: true
+      selector:
+        text:
+          multiline: true

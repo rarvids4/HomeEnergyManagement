@@ -21,6 +21,7 @@ from .const import (
     PLATFORMS,
 )
 from .coordinator import EnergyManagementCoordinator
+from .services import async_register_services
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -29,15 +30,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Set up Home Energy Management from a config entry."""
     hass.data.setdefault(DOMAIN, {})
 
-    # Load variable mapping — prefer local override, fall back to template
-    mapping_path = entry.data.get(CONF_MAPPING_PATH, DEFAULT_MAPPING_PATH)
-    local_path = LOCAL_MAPPING_PATH
+    # Register services (including write_local_config)
+    await async_register_services(hass)
 
-    # Resolve relative paths
+    # Load variable mapping — prefer local override, fall back to bundled template
+    # Local override lives at <HA config root>/variable_mapping.local.yaml
+    local_path = os.path.join(hass.config.config_dir, LOCAL_MAPPING_PATH)
+    # Default mapping bundled inside the component package
+    component_dir = os.path.dirname(os.path.abspath(__file__))
+    mapping_path = entry.data.get(CONF_MAPPING_PATH, DEFAULT_MAPPING_PATH)
     if not os.path.isabs(mapping_path):
-        mapping_path = os.path.join(hass.config.config_dir, mapping_path)
-    if not os.path.isabs(local_path):
-        local_path = os.path.join(hass.config.config_dir, local_path)
+        mapping_path = os.path.join(component_dir, mapping_path)
 
     # Try local first, then template
     mapping = None

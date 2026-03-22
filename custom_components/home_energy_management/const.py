@@ -6,10 +6,10 @@ PLATFORMS = ["sensor"]
 # Config keys
 CONF_MAPPING_PATH = "mapping_path"
 
-# Default path relative to HA config dir
-DEFAULT_MAPPING_PATH = "custom_components/home_energy_management/../../config/variable_mapping.yaml"
-# Local override (gitignored) — loaded first if it exists
-LOCAL_MAPPING_PATH = "custom_components/home_energy_management/../../config/variable_mapping.local.yaml"
+# Default mapping bundled inside the component (deployed via HACS)
+DEFAULT_MAPPING_PATH = "default_mapping.yaml"
+# Local override in HA config root (writable via write_local_config service)
+LOCAL_MAPPING_PATH = "variable_mapping.local.yaml"
 
 # Coordinator update interval (seconds) — overridden by mapping parameters
 DEFAULT_UPDATE_INTERVAL = 900  # 15 minutes

@@ -1946,8 +1946,8 @@ class TestEVChargePlanning:
         )
 
         plan = result["ev_charge_schedule"]
-        # EX90: (95 - 89) / 100 * 111 = 6.66 kWh (default target=95%)
-        assert abs(plan["total_kwh_needed"] - 6.7) < 0.5
+        # EX90: (100 - 89) / 100 * 111 = 12.21 kWh (default target=100%)
+        assert abs(plan["total_kwh_needed"] - 12.2) < 0.5
 
     def test_ev_no_charging_when_at_target(self, default_params, default_outputs):
         """No EV charging scheduled when already at target SoC."""
@@ -2101,7 +2101,7 @@ class TestEVChargePlanning:
         assert len(vehicles) == 1
         assert vehicles[0]["name"] == "ex90"
         assert vehicles[0]["soc"] == 89
-        assert vehicles[0]["target_soc"] == 95  # optimizer default target
+        assert vehicles[0]["target_soc"] == 100  # optimizer default target
         assert vehicles[0]["capacity_kwh"] == 111
         assert vehicles[0]["connected"] is True
         assert "scheduled_hours" in vehicles[0]
@@ -2129,13 +2129,13 @@ class TestEVChargePlanning:
 
 
 class TestEVGridMinimization:
-    """Tests for EV grid minimization: ramp-down, night preference, weekend target.
+    """Tests for EV grid minimization: ramp-down, night preference, Friday target.
 
     The optimizer should minimize grid energy consumption by:
       - Stopping charger when vehicle SoC >= target (ramp-down)
       - Preferring night hours (22:00-06:00) for charging (off-peak)
-      - Lowering target SoC on weekends (car parked at home, solar later)
-      - Overriding weekend target during negative prices (get paid to charge)
+      - Lowering target SoC on Friday (car parked at home Sat, solar fills later)
+      - Overriding Friday target during negative prices (get paid to charge)
     """
 
     @pytest.fixture
@@ -2271,17 +2271,17 @@ class TestEVGridMinimization:
     # Weekend target SoC
     # ------------------------------------------------------------------
 
-    def test_weekend_lower_target_stops_charger(
+    def test_friday_lower_target_stops_charger(
         self, default_params, default_outputs, ev_vehicle_ex90_at_80
     ):
-        """On weekends, charger should stop at ev_weekend_target_soc (80%)
+        """On Friday, charger should stop at ev_weekend_target_soc (80%)
         even though vehicle target is 100%."""
-        # Patch to Saturday
-        fake_saturday = datetime(2025, 1, 4, 0, 0, 0)  # Saturday
+        # Patch to Friday
+        fake_friday = datetime(2025, 1, 3, 0, 0, 0)  # Friday
         with patch(
             "custom_components.home_energy_management.optimizer.datetime"
         ) as mock_dt:
-            mock_dt.now.return_value = fake_saturday
+            mock_dt.now.return_value = fake_friday
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
             opt = Optimizer(default_params, default_outputs)
@@ -2300,10 +2300,10 @@ class TestEVGridMinimization:
             )
 
         actions = result["immediate_actions"]
-        # Weekend + SoC=80% >= weekend_target=80% → stop
+        # Friday + SoC=80% >= weekend_target=80% → stop
         ev_stop = [a for a in actions if a["service"] == "switch.turn_off"
                    and "ex90" in a.get("entity_id", "")]
-        assert len(ev_stop) >= 1, "Should stop at weekend target (80%)"
+        assert len(ev_stop) >= 1, "Should stop at Friday target (80%)"
 
     def test_weekday_charges_to_full_target(
         self, default_params, default_outputs, ev_vehicle_ex90_at_80
@@ -2331,16 +2331,51 @@ class TestEVGridMinimization:
                     and "ex90" in a.get("entity_id", "")]
         assert len(ev_start) >= 1, "Weekday should charge past 80% toward 100%"
 
-    def test_weekend_negative_price_overrides_target(
+    def test_saturday_charges_to_full_target(
         self, default_params, default_outputs, ev_vehicle_ex90_at_80
     ):
-        """On weekends, negative prices should override the weekend target —
-        charge to full vehicle target (we get paid to consume)."""
-        fake_saturday = datetime(2025, 1, 4, 0, 0, 0)  # Saturday
+        """On Saturday, charger should continue past 80% toward 100%
+        (Monday is coming — only Friday uses the lower target)."""
+        fake_saturday = datetime(2025, 1, 4, 22, 0, 0)  # Saturday 22:00
         with patch(
             "custom_components.home_energy_management.optimizer.datetime"
         ) as mock_dt:
             mock_dt.now.return_value = fake_saturday
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            opt = Optimizer(default_params, default_outputs)
+            prices = {
+                "today": [0.05] * 24,
+                "tomorrow": [],
+                "currency": "SEK",
+            }
+
+            result = opt.optimize(
+                prices=prices,
+                predicted_consumption=[1.0] * 24,
+                battery_soc=50,
+                ev_connected=True,
+                ev_vehicles=ev_vehicle_ex90_at_80,
+            )
+
+        actions = result["immediate_actions"]
+        # Saturday + SoC=80% < target=100% + cheap price → should charge
+        ev_start = [a for a in actions if a["service"] == "switch.turn_on"
+                    and "ex90" in a.get("entity_id", "")]
+        assert len(ev_start) >= 1, (
+            "Saturday should charge to full 100% target (Monday coming)"
+        )
+
+    def test_friday_negative_price_overrides_target(
+        self, default_params, default_outputs, ev_vehicle_ex90_at_80
+    ):
+        """On Friday, negative prices should override the lower target —
+        charge to full vehicle target (we get paid to consume)."""
+        fake_friday = datetime(2025, 1, 3, 0, 0, 0)  # Friday
+        with patch(
+            "custom_components.home_energy_management.optimizer.datetime"
+        ) as mock_dt:
+            mock_dt.now.return_value = fake_friday
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
             opt = Optimizer(default_params, default_outputs)
@@ -2366,15 +2401,15 @@ class TestEVGridMinimization:
             "Negative price should override weekend target and charge to full"
         )
 
-    def test_weekend_reduces_scheduled_kwh(
+    def test_friday_reduces_scheduled_kwh(
         self, default_params, default_outputs, ev_vehicle_ex90_charging
     ):
-        """On weekends, the scheduled kWh should be less (lower target)."""
-        fake_saturday = datetime(2025, 1, 4, 0, 0, 0)
+        """On Friday, the scheduled kWh should be less (lower target)."""
+        fake_friday = datetime(2025, 1, 3, 0, 0, 0)  # Friday
         with patch(
             "custom_components.home_energy_management.optimizer.datetime"
         ) as mock_dt:
-            mock_dt.now.return_value = fake_saturday
+            mock_dt.now.return_value = fake_friday
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
             opt = Optimizer(default_params, default_outputs)
@@ -2384,7 +2419,7 @@ class TestEVGridMinimization:
                 "currency": "SEK",
             }
 
-            result_weekend = opt.optimize(
+            result_friday = opt.optimize(
                 prices=prices,
                 predicted_consumption=[1.0] * 24,
                 battery_soc=50,
@@ -2402,13 +2437,13 @@ class TestEVGridMinimization:
             ev_vehicles=ev_vehicle_ex90_charging,
         )
 
-        weekend_kwh = result_weekend["ev_charge_schedule"]["total_kwh_needed"]
+        friday_kwh = result_friday["ev_charge_schedule"]["total_kwh_needed"]
         weekday_kwh = result_weekday["ev_charge_schedule"]["total_kwh_needed"]
 
-        # Weekend: (80-50)/100 * 111 = 33.3 kWh
+        # Friday: (80-50)/100 * 111 = 33.3 kWh
         # Weekday: (100-50)/100 * 111 = 55.5 kWh
-        assert weekend_kwh < weekday_kwh, (
-            f"Weekend ({weekend_kwh}) should need less kWh than weekday ({weekday_kwh})"
+        assert friday_kwh < weekday_kwh, (
+            f"Friday ({friday_kwh}) should need less kWh than weekday ({weekday_kwh})"
         )
 
     # ------------------------------------------------------------------
@@ -2546,11 +2581,11 @@ class TestEVGridMinimization:
             f"EV should not charge during discharge hours. Overlap: {overlap}"
         )
 
-    def test_ramp_down_weekend_and_night_combined(
+    def test_ramp_down_friday_and_night_combined(
         self, default_params, default_outputs
     ):
-        """Combined scenario: weekend + night preference + ramp-down.
-        Car at 85% on Saturday → should stop (above weekend target 80%)."""
+        """Combined scenario: Friday + night preference + ramp-down.
+        Car at 85% on Friday → should stop (above Friday target 80%)."""
         ev_vehicle = [{
             "name": "ex90",
             "power_w": 3000,
@@ -2562,11 +2597,11 @@ class TestEVGridMinimization:
             "vehicle_charging_power_w": 3000,
         }]
 
-        fake_saturday = datetime(2025, 1, 4, 2, 0, 0)  # Saturday 02:00
+        fake_friday = datetime(2025, 1, 3, 2, 0, 0)  # Friday 02:00
         with patch(
             "custom_components.home_energy_management.optimizer.datetime"
         ) as mock_dt:
-            mock_dt.now.return_value = fake_saturday
+            mock_dt.now.return_value = fake_friday
             mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
 
             opt = Optimizer(default_params, default_outputs)
@@ -2585,13 +2620,13 @@ class TestEVGridMinimization:
             )
 
         actions = result["immediate_actions"]
-        # Saturday, SoC=85% > weekend_target=80% → stop
+        # Friday, SoC=85% > friday_target=80% → stop
         ev_stop = [a for a in actions if a["service"] == "switch.turn_off"
                    and "ex90" in a.get("entity_id", "")]
-        assert len(ev_stop) >= 1, "Should stop at weekend — SoC above weekend target"
+        assert len(ev_stop) >= 1, "Should stop on Friday — SoC above Friday target"
 
         # EV schedule should also show reduced kwh (or 0)
         ev_plan = result["ev_charge_schedule"]
         assert ev_plan["total_kwh_needed"] == 0, (
-            "No kWh needed when SoC >= weekend target"
+            "No kWh needed when SoC >= Friday target"
         )

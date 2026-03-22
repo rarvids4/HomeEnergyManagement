@@ -72,10 +72,10 @@ DEFAULT_EV_NIGHT_START = 22   # 22:00
 DEFAULT_EV_NIGHT_END = 6      # 06:00
 # Night hours get this bonus in sorting (SEK/kWh) — prefer night over day
 DEFAULT_EV_NIGHT_PREFERENCE_SEK = 0.10
-# On weekends, target lower SoC (car parked at home, can charge from solar later)
+# On Friday evenings, target lower SoC (car parked at home Sat, solar fills later)
 DEFAULT_EV_WEEKEND_TARGET_SOC = 80  # %
 # Default EV target SoC for night charging (charge if below this)
-DEFAULT_EV_TARGET_SOC = 95  # %
+DEFAULT_EV_TARGET_SOC = 100  # %
 
 # --- Nordpool ---
 DEFAULT_ENTRIES_PER_HOUR = 1  # 1 = hourly prices, 4 = 15-min

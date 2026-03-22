@@ -196,8 +196,8 @@ parameters:
   ev_night_start: 22
   ev_night_end: 6
   ev_night_preference_sek: 0.10
-  ev_weekend_target_soc: 80
+  ev_weekend_target_soc: 80        # Friday-only: lower target so Saturday starts lower
   # Default EV target SoC (%) — vehicles below this will be scheduled to charge
-  ev_default_target_soc: 95
+  ev_default_target_soc: 100
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"

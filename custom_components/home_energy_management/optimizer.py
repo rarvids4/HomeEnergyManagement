@@ -525,7 +525,7 @@ class Optimizer:
             return empty_result
 
         now_dt = datetime.now()
-        is_weekend = now_dt.weekday() >= 5  # Saturday=5, Sunday=6
+        is_friday = now_dt.weekday() == 4  # Friday=4 — lower target so Sat starts lower
 
         # Build candidate hours (shared across vehicles):
         # all plan hours except discharge_battery, ranked by night-adjusted price.
@@ -554,11 +554,11 @@ class Optimizer:
             charging_w = ev.get("vehicle_charging_power_w", 0)
             connected = ev.get("connected", False)
 
-            # Use optimizer's default target (95%) — not the vehicle API target
+            # Use optimizer's default target (100%) — not the vehicle API target
             target = self.ev_default_target_soc
 
-            # Weekend: lower target if weekend_target < default target
-            if is_weekend and self.ev_weekend_target_soc < target:
+            # Friday: lower target so Saturday starts lower (solar fills rest)
+            if is_friday and self.ev_weekend_target_soc < target:
                 target = self.ev_weekend_target_soc
 
             # Determine charging power (kW)
@@ -862,7 +862,7 @@ class Optimizer:
             vehicle_map[v.get("name", "")] = v
 
         now = datetime.now()
-        is_weekend = now.weekday() >= 5
+        is_friday = now.weekday() == 4  # Friday=4
 
         for charger_cfg in ev_chargers:
             charger_name = charger_cfg.get("name", "")
@@ -879,7 +879,7 @@ class Optimizer:
 
                 # Use optimizer's default target (matches the schedule)
                 effective_target = self.ev_default_target_soc
-                if is_weekend and self.ev_weekend_target_soc < effective_target:
+                if is_friday and self.ev_weekend_target_soc < effective_target:
                     effective_target = self.ev_weekend_target_soc
 
                 if vehicle_soc > 0 and vehicle_soc >= effective_target:

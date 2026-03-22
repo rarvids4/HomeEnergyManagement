@@ -5,13 +5,19 @@ battery state, and EV connection status, and produces an hour-by-hour
 schedule of actions (charge battery, discharge, start EV, etc.).
 
 Key strategies:
+  - **Solar surplus** (highest priority after negative prices): When
+    solar panels are producing more than the house consumes (i.e. we
+    are exporting to the grid), the battery should absorb that free
+    energy.  Self-consumption mode on the inverter handles this
+    automatically.  This overrides pre-discharge and force-charge.
   - **Negative prices**: Self-consumption mode — the battery absorbs
     any solar surplus (preventing grid export) and EVs charge.
     We do NOT force-charge from the grid.
   - **Pre-discharge**: When negative prices are approaching in the next
-    few hours, discharge the battery first to create room so it can
-    absorb surplus during the negative window.
-  - **Cheap hours**: Charge battery from grid.
+    few hours *and there is no solar surplus*, discharge the battery
+    first to create room so it can absorb surplus during the negative
+    window.
+  - **Cheap hours (no solar)**: Charge battery from grid.
   - **Expensive hours**: Discharge battery to avoid grid import.
   - **Normal hours**: Self-consumption mode.
 """
@@ -153,6 +159,7 @@ class Optimizer:
                 battery_soc=battery_soc,
                 consumption=consumption,
                 upcoming_prices=upcoming_prices,
+                grid_export_power=grid_export_power if i == 0 else 0.0,
             )
 
             hourly_plan.append({
@@ -220,15 +227,17 @@ class Optimizer:
         battery_soc: float,
         consumption: float,
         upcoming_prices: list[float] | None = None,
+        grid_export_power: float = 0.0,
     ) -> tuple[str, str]:
         """Decide what to do in a given hour based on price position.
 
         Priority order:
-          1. Negative price  → MAXIMIZE_LOAD (charge everything)
-          2. Pre-discharge   → empty battery before upcoming negatives
-          3. Cheap hour      → charge battery
-          4. Expensive hour  → discharge battery
-          5. Otherwise       → self-consumption
+          1. Negative price   → MAXIMIZE_LOAD (charge everything)
+          2. Solar surplus     → SELF_CONSUMPTION (absorb free solar)
+          3. Pre-discharge     → empty battery before upcoming negatives
+          4. Cheap hour        → charge battery from grid
+          5. Expensive hour    → discharge battery
+          6. Otherwise         → self-consumption
         """
         if upcoming_prices is None:
             upcoming_prices = []
@@ -241,7 +250,34 @@ class Optimizer:
                 f"(absorb surplus, no grid export) + all EVs ON",
             )
 
-        # --- 2. PRE-DISCHARGE before upcoming negative prices ---
+        # --- 2. SOLAR SURPLUS: absorb free energy into battery ---
+        # When solar produces more than the house consumes (exporting
+        # to grid), the battery should absorb that surplus.  This takes
+        # priority over pre-discharge and force-charge-from-grid because
+        # solar energy is free — there is no point in discharging stored
+        # energy or buying from grid while the sun provides.
+        # Exception: during expensive hours we WANT to sell to the grid
+        # at high prices, so the override does not apply.
+        # Note: grid_export_power is only set for the *current* hour
+        # (real-time data); future hours default to 0.
+        if price_spread >= self.min_price_spread:
+            _expensive_threshold = max_price - price_spread * 0.30
+        else:
+            _expensive_threshold = float("inf")
+
+        if (
+            grid_export_power > 0
+            and self.enable_battery
+            and battery_soc < self.max_soc
+            and price < _expensive_threshold
+        ):
+            return (
+                ACTION_SELF_CONSUMPTION,
+                f"Solar surplus ({grid_export_power:.0f} W export) — "
+                f"battery absorbing excess solar (SoC {battery_soc:.0f}%)",
+            )
+
+        # --- 3. PRE-DISCHARGE before upcoming negative prices ---
         # If any of the next few hours are negative, we want to empty
         # the battery *now* so we have room to charge for free later.
         has_negative_ahead = any(p < 0 for p in upcoming_prices)

@@ -638,12 +638,15 @@ class TestSolarSurplusEVCharging:
     def test_evs_charge_during_pre_discharge_with_surplus(
         self, default_params, default_outputs
     ):
-        """During pre_discharge with solar surplus, EVs should still charge."""
+        """During solar surplus with negative prices ahead, the battery
+        should absorb solar (self_consumption) instead of pre-discharging.
+        EVs should still charge on the surplus."""
         opt = Optimizer(default_params, default_outputs)
 
-        # Pre-discharge scenario: price 0.50 with negatives ahead
+        # Pre-discharge scenario: price 0.30 with negatives ahead
+        # (0.30 is mid-range, not expensive, so solar override applies)
         prices = {
-            "today": [0.50, -0.10, -0.20] + [0.80] * 21,
+            "today": [0.30, -0.10, -0.20] + [0.80] * 21,
             "tomorrow": [],
             "currency": "SEK",
         }
@@ -657,13 +660,22 @@ class TestSolarSurplusEVCharging:
         )
 
         plan = result["hourly_plan"]
-        assert plan[0]["action"] == ACTION_PRE_DISCHARGE
+        # Solar surplus overrides pre_discharge → self_consumption
+        assert plan[0]["action"] == ACTION_SELF_CONSUMPTION
+        assert "Solar surplus" in plan[0]["reason"]
 
         actions = result["immediate_actions"]
-        # Price is 0.50 > cheap threshold, but solar surplus is huge
+        # Battery should be in self-consumption (absorbing solar)
+        sc_actions = [
+            a for a in actions
+            if a["entity_id"] == "script.sg_set_self_consumption_mode"
+        ]
+        assert len(sc_actions) == 1, "Battery should absorb solar surplus"
+
+        # EVs should charge on surplus
         ev_on = [a for a in actions if a["service"] == "switch.turn_on"
                  and "charger" in a.get("entity_id", "")]
-        assert len(ev_on) >= 1, "EVs should charge on surplus even during pre_discharge"
+        assert len(ev_on) >= 1, "EVs should charge on surplus even during would-be pre_discharge"
 
     def test_cheap_price_threshold_configurable(self, default_outputs):
         """The ev_cheap_price_threshold should be configurable via params."""
@@ -720,3 +732,219 @@ class TestSolarSurplusEVCharging:
         ev_off = [a for a in actions if a["service"] == "switch.turn_off"
                   and "charger" in a.get("entity_id", "")]
         assert len(ev_off) == 0, "EVs should NOT be stopped during self_consumption"
+
+
+class TestSolarSurplusBatteryCharging:
+    """Tests for solar-surplus-aware battery charging.
+
+    When solar panels produce more than the house consumes (grid export > 0),
+    the battery should absorb that surplus via self-consumption mode.
+    This overrides pre-discharge and charge-from-grid.
+    """
+
+    def test_solar_surplus_overrides_pre_discharge(
+        self, default_params, default_outputs
+    ):
+        """With solar surplus, don't pre-discharge — absorb the surplus instead."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Negative prices ahead at hours 2-3 → normally would pre-discharge
+        prices = {
+            "today": [0.50, 0.40, -0.10, -0.20, 0.60, 0.70,
+                      0.80, 0.90, 1.00, 1.10, 1.00, 0.90,
+                      0.80, 0.70, 0.60, 0.50, 0.40, 0.30,
+                      0.20, 0.15, 0.10, 0.08, 0.05, 0.03],
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=75,
+            ev_connected=False,
+            grid_export_power=4000.0,  # 4 kW solar surplus
+        )
+
+        plan = result["hourly_plan"]
+        # Current hour (0) should be self_consumption, not pre_discharge
+        assert plan[0]["action"] == ACTION_SELF_CONSUMPTION
+        assert "Solar surplus" in plan[0]["reason"]
+
+        # Future hours without real-time solar data keep their plan
+        # Hour 1 should still be pre_discharge (no solar data for future)
+        assert plan[1]["action"] == ACTION_PRE_DISCHARGE
+        # Negative hours still maximize_load
+        assert plan[2]["action"] == ACTION_MAXIMIZE_LOAD
+
+    def test_solar_surplus_overrides_charge_battery(
+        self, default_params, default_outputs
+    ):
+        """With solar surplus, don't force-charge from grid — absorb solar."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Wide spread: 0.10-1.50 → hour 0 price 0.10 is cheap → charge_battery
+        prices = {
+            "today": [0.10, 0.15, 0.20, 0.30, 0.50, 0.70,
+                      0.90, 1.10, 1.30, 1.50, 1.40, 1.20,
+                      1.00, 0.80, 0.60, 0.50, 0.40, 0.30,
+                      0.20, 0.15, 0.10, 0.08, 0.05, 0.03],
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        # Without solar surplus → charge_battery
+        result_no_solar = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=30,
+            ev_connected=False,
+            grid_export_power=0.0,
+        )
+        assert result_no_solar["hourly_plan"][0]["action"] == ACTION_CHARGE_BATTERY
+
+        # With solar surplus → self_consumption (absorb solar instead)
+        result_solar = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=30,
+            ev_connected=False,
+            grid_export_power=3000.0,  # 3 kW export
+        )
+        assert result_solar["hourly_plan"][0]["action"] == ACTION_SELF_CONSUMPTION
+        assert "Solar surplus" in result_solar["hourly_plan"][0]["reason"]
+
+    def test_solar_surplus_no_override_when_battery_full(
+        self, default_params, default_outputs
+    ):
+        """When battery is at max SoC, solar surplus override should NOT apply
+        so pre-discharge can still create room for upcoming negative prices."""
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [0.50, -0.10, -0.20] + [0.80] * 21,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=100,  # Battery FULL
+            ev_connected=False,
+            grid_export_power=5000.0,  # Solar surplus exists
+        )
+
+        plan = result["hourly_plan"]
+        # Battery is full → can't absorb more → solar override doesn't apply
+        # BUT soc=100 > min_soc(10) so pre_discharge IS allowed
+        assert plan[0]["action"] == ACTION_PRE_DISCHARGE
+
+    def test_solar_surplus_no_override_for_negative_prices(
+        self, default_params, default_outputs
+    ):
+        """Negative price check has higher priority than solar surplus."""
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [-0.10] + [0.80] * 23,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+            grid_export_power=5000.0,
+        )
+
+        plan = result["hourly_plan"]
+        # Negative price takes priority over solar surplus
+        assert plan[0]["action"] == ACTION_MAXIMIZE_LOAD
+
+    def test_solar_surplus_only_affects_current_hour(
+        self, default_params, default_outputs
+    ):
+        """Solar surplus override should only affect hour 0 (real-time data).
+        Future hours keep their price-based classification."""
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [0.10, 0.10, -0.10, -0.20] + [0.80] * 20,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+            grid_export_power=5000.0,
+        )
+
+        plan = result["hourly_plan"]
+        # Hour 0: solar surplus → self_consumption
+        assert plan[0]["action"] == ACTION_SELF_CONSUMPTION
+        # Hour 1: no solar data (future) → pre_discharge (negatives at 2-3)
+        assert plan[1]["action"] == ACTION_PRE_DISCHARGE
+
+    def test_pre_discharge_still_works_without_solar(
+        self, default_params, default_outputs
+    ):
+        """Without solar surplus, pre-discharge should work normally."""
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [0.50, 0.40, -0.10, -0.20] + [0.60] * 20,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=80,
+            ev_connected=False,
+            grid_export_power=0.0,  # No solar surplus
+        )
+
+        plan = result["hourly_plan"]
+        assert plan[0]["action"] == ACTION_PRE_DISCHARGE
+
+    def test_battery_immediate_action_self_consumption_on_surplus(
+        self, default_params, default_outputs
+    ):
+        """When solar surplus overrides, the immediate action should set
+        the inverter to self-consumption mode."""
+        opt = Optimizer(default_params, default_outputs)
+
+        prices = {
+            "today": [0.50, -0.10] + [0.80] * 22,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=75,
+            ev_connected=False,
+            grid_export_power=4000.0,
+        )
+
+        actions = result["immediate_actions"]
+        # Should call self_consumption on inverter
+        sc_actions = [
+            a for a in actions
+            if a["entity_id"] == "script.sg_set_self_consumption_mode"
+        ]
+        assert len(sc_actions) == 1
+        # Should NOT call force_discharge (no pre-discharge)
+        fd_actions = [
+            a for a in actions
+            if a["entity_id"] == "script.sg_set_forced_discharge_battery_mode"
+        ]
+        assert len(fd_actions) == 0

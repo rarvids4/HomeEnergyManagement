@@ -1193,3 +1193,273 @@ class TestSoCAwaredDischarge:
         assert len(discharge_hours) >= 6, (
             f"Large battery should cover all expensive hours, got {len(discharge_hours)}"
         )
+
+
+class TestEVChargePlanning:
+    """Tests for the EV charge scheduling algorithm.
+
+    The optimizer should calculate how many kWh the EV needs to reach
+    its target SoC, then schedule charging during the cheapest available
+    hours (excluding discharge_battery hours).
+    """
+
+    @pytest.fixture
+    def ev_vehicle_ex90(self):
+        """A connected Volvo EX90 at 89% needing charge to 100%."""
+        return [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 89,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+        }]
+
+    def test_ev_schedule_in_result(self, default_params, default_outputs, ev_vehicle_ex90):
+        """optimize() should return ev_charge_schedule in its result."""
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50 + i * 0.05 for i in range(24)],
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle_ex90,
+        )
+
+        assert "ev_charge_schedule" in result
+        plan = result["ev_charge_schedule"]
+        assert "schedule" in plan
+        assert "total_kwh_needed" in plan
+        assert "vehicles" in plan
+        assert len(plan["schedule"]) == len(result["hourly_plan"])
+
+    def test_ev_charges_cheapest_hours_first(
+        self, default_params, default_outputs, ev_vehicle_ex90
+    ):
+        """EV charging should be scheduled in the cheapest hours."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Distinct prices: cheap at start, expensive later
+        prices = {
+            "today": [0.10, 0.15, 0.20, 0.25, 0.30, 0.35,
+                      0.50, 0.55, 0.60, 0.65, 0.70, 0.75,
+                      1.00, 1.10, 1.20, 1.30, 1.40, 1.50,
+                      0.80, 0.70, 0.60, 0.50, 0.40, 0.30],
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle_ex90,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [h for h in plan["schedule"] if h["charging"]]
+
+        # The cheapest hours should be selected first
+        charging_prices = [h["price"] for h in charging_hours]
+        assert all(p <= 0.60 for p in charging_prices[:2]), (
+            f"First charging hours should be cheap, got prices: {charging_prices[:3]}"
+        )
+
+    def test_ev_kwh_needed_calculation(
+        self, default_params, default_outputs, ev_vehicle_ex90
+    ):
+        """kWh needed should be (target - current) / 100 * capacity."""
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle_ex90,
+        )
+
+        plan = result["ev_charge_schedule"]
+        # EX90: (100 - 89) / 100 * 111 = 12.21 kWh
+        assert abs(plan["total_kwh_needed"] - 12.2) < 0.5
+
+    def test_ev_no_charging_when_at_target(self, default_params, default_outputs):
+        """No EV charging scheduled when already at target SoC."""
+        ev_full = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "connected",
+            "connected": True,
+            "vehicle_soc": 100,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 0,
+        }]
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_full,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [h for h in plan["schedule"] if h["charging"]]
+        assert len(charging_hours) == 0
+
+    def test_ev_avoids_discharge_hours(
+        self, default_params, default_outputs, ev_vehicle_ex90
+    ):
+        """EV should NOT charge during expensive/discharge hours."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Very distinct prices: 0.10 cheap, 2.00 expensive
+        prices = {
+            "today": [0.10] * 6 + [2.00] * 12 + [0.10] * 6,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle_ex90,
+        )
+
+        # Get hours that are discharge_battery
+        discharge_hours_set = {
+            h["hour"] for h in result["hourly_plan"]
+            if h["action"] == ACTION_DISCHARGE_BATTERY
+        }
+
+        plan = result["ev_charge_schedule"]
+        for entry in plan["schedule"]:
+            if entry["charging"]:
+                assert entry["hour"] not in discharge_hours_set, (
+                    f"EV should not charge during discharge hour {entry['hour']}"
+                )
+
+    def test_ev_no_schedule_when_disconnected(self, default_params, default_outputs):
+        """No EV charge plan when EV is not connected."""
+        ev_disconnected = [{
+            "name": "ex90",
+            "power_w": 0,
+            "status": "disconnected",
+            "connected": False,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 0,
+        }]
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.10] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+            ev_vehicles=ev_disconnected,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [h for h in plan["schedule"] if h["charging"]]
+        assert len(charging_hours) == 0
+
+    def test_ev_charging_hours_match_energy_need(
+        self, default_params, default_outputs, ev_vehicle_ex90
+    ):
+        """Total scheduled energy should cover the kWh needed."""
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle_ex90,
+        )
+
+        plan = result["ev_charge_schedule"]
+        total_scheduled = sum(h["power_kw"] for h in plan["schedule"] if h["charging"])
+        # Should cover (or slightly exceed) the kwh needed
+        assert total_scheduled >= plan["total_kwh_needed"] - 0.1
+
+    def test_ev_vehicle_summary_in_plan(
+        self, default_params, default_outputs, ev_vehicle_ex90
+    ):
+        """The plan should include per-vehicle summary data."""
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle_ex90,
+        )
+
+        vehicles = result["ev_charge_schedule"]["vehicles"]
+        assert len(vehicles) == 1
+        assert vehicles[0]["name"] == "ex90"
+        assert vehicles[0]["soc"] == 89
+        assert vehicles[0]["target_soc"] == 100
+        assert vehicles[0]["capacity_kwh"] == 111
+
+    def test_summary_includes_ev_charge_count(
+        self, default_params, default_outputs, ev_vehicle_ex90
+    ):
+        """The summary string should mention the EV-charge hour count."""
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle_ex90,
+        )
+
+        assert "EV-charge" in result["summary"]

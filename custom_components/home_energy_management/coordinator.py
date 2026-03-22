@@ -97,6 +97,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 battery_soc=sensor_data.get("battery_soc", 50),
                 ev_connected=sensor_data.get("ev_connected", False),
                 grid_export_power=sensor_data.get("grid_export_power", 0.0),
+                ev_vehicles=sensor_data.get("ev_chargers", []),
             )
 
             # 6. Execute immediate actions
@@ -247,6 +248,12 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             if switch_state == "on":
                 is_connected = True
 
+            # Vehicle battery sensors (optional — from Volvo Cars API etc.)
+            vehicle_soc = self._get_state_float(charger.get("vehicle_soc"))
+            vehicle_capacity = self._get_state_float(charger.get("vehicle_capacity_kwh"))
+            vehicle_target_soc = self._get_state_float(charger.get("vehicle_target_soc"))
+            vehicle_charging_power = self._get_state_float(charger.get("vehicle_charging_power"))
+
             total_ev_power += power_w
             if is_connected:
                 ev_any_connected = True
@@ -256,6 +263,10 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 "power_w": power_w,
                 "status": status,
                 "connected": is_connected,
+                "vehicle_soc": vehicle_soc,
+                "vehicle_capacity_kwh": vehicle_capacity,
+                "vehicle_target_soc": vehicle_target_soc if vehicle_target_soc > 0 else 100.0,
+                "vehicle_charging_power_w": vehicle_charging_power,
             })
 
         data["ev_power"] = total_ev_power

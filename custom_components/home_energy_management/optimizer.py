@@ -98,6 +98,7 @@ class Optimizer:
         battery_soc: float,
         ev_connected: bool,
         grid_export_power: float = 0.0,
+        ev_vehicles: list[dict[str, Any]] | None = None,
     ) -> dict[str, Any]:
         """Produce an hour-by-hour schedule and immediate actions.
 
@@ -107,12 +108,16 @@ class Optimizer:
             Current grid export in Watts.  Used to detect solar surplus
             so EVs can absorb excess production instead of exporting
             at rock-bottom prices.
+        ev_vehicles : list[dict]
+            Per-EV data including vehicle_soc, vehicle_capacity_kwh,
+            vehicle_target_soc, and vehicle_charging_power_w.
 
         Returns
         -------
         dict with keys:
           - hourly_plan: list of {hour, action, reason, price}
           - immediate_actions: list of service calls to execute now
+          - ev_charge_schedule: per-hour EV charging plan
           - summary: human-readable summary
         """
         now = datetime.now()
@@ -186,6 +191,11 @@ class Optimizer:
             hourly_plan, initial_soc, predicted_consumption
         )
 
+        # --- EV charge scheduling ---
+        ev_charge_plan = self._plan_ev_charging(
+            hourly_plan, ev_vehicles or [], current_hour
+        )
+
         # Build immediate actions (only for the current hour)
         if hourly_plan:
             current_plan = hourly_plan[0]
@@ -204,12 +214,14 @@ class Optimizer:
         pre_dis_hours = [h for h in hourly_plan if h["action"] == ACTION_PRE_DISCHARGE]
         cheap_hours = [h for h in hourly_plan if h["action"] == ACTION_CHARGE_BATTERY]
         expensive_hours = [h for h in hourly_plan if h["action"] == ACTION_DISCHARGE_BATTERY]
+        ev_charge_hours = [h for h in ev_charge_plan.get("schedule", []) if h.get("charging")]
 
         summary = (
             f"Plan: {len(neg_hours)} negative-price (maximize), "
             f"{len(pre_dis_hours)} pre-discharge, "
             f"{len(cheap_hours)} charge, "
-            f"{len(expensive_hours)} discharge hours. "
+            f"{len(expensive_hours)} discharge, "
+            f"{len(ev_charge_hours)} EV-charge hours. "
             f"Price range: {min_price:.2f}–{max_price:.2f} {prices.get('currency', 'SEK')}/kWh. "
             f"Spread: {price_spread:.2f}."
         )
@@ -217,6 +229,7 @@ class Optimizer:
         return {
             "hourly_plan": hourly_plan,
             "immediate_actions": immediate_actions,
+            "ev_charge_schedule": ev_charge_plan,
             "summary": summary,
             "stats": {
                 "avg_price": round(avg_price, 4),
@@ -409,6 +422,142 @@ class Optimizer:
         )
 
         return hourly_plan
+
+    # ------------------------------------------------------------------
+    # EV charge scheduling
+    # ------------------------------------------------------------------
+
+    def _plan_ev_charging(
+        self,
+        hourly_plan: list[dict[str, Any]],
+        ev_vehicles: list[dict[str, Any]],
+        start_hour: int,
+    ) -> dict[str, Any]:
+        """Plan EV charging across the time horizon.
+
+        For each connected EV with vehicle battery data, calculates the
+        kWh needed to reach the target SoC.  Then schedules charging
+        during the cheapest available hours (excluding expensive /
+        discharge hours).
+
+        Returns a dict with:
+          - schedule: per-hour list with charging flag + price
+          - total_kwh_needed, total_charging_power_kw, hours_needed
+          - vehicles: per-vehicle summary
+        """
+        empty_schedule = {
+            "schedule": [
+                {
+                    "hour": entry["hour"],
+                    "price": entry["price"],
+                    "charging": False,
+                    "power_kw": 0.0,
+                }
+                for entry in hourly_plan
+            ],
+            "total_kwh_needed": 0,
+            "total_charging_power_kw": 0,
+            "hours_needed": 0,
+            "vehicles": [],
+            "start_hour": start_hour,
+        }
+
+        if not ev_vehicles:
+            return empty_schedule
+
+        # Gather vehicles that need charging
+        vehicle_plans = []
+        total_kwh_needed = 0.0
+        total_charging_kw = 0.0
+
+        for ev in ev_vehicles:
+            if not ev.get("connected"):
+                continue
+
+            soc = ev.get("vehicle_soc", 0)
+            capacity = ev.get("vehicle_capacity_kwh", 0)
+            target = ev.get("vehicle_target_soc", 100)
+            charging_w = ev.get("vehicle_charging_power_w", 0)
+
+            # Skip if no vehicle data available
+            if soc <= 0 or capacity <= 0:
+                continue
+            # Skip if already at target
+            if soc >= target:
+                continue
+
+            kwh_needed = (target - soc) / 100.0 * capacity
+            # Use actual charging power, fall back to charger power
+            charging_kw = (charging_w / 1000.0) if charging_w > 0 else (
+                ev.get("power_w", 7000) / 1000.0
+            )
+            if charging_kw <= 0:
+                charging_kw = 7.0  # fallback
+
+            total_kwh_needed += kwh_needed
+            total_charging_kw += charging_kw
+
+            vehicle_plans.append({
+                "name": ev.get("name", "ev"),
+                "soc": round(soc, 1),
+                "target_soc": round(target, 1),
+                "capacity_kwh": round(capacity, 1),
+                "kwh_needed": round(kwh_needed, 1),
+                "charging_power_kw": round(charging_kw, 1),
+            })
+
+        if not vehicle_plans or total_kwh_needed <= 0:
+            empty_schedule["vehicles"] = vehicle_plans
+            return empty_schedule
+
+        hours_needed = total_kwh_needed / total_charging_kw if total_charging_kw > 0 else 0
+
+        # Candidate hours: all plan hours ranked by price, cheapest first.
+        # Exclude discharge_battery hours (we want to sell to grid then).
+        candidates = []
+        for i, entry in enumerate(hourly_plan):
+            if entry["action"] == ACTION_DISCHARGE_BATTERY:
+                continue
+            candidates.append((i, entry["price"]))
+        candidates.sort(key=lambda x: x[1])
+
+        # Build the schedule
+        schedule = [
+            {
+                "hour": entry["hour"],
+                "price": entry["price"],
+                "charging": False,
+                "power_kw": 0.0,
+            }
+            for entry in hourly_plan
+        ]
+
+        remaining_kwh = total_kwh_needed
+        for idx, _price in candidates:
+            if remaining_kwh <= 0:
+                break
+            charge_kwh = min(total_charging_kw, remaining_kwh)
+            schedule[idx]["charging"] = True
+            schedule[idx]["power_kw"] = round(charge_kwh, 2)
+            remaining_kwh -= charge_kwh
+
+        _LOGGER.debug(
+            "EV charge plan: %.1f kWh needed, %.1f kW power, "
+            "%.1f hours, scheduled %d hours",
+            total_kwh_needed,
+            total_charging_kw,
+            hours_needed,
+            len([s for s in schedule if s["charging"]]),
+        )
+
+        return {
+            "schedule": schedule,
+            "total_kwh_needed": round(total_kwh_needed, 1),
+            "total_charging_power_kw": round(total_charging_kw, 1),
+            "hours_needed": round(hours_needed, 1),
+            "vehicles": vehicle_plans,
+            "start_hour": start_hour,
+        }
 
     # ------------------------------------------------------------------
     # SoC simulation

@@ -242,7 +242,7 @@ class BatteryPlanSensor(EnergyManagementSensor):
 
 
 class ChargerPlanSensor(EnergyManagementSensor):
-    """EV charger schedule overview."""
+    """EV charger schedule overview with charging plan."""
 
     def __init__(self, coordinator, entry):
         super().__init__(coordinator, entry, "charger_plan", "EV Charger Plan")
@@ -255,21 +255,39 @@ class ChargerPlanSensor(EnergyManagementSensor):
             return "disconnected"
 
         schedule = data.get("schedule", {})
-        plan = schedule.get("hourly_plan", [])
-        charge_hours = [h["hour"] for h in plan if h.get("action") == "charge_battery"]
-        return f"Charging in {len(charge_hours)} hours" if charge_hours else "idle"
+        ev_plan = schedule.get("ev_charge_schedule", {})
+        ev_schedule = ev_plan.get("schedule", [])
+        charge_hours = [h for h in ev_schedule if h.get("charging")]
+        if charge_hours:
+            kwh_needed = ev_plan.get("total_kwh_needed", 0)
+            return f"{len(charge_hours)}h charging ({kwh_needed:.0f} kWh needed)"
+        return "idle"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         data = self.coordinator.data or {}
         sensor = data.get("sensor_data", {})
+        schedule = data.get("schedule", {})
+        ev_plan = schedule.get("ev_charge_schedule", {})
         ev_power_w = sensor.get("ev_power", 0)
+
+        # Per-vehicle info
+        vehicles = ev_plan.get("vehicles", [])
+        chargers = sensor.get("ev_chargers", [])
+
         return {
             "ev_connected": sensor.get("ev_connected", False),
             "ev_power_kw": round(ev_power_w / 1000, 2) if ev_power_w else 0,
             "ev_power_w": round(ev_power_w, 0),
-            "ev_chargers": sensor.get("ev_chargers", []),
+            "ev_chargers": chargers,
             "ev_status": sensor.get("ev_status", "unknown"),
+            # EV charge schedule for dashboard graphs
+            "ev_charge_schedule": ev_plan.get("schedule", []),
+            "ev_kwh_needed": ev_plan.get("total_kwh_needed", 0),
+            "ev_charging_power_kw": ev_plan.get("total_charging_power_kw", 0),
+            "ev_hours_needed": ev_plan.get("hours_needed", 0),
+            "ev_vehicles": vehicles,
+            "start_hour": ev_plan.get("start_hour", 0),
         }
 
     @property

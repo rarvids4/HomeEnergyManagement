@@ -536,6 +536,11 @@ class Optimizer:
              urgently schedule enough in near-term hours to reach the
              floor.  Remaining charge uses cheapest hours across the
              full window (possibly day 2 when optimization_days=2).
+          6. When optimization_window ≥ 2 and min_charge_level > 0,
+             the deferred portion (floor → target) is NOT constrained
+             by departure_time — the car already has min_charge_level
+             for the next trip and can wait for the cheapest prices
+             anywhere in the extended window.
 
         Parameters
         ----------
@@ -711,8 +716,23 @@ class Optimizer:
             #
             # Deferred pass: schedule by CHEAPEST price across the
             # full optimisation window (including day-2 when enabled).
+            # When optimization_window >= 2 and min_charge_level > 0,
+            # the deferred portion is NOT constrained by departure_time
+            # — the car already has min_charge_level for the next trip
+            # and the rest can wait for the cheapest prices anywhere
+            # in the extended window (including hours after departure).
             scheduled_hours = []
             used_indices: set[int] = set()
+
+            # When the plan was extended beyond the near-term boundary,
+            # the deferred/opportunistic portion can use the full
+            # window without departure filtering.
+            has_extended_window = boundary < len(hourly_plan)
+            deferred_pool = (
+                all_candidates
+                if has_extended_window and min_charge_level > 0
+                else vehicle_candidates
+            )
 
             if min_charge_level > 0 and soc < min_charge_level:
                 urgent_kwh = (min_charge_level - soc) / 100.0 * capacity
@@ -721,9 +741,9 @@ class Optimizer:
                 _LOGGER.debug(
                     "EV %s: two-pass scheduling — urgent %.1f kWh "
                     "(SoC %.0f%% → floor %.0f%%), deferred %.1f kWh "
-                    "(floor → target %.0f%%)",
+                    "(floor → target %.0f%%), extended_window=%s",
                     name, urgent_kwh, soc, min_charge_level,
-                    deferred_kwh, target,
+                    deferred_kwh, target, has_extended_window,
                 )
 
                 # Pass 1: urgent — near-term candidates sorted by
@@ -746,9 +766,13 @@ class Optimizer:
                     used_indices.add(idx)
                     remaining -= charge_kwh
 
-                # Pass 2: deferred — cheapest across full window
+                # Pass 2: deferred — cheapest across full window.
+                # When extended window is active, this pool includes
+                # ALL hours (no departure filter) so the car can
+                # charge at the cheapest prices across the full
+                # optimization window.
                 remaining = deferred_kwh
-                for idx, _price, _hour in vehicle_candidates:
+                for idx, _price, _hour in deferred_pool:
                     if remaining <= 0:
                         break
                     if idx in used_indices:
@@ -760,8 +784,23 @@ class Optimizer:
                     scheduled_hours.append(hourly_plan[idx]["hour"])
                     used_indices.add(idx)
                     remaining -= charge_kwh
+            elif min_charge_level > 0:
+                # SoC is already above the floor — all remaining
+                # charge is "deferred" and can use the full window
+                # when extended (no departure filter needed since
+                # the car already meets the minimum for driving).
+                remaining = kwh_needed
+                for idx, _price, _hour in deferred_pool:
+                    if remaining <= 0:
+                        break
+                    charge_kwh = min(charging_kw, remaining)
+                    schedule[idx]["vehicles"][name] = round(charge_kwh, 2)
+                    schedule[idx]["total_power_kw"] += charge_kwh
+                    schedule[idx]["charging"] = True
+                    scheduled_hours.append(hourly_plan[idx]["hour"])
+                    remaining -= charge_kwh
             else:
-                # No floor issue — schedule normally (cheapest first)
+                # No floor set — normal departure-filtered scheduling
                 remaining = kwh_needed
                 for idx, _price, _hour in vehicle_candidates:
                     if remaining <= 0:

@@ -3527,3 +3527,195 @@ class TestEVOptimizationDays:
         assert day2_kwh > 0, (
             "Deferred portion should use cheaper day-2 hours"
         )
+
+    def test_two_day_deferred_ignores_departure_filter(
+        self, two_day_params, default_outputs
+    ):
+        """With optimization_window=2 and min_charge_level>0, the deferred
+        portion should use ALL hours in the extended window — including
+        hours AFTER the departure time — to find the cheapest prices.
+
+        Scenario: hour 0, departure_time=07:00, SoC=50% > floor=40%.
+        Today prices: 0.80 SEK (expensive).
+        Tomorrow prices: cheap during daytime (hours 10-16 at 0.02 SEK).
+        With departure filter, only hours 0-6 are candidates (expensive).
+        Without departure filter, hours 10-16 tomorrow (very cheap) are used.
+        """
+        ev = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "departure_time": "07:00",
+            "min_departure_soc": 100,
+            "min_charge_level": 40,
+        }]
+
+        opt = Optimizer(two_day_params, default_outputs)
+
+        # Uniform prices — but tomorrow daytime (10-16) is very cheap.
+        # Keep spread small (< 0.30) to avoid discharge classification.
+        today_prices = [0.25] * 24
+        tomorrow_prices = [0.25] * 10 + [0.02] * 7 + [0.25] * 7
+
+        with patch("custom_components.home_energy_management.optimizer.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2024, 3, 12, 0, 0)  # Tuesday 00:00
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            result = opt.optimize(
+                prices={
+                    "today": today_prices,
+                    "tomorrow": tomorrow_prices,
+                    "currency": "SEK",
+                },
+                predicted_consumption=[1.0] * 24,
+                battery_soc=50,
+                ev_connected=True,
+                ev_vehicles=ev,
+            )
+
+        plan = result["ev_charge_schedule"]
+        schedule = plan["schedule"]
+
+        # Collect hours where EX90 is charging
+        charging_entries = [
+            (i, e["hour"], e["price"], e["vehicles"].get("ex90", 0))
+            for i, e in enumerate(schedule)
+            if e["vehicles"].get("ex90", 0) > 0
+        ]
+
+        # Some charging should be scheduled in hours >= 7 (after departure)
+        # because those are the cheapest hours in the extended window.
+        after_departure = [
+            (i, h, p, kwh) for i, h, p, kwh in charging_entries if h >= 7
+        ]
+        assert len(after_departure) > 0, (
+            f"Deferred charging should use cheap hours after departure "
+            f"(hours 10-16 tomorrow at 0.02 SEK). "
+            f"All charging: {[(h, p) for _, h, p, _ in charging_entries]}"
+        )
+
+    def test_two_day_deferred_below_floor_ignores_departure(
+        self, two_day_params, default_outputs
+    ):
+        """When SoC is below floor and window=2, urgent pass uses
+        departure-filtered near-term hours, but deferred pass uses
+        the full extended window (no departure filter).
+
+        Scenario: SoC=10%, floor=30%, target=100%, departure=07:00.
+        Urgent (10→30%): must happen ASAP in near-term before departure.
+        Deferred (30→100%): should pick cheapest hours across full
+        window including hours after departure.
+        """
+        ev = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 10,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "departure_time": "07:00",
+            "min_departure_soc": 100,
+            "min_charge_level": 30,
+        }]
+
+        opt = Optimizer(two_day_params, default_outputs)
+
+        # Today: moderate prices. Tomorrow 10-16: very cheap.
+        today_prices = [0.25] * 24
+        tomorrow_prices = [0.25] * 10 + [0.02] * 7 + [0.25] * 7
+
+        with patch("custom_components.home_energy_management.optimizer.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2024, 3, 12, 0, 0)  # Tuesday 00:00
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            result = opt.optimize(
+                prices={
+                    "today": today_prices,
+                    "tomorrow": tomorrow_prices,
+                    "currency": "SEK",
+                },
+                predicted_consumption=[1.0] * 24,
+                battery_soc=50,
+                ev_connected=True,
+                ev_vehicles=ev,
+            )
+
+        plan = result["ev_charge_schedule"]
+        schedule = plan["schedule"]
+
+        charging_entries = [
+            (i, e["hour"], e["price"], e["vehicles"].get("ex90", 0))
+            for i, e in enumerate(schedule)
+            if e["vehicles"].get("ex90", 0) > 0
+        ]
+
+        # Urgent portion should be in near-term before departure (hours 0-6)
+        near_term = len(result["hourly_plan"])
+        urgent_before_dep = [
+            (i, h, p, kwh)
+            for i, h, p, kwh in charging_entries
+            if i < near_term and h < 7
+        ]
+        assert len(urgent_before_dep) > 0, (
+            "Urgent pass should have some hours before departure"
+        )
+
+        # Deferred portion should include hours after departure
+        after_departure = [
+            (i, h, p, kwh) for i, h, p, kwh in charging_entries if h >= 7
+        ]
+        assert len(after_departure) > 0, (
+            f"Deferred pass should use cheap hours after departure "
+            f"(tomorrow 10-16 at 0.02). All: {[(h, p) for _, h, p, _ in charging_entries]}"
+        )
+
+    def test_single_day_departure_still_filters(
+        self, default_params, default_outputs
+    ):
+        """With optimization_window=1, departure filtering should still
+        apply even when min_charge_level > 0. The extended-window
+        relaxation only kicks in with window >= 2."""
+        ev = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "departure_time": "07:00",
+            "min_departure_soc": 100,
+            "min_charge_level": 40,
+        }]
+
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.25] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [h["hour"] for h in plan["schedule"] if h["charging"]]
+
+        # With window=1, departure filter should still restrict to 0-6
+        for h in charging_hours:
+            assert h < 7, (
+                f"Window=1: departure at 07:00 should restrict to 0-6, got {h}"
+            )

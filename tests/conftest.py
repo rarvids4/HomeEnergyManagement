@@ -31,6 +31,7 @@ _HA_MODULES = [
     "homeassistant.components.sensor",
     "homeassistant.helpers",
     "homeassistant.helpers.entity_platform",
+    "homeassistant.helpers.event",
     "homeassistant.helpers.update_coordinator",
 ]
 
@@ -41,9 +42,14 @@ for _mod_name in _HA_MODULES:
 # homeassistant.config_entries.ConfigEntry
 sys.modules["homeassistant.config_entries"].ConfigEntry = MagicMock()
 
-# homeassistant.core.HomeAssistant / ServiceCall
+# homeassistant.core.HomeAssistant / ServiceCall / callback / Event
 sys.modules["homeassistant.core"].HomeAssistant = MagicMock()
 sys.modules["homeassistant.core"].ServiceCall = MagicMock()
+sys.modules["homeassistant.core"].callback = lambda f: f  # decorator passthrough
+sys.modules["homeassistant.core"].Event = MagicMock()
+
+# homeassistant.helpers.event.async_track_state_change_event
+sys.modules["homeassistant.helpers.event"].async_track_state_change_event = MagicMock()
 
 # homeassistant.helpers.update_coordinator.DataUpdateCoordinator / CoordinatorEntity
 sys.modules["homeassistant.helpers.update_coordinator"].DataUpdateCoordinator = type(

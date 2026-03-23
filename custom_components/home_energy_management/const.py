@@ -80,8 +80,13 @@ DEFAULT_EV_TARGET_SOC = 100  # %
 # --- EV departure & optimization window ---
 # Default departure time — car must be ready by this time
 DEFAULT_EV_DEPARTURE_TIME = "07:00"
-# Minimum SoC at departure (defaults to full target if not set)
+# Departure SoC — target charge level at departure (defaults to full if not set)
 DEFAULT_EV_MIN_DEPARTURE_SOC = 100  # %
+# Min Charge Level — SoC floor the car should never sit below.
+# When optimization_days=2 and cheaper prices exist tomorrow, charging
+# above this level may be deferred, but the car will always be kept
+# at or above this percentage.  0 = no floor (defer everything).
+DEFAULT_EV_MIN_CHARGE_LEVEL = 20  # %
 # Optimization window: 1 = plan within today+tomorrow prices only;
 # 2 = consider up to 48 h ahead (requires tomorrow prices or weather)
 DEFAULT_EV_OPTIMIZATION_WINDOW = 1  # days

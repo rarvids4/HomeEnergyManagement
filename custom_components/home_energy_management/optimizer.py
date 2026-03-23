@@ -43,6 +43,7 @@ from .const import (
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_EV_CHEAP_PRICE_THRESHOLD,
     DEFAULT_EV_DEPARTURE_TIME,
+    DEFAULT_EV_MIN_CHARGE_LEVEL,
     DEFAULT_EV_MIN_DEPARTURE_SOC,
     DEFAULT_EV_OPTIMIZATION_WINDOW,
     DEFAULT_EV_TARGET_SOC,
@@ -126,6 +127,9 @@ class Optimizer:
         )
         self.ev_default_min_departure_soc = params.get(
             "ev_default_min_departure_soc", DEFAULT_EV_MIN_DEPARTURE_SOC
+        )
+        self.ev_default_min_charge_level = params.get(
+            "ev_default_min_charge_level", DEFAULT_EV_MIN_CHARGE_LEVEL
         )
 
         # EV chargers — list-based config (new) or legacy "easee" dict
@@ -236,8 +240,29 @@ class Optimizer:
         )
 
         # --- EV charge scheduling ---
+        # When 2-day optimisation is enabled, extend the plan with
+        # day-2 price entries so EV charging can be deferred to
+        # cheaper hours tomorrow.  The battery plan is unaffected.
+        ev_plan_for_scheduling = hourly_plan
+        near_term_hours = len(hourly_plan)
+
+        if self.ev_optimization_window >= 2:
+            extended_prices = all_prices[current_hour : current_hour + 48]
+            if len(extended_prices) > len(hourly_plan):
+                ev_plan_for_scheduling = list(hourly_plan)  # copy
+                for i in range(len(hourly_plan), len(extended_prices)):
+                    hour = (current_hour + i) % 24
+                    ev_plan_for_scheduling.append({
+                        "hour": hour,
+                        "action": ACTION_SELF_CONSUMPTION,
+                        "reason": "Extended window (day 2)",
+                        "price": round(extended_prices[i], 4),
+                        "predicted_consumption_kwh": 0,
+                    })
+
         ev_charge_plan = self._plan_ev_charging(
-            hourly_plan, ev_vehicles or [], current_hour
+            ev_plan_for_scheduling, ev_vehicles or [], current_hour,
+            near_term_hours=near_term_hours,
         )
 
         # Build immediate actions (only for the current hour)
@@ -496,6 +521,7 @@ class Optimizer:
         hourly_plan: list[dict[str, Any]],
         ev_vehicles: list[dict[str, Any]],
         start_hour: int,
+        near_term_hours: int | None = None,
     ) -> dict[str, Any]:
         """Plan EV charging per vehicle to minimize grid energy consumption.
 
@@ -506,6 +532,18 @@ class Optimizer:
           3. Schedule charging in cheapest available hours with night
              preference (off-peak hours are less grid-intensive).
           4. Exclude ``discharge_battery`` hours (selling to grid).
+          5. When min_charge_level is set and SoC is below the floor,
+             urgently schedule enough in near-term hours to reach the
+             floor.  Remaining charge uses cheapest hours across the
+             full window (possibly day 2 when optimization_days=2).
+
+        Parameters
+        ----------
+        near_term_hours : int | None
+            Number of entries from the start of hourly_plan that belong
+            to the original (battery) planning horizon.  Used to split
+            urgent vs deferred EV charging.  None means all entries are
+            near-term (single-day optimisation).
 
         Returns a dict with:
           - schedule: per-hour list with per-vehicle kWh breakdown
@@ -578,6 +616,10 @@ class Optimizer:
         # Per-vehicle scheduling
         vehicle_plans = []
 
+        # Near-term boundary: entries from the original planning horizon.
+        # Hours beyond this boundary are day-2 extension slots.
+        boundary = near_term_hours if near_term_hours is not None else len(hourly_plan)
+
         for ev in ev_vehicles:
             name = ev.get("name", "ev")
             soc = ev.get("vehicle_soc", 0)
@@ -592,6 +634,13 @@ class Optimizer:
             departure_hour = _parse_departure(departure_str) if departure_str else None
             min_dep_soc = ev.get(
                 "min_departure_soc", self.ev_default_min_departure_soc
+            )
+
+            # Min charge level: SoC floor the car must maintain.
+            # When soc < floor, urgent charging is scheduled in
+            # near-term hours regardless of day-2 prices.
+            min_charge_level = ev.get(
+                "min_charge_level", self.ev_default_min_charge_level
             )
 
             # Target SoC: use per-vehicle min_departure_soc if set,
@@ -633,6 +682,7 @@ class Optimizer:
                     "scheduled_hours": [],
                     "departure_time": departure_str,
                     "min_departure_soc": min_dep_soc,
+                    "min_charge_level": min_charge_level,
                 })
                 continue
 
@@ -649,18 +699,61 @@ class Optimizer:
             else:
                 vehicle_candidates = all_candidates
 
-            # Schedule this vehicle in cheapest available hours
-            remaining = kwh_needed
+            # --- Two-pass scheduling for min_charge_level ---
+            # When the vehicle is below the floor, we must charge
+            # urgently (near-term) to reach the floor, then defer
+            # the rest (floor→target) to cheapest hours across the
+            # full window (which may include day-2 when opt_days=2).
             scheduled_hours = []
-            for idx, _price, _hour in vehicle_candidates:
-                if remaining <= 0:
-                    break
-                charge_kwh = min(charging_kw, remaining)
-                schedule[idx]["vehicles"][name] = round(charge_kwh, 2)
-                schedule[idx]["total_power_kw"] += charge_kwh
-                schedule[idx]["charging"] = True
-                scheduled_hours.append(hourly_plan[idx]["hour"])
-                remaining -= charge_kwh
+            used_indices: set[int] = set()
+
+            if min_charge_level > 0 and soc < min_charge_level:
+                urgent_kwh = (min_charge_level - soc) / 100.0 * capacity
+                deferred_kwh = max(0, kwh_needed - urgent_kwh)
+
+                # Pass 1: urgent — only near-term candidates
+                near_candidates = [
+                    (idx, p, h) for idx, p, h in vehicle_candidates
+                    if idx < boundary
+                ]
+                remaining = urgent_kwh
+                for idx, _price, _hour in near_candidates:
+                    if remaining <= 0:
+                        break
+                    charge_kwh = min(charging_kw, remaining)
+                    schedule[idx]["vehicles"][name] = round(charge_kwh, 2)
+                    schedule[idx]["total_power_kw"] += charge_kwh
+                    schedule[idx]["charging"] = True
+                    scheduled_hours.append(hourly_plan[idx]["hour"])
+                    used_indices.add(idx)
+                    remaining -= charge_kwh
+
+                # Pass 2: deferred — cheapest across full window
+                remaining = deferred_kwh
+                for idx, _price, _hour in vehicle_candidates:
+                    if remaining <= 0:
+                        break
+                    if idx in used_indices:
+                        continue
+                    charge_kwh = min(charging_kw, remaining)
+                    schedule[idx]["vehicles"][name] = round(charge_kwh, 2)
+                    schedule[idx]["total_power_kw"] += charge_kwh
+                    schedule[idx]["charging"] = True
+                    scheduled_hours.append(hourly_plan[idx]["hour"])
+                    used_indices.add(idx)
+                    remaining -= charge_kwh
+            else:
+                # No floor issue — schedule normally (cheapest first)
+                remaining = kwh_needed
+                for idx, _price, _hour in vehicle_candidates:
+                    if remaining <= 0:
+                        break
+                    charge_kwh = min(charging_kw, remaining)
+                    schedule[idx]["vehicles"][name] = round(charge_kwh, 2)
+                    schedule[idx]["total_power_kw"] += charge_kwh
+                    schedule[idx]["charging"] = True
+                    scheduled_hours.append(hourly_plan[idx]["hour"])
+                    remaining -= charge_kwh
 
             hours_needed_f = kwh_needed / charging_kw if charging_kw > 0 else 0
 
@@ -676,6 +769,7 @@ class Optimizer:
                 "scheduled_hours": sorted(scheduled_hours),
                 "departure_time": departure_str,
                 "min_departure_soc": min_dep_soc,
+                "min_charge_level": min_charge_level,
             })
 
         # Round totals in schedule

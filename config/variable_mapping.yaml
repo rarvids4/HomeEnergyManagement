@@ -53,10 +53,19 @@ inputs:
       # Switch to enable/disable charging
       charger_switch: "switch.CHANGE_ME_ev_charger_enabled"
       # --- EV departure settings (per vehicle) ---
-      # Time by which the vehicle must be charged (HH:MM)
+      # Static fallback: time by which the vehicle must be charged (HH:MM)
       departure_time: "07:00"
-      # Minimum SoC (%) required at departure time
+      # Static fallback: departure SoC (%) — target charge level at departure
       min_departure_soc: 100
+      # Static fallback: min charge level (%) — SoC floor the car should
+      # never sit below.  When optimization_days=2, charging above this
+      # level may be deferred to cheaper day-2 hours.
+      min_charge_level: 20
+      # Optional HA input helpers for UI control (override static values).
+      # Create these via Settings → Devices → Helpers in HA.
+      departure_time_entity: "input_datetime.CHANGE_ME_ev_departure_time"
+      min_departure_soc_entity: "input_number.CHANGE_ME_ev_departure_soc"
+      min_charge_level_entity: "input_number.CHANGE_ME_ev_min_charge_level"
 
   # --- Sungrow Inverter / Battery (primary) ---
   sungrow:
@@ -207,5 +216,7 @@ parameters:
   # Optimization window: 1 = schedule within available price data only;
   # 2 = consider up to 48 h ahead (uses tomorrow prices when available)
   ev_optimization_window: 1
+  # Optional HA input helper to override ev_optimization_window from UI
+  optimization_days_entity: "input_number.CHANGE_ME_ev_optimization_days"
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"

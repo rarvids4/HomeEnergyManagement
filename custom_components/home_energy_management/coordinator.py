@@ -11,7 +11,8 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback, Event
+from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
@@ -70,6 +71,57 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             log_level=self.params.get("log_level", "info"),
         )
 
+        # --- Auto-replan: re-run optimisation when UI settings change ---
+        self._unsub_state_listeners: list = []
+        watched = self._collect_watched_entities()
+        if watched:
+            _LOGGER.info("Auto-replan: watching %s", watched)
+            unsub = async_track_state_change_event(
+                hass, watched, self._on_setting_changed,
+            )
+            self._unsub_state_listeners.append(unsub)
+
+    # ------------------------------------------------------------------
+    # Auto-replan helpers
+    # ------------------------------------------------------------------
+
+    def _collect_watched_entities(self) -> list[str]:
+        """Collect input-helper entity IDs that should trigger an immediate replan."""
+        entities: list[str] = []
+
+        # Global optimisation settings
+        opt_days_entity = self.params.get("optimization_days_entity")
+        if opt_days_entity:
+            entities.append(opt_days_entity)
+
+        # Per-vehicle settings
+        ev_chargers_cfg = self.inputs.get(INPUT_EV_CHARGERS, [])
+        for charger in (ev_chargers_cfg if isinstance(ev_chargers_cfg, list) else []):
+            for key in (
+                "departure_time_entity",
+                "min_departure_soc_entity",
+                "min_charge_level_entity",
+            ):
+                entity = charger.get(key)
+                if entity:
+                    entities.append(entity)
+
+        return entities
+
+    @callback
+    def _on_setting_changed(self, event: Event) -> None:
+        """Trigger an immediate replan when a watched input helper changes."""
+        entity_id = event.data.get("entity_id", "")
+        old_state = event.data.get("old_state")
+        new_state = event.data.get("new_state")
+        old_val = old_state.state if old_state else "?"
+        new_val = new_state.state if new_state else "?"
+        _LOGGER.info(
+            "Setting changed: %s (%s → %s) — triggering replan",
+            entity_id, old_val, new_val,
+        )
+        self.async_request_refresh()
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from HA sensors, run prediction & optimization."""
         try:
@@ -90,7 +142,14 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             )
             predicted_consumption = prediction_split["total"]
 
-            # 5. Run optimizer to produce a schedule
+            # 5. Read runtime-editable parameters from input helpers
+            opt_days_entity = self.params.get("optimization_days_entity")
+            if opt_days_entity:
+                opt_days_val = self._get_state_float(opt_days_entity)
+                if opt_days_val >= 1:
+                    self.optimizer.ev_optimization_window = int(opt_days_val)
+
+            # 6. Run optimizer to produce a schedule
             schedule = self.optimizer.optimize(
                 prices=prices,
                 predicted_consumption=predicted_consumption,
@@ -100,13 +159,13 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 ev_vehicles=sensor_data.get("ev_chargers", []),
             )
 
-            # 6. Execute immediate actions
+            # 7. Execute immediate actions
             await self._execute_actions(schedule)
 
-            # 7. Log actual vs previous prediction (before overwriting)
+            # 8. Log actual vs previous prediction (before overwriting)
             self._log_actuals(sensor_data)
 
-            # 8. Log the new decision (stores predictions for next comparison)
+            # 9. Log the new decision (stores predictions for next comparison)
             self.prediction_logger.log_decision(
                 prices=prices,
                 predicted_consumption=predicted_consumption,
@@ -264,6 +323,28 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             if is_connected:
                 ev_any_connected = True
 
+            # Per-vehicle departure settings:
+            # Prefer HA input helper entities (UI-editable) over static YAML values.
+            dep_time_entity = charger.get("departure_time_entity")
+            dep_time_value = self._get_state_str(dep_time_entity) if dep_time_entity else ""
+            # input_datetime returns "HH:MM:SS"; strip seconds for "HH:MM"
+            if dep_time_value and ":" in dep_time_value:
+                dep_time_value = ":".join(dep_time_value.split(":")[:2])
+            if not dep_time_value:
+                dep_time_value = charger.get("departure_time", "")
+
+            dep_soc_entity = charger.get("min_departure_soc_entity")
+            dep_soc_value = self._get_state_float(dep_soc_entity) if dep_soc_entity else 0.0
+            if dep_soc_value <= 0:
+                dep_soc_value = float(charger.get("min_departure_soc", 0))
+
+            # Per-vehicle min charge level (SoC floor):
+            # When optimization_days=2, the car won't be drained below this.
+            mcl_entity = charger.get("min_charge_level_entity")
+            mcl_value = self._get_state_float(mcl_entity) if mcl_entity else 0.0
+            if mcl_value <= 0:
+                mcl_value = float(charger.get("min_charge_level", 0))
+
             ev_details.append({
                 "name": name,
                 "power_w": power_w,
@@ -273,9 +354,9 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 "vehicle_capacity_kwh": vehicle_capacity,
                 "vehicle_target_soc": vehicle_target_soc if vehicle_target_soc > 0 else 100.0,
                 "vehicle_charging_power_w": vehicle_charging_power,
-                # Per-vehicle departure settings (from config)
-                "departure_time": charger.get("departure_time", "07:00"),
-                "min_departure_soc": int(charger.get("min_departure_soc", 0)) or 0,
+                "departure_time": dep_time_value,
+                "min_departure_soc": int(dep_soc_value),
+                "min_charge_level": int(mcl_value),
             })
 
         data["ev_power"] = total_ev_power

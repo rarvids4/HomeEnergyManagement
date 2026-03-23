@@ -3010,3 +3010,374 @@ class TestEVDepartureTime:
         assert vehicles[0]["target_soc"] == 80, (
             f"Friday should lower target to 80%, got {vehicles[0]['target_soc']}"
         )
+
+
+class TestEVOptimizationDays:
+    """Tests for multi-day EV optimisation (optimization_days=2).
+
+    When ev_optimization_window=2, the optimizer should:
+      - Extend the EV candidate window to include tomorrow's prices
+      - Defer charging to cheaper day-2 hours
+      - Respect min_charge_level as a floor (urgent charging today)
+      - Fall back to normal single-day behaviour when window=1
+    """
+
+    @pytest.fixture
+    def two_day_params(self, default_params):
+        """Params with 2-day optimization enabled."""
+        return {**default_params, "ev_optimization_window": 2}
+
+    @pytest.fixture
+    def ev_below_floor(self):
+        """EX90 at 15% SoC, below min_charge_level of 40%."""
+        return [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 15,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "min_charge_level": 40,
+        }]
+
+    @pytest.fixture
+    def ev_above_floor(self):
+        """EX90 at 50% SoC, above min_charge_level of 40%."""
+        return [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "min_charge_level": 40,
+        }]
+
+    def test_two_day_defers_to_cheaper_tomorrow(
+        self, two_day_params, default_outputs, ev_above_floor
+    ):
+        """When tomorrow is cheaper, charging should be deferred to day-2 hours."""
+        opt = Optimizer(two_day_params, default_outputs)
+
+        # Today: expensive (1.00 SEK/kWh), Tomorrow: very cheap (0.10 SEK/kWh)
+        prices = {
+            "today": [1.00] * 24,
+            "tomorrow": [0.10] * 24,
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_above_floor,
+        )
+
+        plan = result["ev_charge_schedule"]
+        schedule_entries = plan["schedule"]
+
+        # Vehicle is at 50%, above floor (40%), so ALL charging can be deferred.
+        # Tomorrow hours (0-23 of day 2) should be preferred since they're cheaper.
+        # In the extended plan, day-2 entries start at index 24.
+        day2_charging_indices = [
+            i for i, h in enumerate(schedule_entries)
+            if h["charging"] and i >= 24
+        ]
+        day1_charging_indices = [
+            i for i, h in enumerate(schedule_entries)
+            if h["charging"] and i < 24
+        ]
+
+        assert len(day2_charging_indices) > 0, (
+            "Should defer charging to cheaper day-2 hours"
+        )
+        assert len(day1_charging_indices) == 0, (
+            f"No day-1 charging expected when above floor and day 2 is cheaper, "
+            f"got day-1 indices: {day1_charging_indices}"
+        )
+
+    def test_two_day_urgent_floor_then_defer(
+        self, two_day_params, default_outputs, ev_below_floor
+    ):
+        """When SoC is below floor, charge urgently to floor in near-term,
+        then defer the rest to cheaper day-2 hours."""
+        opt = Optimizer(two_day_params, default_outputs)
+
+        # Today: moderate price (0.80), Tomorrow: very cheap (0.05)
+        prices = {
+            "today": [0.80] * 24,
+            "tomorrow": [0.05] * 24,
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_below_floor,
+        )
+
+        plan = result["ev_charge_schedule"]
+        vehicles = plan["vehicles"]
+        assert len(vehicles) == 1
+        v = vehicles[0]
+
+        # Vehicle at 15%, floor at 40%, target 100%
+        # Urgent: (40-15)/100 * 111 = 27.75 kWh → must be in day 1
+        # Deferred: (100-40)/100 * 111 = 66.6 kWh → should be in day 2
+        schedule_entries = plan["schedule"]
+        day1_kwh = sum(
+            e["vehicles"].get("ex90", 0)
+            for i, e in enumerate(schedule_entries) if i < 24
+        )
+        day2_kwh = sum(
+            e["vehicles"].get("ex90", 0)
+            for i, e in enumerate(schedule_entries) if i >= 24
+        )
+
+        # Day 1 should have at least the urgent portion (~27.75 kWh)
+        assert day1_kwh >= 25, (
+            f"Day-1 should have at least ~27.75 kWh (urgent floor), got {day1_kwh:.1f}"
+        )
+        # Day 2 should have the deferred portion
+        assert day2_kwh > 0, (
+            f"Day-2 should have deferred charging, got {day2_kwh:.1f} kWh"
+        )
+
+    def test_single_day_ignores_tomorrow(
+        self, default_params, default_outputs, ev_above_floor
+    ):
+        """With optimization_window=1 (default), tomorrow prices should not
+        be used for EV scheduling even if available."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Today expensive, tomorrow cheap — but window=1 so no deferral
+        prices = {
+            "today": [1.00] * 24,
+            "tomorrow": [0.05] * 24,
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_above_floor,
+        )
+
+        plan = result["ev_charge_schedule"]
+        schedule_entries = plan["schedule"]
+
+        # With window=1, schedule should only span 24 entries (no day-2 extension)
+        assert len(schedule_entries) == 24, (
+            f"Single-day should have 24 entries, got {len(schedule_entries)}"
+        )
+
+    def test_two_day_extends_schedule_to_48h(
+        self, two_day_params, default_outputs, ev_above_floor
+    ):
+        """The EV schedule should extend to 48 entries when optimization_days=2."""
+        opt = Optimizer(two_day_params, default_outputs)
+
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [0.50] * 24,
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_above_floor,
+        )
+
+        plan = result["ev_charge_schedule"]
+        assert len(plan["schedule"]) == 48, (
+            f"Two-day should extend schedule to 48 entries, got {len(plan['schedule'])}"
+        )
+
+    def test_min_charge_level_in_vehicle_plan(
+        self, default_params, default_outputs, ev_below_floor
+    ):
+        """Vehicle plan should include min_charge_level field."""
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_below_floor,
+        )
+
+        vehicles = result["ev_charge_schedule"]["vehicles"]
+        assert vehicles[0]["min_charge_level"] == 40
+
+    def test_no_min_charge_level_schedules_normally(
+        self, two_day_params, default_outputs
+    ):
+        """When min_charge_level is 0, all charging defers to cheapest hours."""
+        ev = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 15,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "min_charge_level": 0,
+        }]
+
+        opt = Optimizer(two_day_params, default_outputs)
+        prices = {
+            "today": [1.00] * 24,
+            "tomorrow": [0.05] * 24,
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev,
+        )
+
+        plan = result["ev_charge_schedule"]
+        schedule_entries = plan["schedule"]
+
+        # No floor → all charging should go to cheapest (day 2)
+        day1_kwh = sum(
+            e["vehicles"].get("ex90", 0)
+            for i, e in enumerate(schedule_entries) if i < 24
+        )
+        day2_kwh = sum(
+            e["vehicles"].get("ex90", 0)
+            for i, e in enumerate(schedule_entries) if i >= 24
+        )
+
+        assert day2_kwh > day1_kwh, (
+            f"With no floor, all charging should defer to cheaper day 2. "
+            f"Day 1: {day1_kwh:.1f}, Day 2: {day2_kwh:.1f}"
+        )
+
+    def test_two_day_with_departure_filters_correctly(
+        self, two_day_params, default_outputs
+    ):
+        """Departure time should still constrain EV charging even with 2-day window."""
+        ev = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 80,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "departure_time": "07:00",
+            "min_departure_soc": 90,
+            "min_charge_level": 0,
+        }]
+
+        opt = Optimizer(two_day_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [0.10] * 24,
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [h["hour"] for h in plan["schedule"] if h["charging"]]
+
+        # Departure at 07:00 limits to hours 0-6
+        for h in charging_hours:
+            assert h < 7, (
+                f"Departure at 07:00 should restrict hours to 0-6, got {h}"
+            )
+
+    def test_two_day_battery_plan_stays_24h(
+        self, two_day_params, default_outputs, ev_above_floor
+    ):
+        """The battery hourly_plan should remain 24h even with 2-day EV window."""
+        opt = Optimizer(two_day_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [0.50] * 24,
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_above_floor,
+        )
+
+        # Battery hourly plan should not be extended
+        assert len(result["hourly_plan"]) == 24, (
+            f"Battery plan should stay at 24h, got {len(result['hourly_plan'])}"
+        )
+
+    def test_min_charge_level_all_urgent_when_no_tomorrow(
+        self, two_day_params, default_outputs
+    ):
+        """When there are no tomorrow prices, urgent+deferred all go to today."""
+        ev = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 15,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "min_charge_level": 40,
+        }]
+
+        opt = Optimizer(two_day_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],  # No tomorrow prices yet
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev,
+        )
+
+        plan = result["ev_charge_schedule"]
+        # Without tomorrow prices, schedule can't extend → stays at 24
+        assert len(plan["schedule"]) == 24, (
+            f"Without tomorrow prices, schedule should be 24h, got {len(plan['schedule'])}"
+        )
+
+        vehicles = plan["vehicles"]
+        assert vehicles[0]["kwh_needed"] > 0

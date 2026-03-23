@@ -61,3 +61,45 @@ async def async_register_services(hass: HomeAssistant) -> None:
     hass.services.async_register(
         DOMAIN, "write_local_config", handle_write_local_config
     )
+
+    async def handle_read_local_config(call: ServiceCall) -> None:
+        """Read local variable mapping and publish it as a persistent notification.
+
+        This allows inspecting the deployed mapping without SSH access.
+        """
+        target_path = os.path.join(hass.config.config_dir, LOCAL_MAPPING_PATH)
+
+        def _read():
+            if not os.path.exists(target_path):
+                return None
+            with open(target_path, "r", encoding="utf-8") as fh:
+                return fh.read()
+
+        content = await hass.async_add_executor_job(_read)
+        if content is None:
+            _LOGGER.warning("No local mapping file found at %s", target_path)
+            await hass.services.async_call(
+                "persistent_notification",
+                "create",
+                {
+                    "title": "HEM: No Local Mapping",
+                    "message": f"File not found: {target_path}",
+                    "notification_id": "hem_local_config",
+                },
+            )
+            return
+
+        _LOGGER.info("Local mapping read (%d bytes)", len(content))
+        await hass.services.async_call(
+            "persistent_notification",
+            "create",
+            {
+                "title": "HEM: Local Mapping",
+                "message": f"```yaml\n{content}\n```",
+                "notification_id": "hem_local_config",
+            },
+        )
+
+    hass.services.async_register(
+        DOMAIN, "read_local_config", handle_read_local_config
+    )

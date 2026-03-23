@@ -17,3 +17,11 @@ write_local_config:
       selector:
         text:
           multiline: true
+
+read_local_config:
+  name: Read local config
+  description: >-
+    Read the deployed local variable mapping and show it as a
+    persistent notification. Useful for inspecting the current
+    configuration without SSH access.
+  fields: {}

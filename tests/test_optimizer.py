@@ -2630,3 +2630,383 @@ class TestEVGridMinimization:
         assert ev_plan["total_kwh_needed"] == 0, (
             "No kWh needed when SoC >= Friday target"
         )
+
+
+class TestEVDepartureTime:
+    """Tests for per-vehicle departure time and min departure SoC.
+
+    When departure_time is set per vehicle, the optimizer should:
+      - Only schedule charging in hours *before* the departure deadline
+      - Use min_departure_soc as the target SoC instead of the global default
+      - Fall back to full candidate list when departure_time is absent
+      - Handle midnight-crossing windows (e.g. start_hour=22, departure=07)
+    """
+
+    @pytest.fixture
+    def ev_with_departure(self):
+        """EX90 at 50% with departure at 07:00 and min SoC 80%."""
+        return [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "departure_time": "07:00",
+            "min_departure_soc": 80,
+        }]
+
+    @pytest.fixture
+    def ev_without_departure(self):
+        """EX90 at 50% with NO departure_time set."""
+        return [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+        }]
+
+    def test_departure_filters_candidate_hours(
+        self, default_params, default_outputs, ev_with_departure
+    ):
+        """Only hours before departure (07:00) should be used for charging."""
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_with_departure,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [h["hour"] for h in plan["schedule"] if h["charging"]]
+
+        # With departure at 07:00 and start_hour=0, only hours 0-6 eligible
+        assert all(h < 7 for h in charging_hours), (
+            f"All charging should be before departure (07:00), got: {charging_hours}"
+        )
+
+    def test_departure_uses_min_departure_soc_as_target(
+        self, default_params, default_outputs, ev_with_departure
+    ):
+        """Target SoC should be min_departure_soc (80%) not default (100%)."""
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_with_departure,
+        )
+
+        vehicles = result["ev_charge_schedule"]["vehicles"]
+        assert len(vehicles) == 1
+        assert vehicles[0]["target_soc"] == 80
+        # kWh needed: (80-50)/100 * 111 = 33.3 kWh
+        assert abs(vehicles[0]["kwh_needed"] - 33.3) < 0.5
+
+    def test_no_departure_uses_all_hours(
+        self, default_params, default_outputs, ev_without_departure
+    ):
+        """Without departure_time, all candidate hours should be eligible."""
+        opt = Optimizer(default_params, default_outputs)
+
+        # Cheap hour at 15:00, everything else expensive
+        prices = {
+            "today": [1.00] * 15 + [0.05] + [1.00] * 8,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_without_departure,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [h["hour"] for h in plan["schedule"] if h["charging"]]
+
+        # Hour 15 (cheapest) should be in the schedule even though it's
+        # past any default departure time
+        assert 15 in charging_hours, (
+            f"Without departure_time, hour 15 should be selectable, got: {charging_hours}"
+        )
+
+    def test_departure_kwh_less_than_full_target(
+        self, default_params, default_outputs, ev_with_departure, ev_without_departure
+    ):
+        """Vehicle with min_departure_soc=80% should need less kWh than one
+        targeting 100%."""
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        opt1 = Optimizer(default_params, default_outputs)
+        result_dep = opt1.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_with_departure,
+        )
+
+        opt2 = Optimizer(default_params, default_outputs)
+        result_full = opt2.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_without_departure,
+        )
+
+        dep_kwh = result_dep["ev_charge_schedule"]["total_kwh_needed"]
+        full_kwh = result_full["ev_charge_schedule"]["total_kwh_needed"]
+
+        # 80% target → (80-50)/100*111 = 33.3 kWh
+        # 100% target → (100-50)/100*111 = 55.5 kWh
+        assert dep_kwh < full_kwh, (
+            f"Departure target 80% ({dep_kwh}) should need less kWh "
+            f"than full target 100% ({full_kwh})"
+        )
+
+    def test_departure_info_in_vehicle_plan(
+        self, default_params, default_outputs, ev_with_departure
+    ):
+        """Vehicle plan should include departure_time and min_departure_soc."""
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_with_departure,
+        )
+
+        vehicles = result["ev_charge_schedule"]["vehicles"]
+        assert vehicles[0]["departure_time"] == "07:00"
+        assert vehicles[0]["min_departure_soc"] == 80
+
+    def test_midnight_crossing_departure(
+        self, default_params, default_outputs, freeze_time
+    ):
+        """When start_hour is late evening and departure is early morning,
+        the window should cross midnight correctly."""
+        # Set time to 22:00 so start_hour = 22
+        freeze_time.now.return_value = datetime(2025, 1, 6, 22, 0, 0)
+
+        ev_vehicle = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 80,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "departure_time": "07:00",
+            "min_departure_soc": 90,
+        }]
+
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [0.50] * 24,
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [h["hour"] for h in plan["schedule"] if h["charging"]]
+
+        # Window: 22-23 and 0-6 (crossing midnight, before 07:00)
+        for h in charging_hours:
+            assert h >= 22 or h < 7, (
+                f"Midnight-crossing: hour {h} should be 22-23 or 0-6"
+            )
+
+    def test_ramp_down_uses_per_vehicle_departure_soc(
+        self, default_params, default_outputs
+    ):
+        """Ramp-down should use per-vehicle min_departure_soc (80%)
+        instead of global default (100%)."""
+        ev_vehicle = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 85,  # Above departure target (80%) but below 100%
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "departure_time": "07:00",
+            "min_departure_soc": 80,
+        }]
+
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.05] * 24,  # Very cheap
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicle,
+        )
+
+        actions = result["immediate_actions"]
+        # SoC=85% >= min_departure_soc=80% → should stop
+        ev_stop = [a for a in actions if a["service"] == "switch.turn_off"
+                   and "ex90" in a.get("entity_id", "")]
+        assert len(ev_stop) >= 1, (
+            "Should stop charger — SoC 85% >= departure target 80%"
+        )
+
+    def test_two_vehicles_different_departures(
+        self, default_params, default_outputs
+    ):
+        """Two EVs with different departure times should each only use
+        hours before their respective deadlines."""
+        ev_vehicles = [
+            {
+                "name": "ex90",
+                "power_w": 8250,
+                "status": "charging",
+                "connected": True,
+                "vehicle_soc": 80,
+                "vehicle_capacity_kwh": 111,
+                "vehicle_target_soc": 100,
+                "vehicle_charging_power_w": 8250,
+                "departure_time": "05:00",
+                "min_departure_soc": 90,
+            },
+            {
+                "name": "renault_zoe",
+                "power_w": 7000,
+                "status": "charging",
+                "connected": True,
+                "vehicle_soc": 60,
+                "vehicle_capacity_kwh": 52,
+                "vehicle_target_soc": 100,
+                "vehicle_charging_power_w": 7000,
+                "departure_time": "09:00",
+                "min_departure_soc": 80,
+            },
+        ]
+
+        opt = Optimizer(default_params, default_outputs)
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_vehicles,
+        )
+
+        vehicles = result["ev_charge_schedule"]["vehicles"]
+        ex90_plan = next(v for v in vehicles if v["name"] == "ex90")
+        zoe_plan = next(v for v in vehicles if v["name"] == "renault_zoe")
+
+        # EX90: departure 05:00 → hours 0-4 only
+        for h in ex90_plan["scheduled_hours"]:
+            assert h < 5, f"EX90 should only charge before 05:00, got hour {h}"
+
+        # Zoe: departure 09:00 → hours 0-8 only
+        for h in zoe_plan["scheduled_hours"]:
+            assert h < 9, f"Zoe should only charge before 09:00, got hour {h}"
+
+        # Zoe has a later departure so it can use more hours
+        assert zoe_plan["target_soc"] == 80
+        assert ex90_plan["target_soc"] == 90
+
+    def test_friday_overrides_departure_soc_when_lower(
+        self, default_params, default_outputs
+    ):
+        """On Friday, the weekend target (80%) should override
+        min_departure_soc if it's lower."""
+        ev_vehicle = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 50,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "departure_time": "07:00",
+            "min_departure_soc": 90,
+        }]
+
+        fake_friday = datetime(2025, 1, 3, 0, 0, 0)  # Friday
+        with patch(
+            "custom_components.home_energy_management.optimizer.datetime"
+        ) as mock_dt:
+            mock_dt.now.return_value = fake_friday
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            opt = Optimizer(default_params, default_outputs)
+            prices = {
+                "today": [0.50] * 24,
+                "tomorrow": [],
+                "currency": "SEK",
+            }
+
+            result = opt.optimize(
+                prices=prices,
+                predicted_consumption=[1.0] * 24,
+                battery_soc=50,
+                ev_connected=True,
+                ev_vehicles=ev_vehicle,
+            )
+
+        vehicles = result["ev_charge_schedule"]["vehicles"]
+        # Friday target (80%) < departure target (90%) → use 80%
+        assert vehicles[0]["target_soc"] == 80, (
+            f"Friday should lower target to 80%, got {vehicles[0]['target_soc']}"
+        )

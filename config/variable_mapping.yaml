@@ -52,6 +52,11 @@ inputs:
       lifetime_energy: "sensor.CHANGE_ME_ev_lifetime_energy"
       # Switch to enable/disable charging
       charger_switch: "switch.CHANGE_ME_ev_charger_enabled"
+      # --- EV departure settings (per vehicle) ---
+      # Time by which the vehicle must be charged (HH:MM)
+      departure_time: "07:00"
+      # Minimum SoC (%) required at departure time
+      min_departure_soc: 100
 
   # --- Sungrow Inverter / Battery (primary) ---
   sungrow:
@@ -199,5 +204,8 @@ parameters:
   ev_weekend_target_soc: 80        # Friday-only: lower target so Saturday starts lower
   # Default EV target SoC (%) — vehicles below this will be scheduled to charge
   ev_default_target_soc: 100
+  # Optimization window: 1 = schedule within available price data only;
+  # 2 = consider up to 48 h ahead (uses tomorrow prices when available)
+  ev_optimization_window: 1
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"

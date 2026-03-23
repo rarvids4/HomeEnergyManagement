@@ -77,6 +77,15 @@ DEFAULT_EV_WEEKEND_TARGET_SOC = 80  # %
 # Default EV target SoC for night charging (charge if below this)
 DEFAULT_EV_TARGET_SOC = 100  # %
 
+# --- EV departure & optimization window ---
+# Default departure time — car must be ready by this time
+DEFAULT_EV_DEPARTURE_TIME = "07:00"
+# Minimum SoC at departure (defaults to full target if not set)
+DEFAULT_EV_MIN_DEPARTURE_SOC = 100  # %
+# Optimization window: 1 = plan within today+tomorrow prices only;
+# 2 = consider up to 48 h ahead (requires tomorrow prices or weather)
+DEFAULT_EV_OPTIMIZATION_WINDOW = 1  # days
+
 # --- Nordpool ---
 DEFAULT_ENTRIES_PER_HOUR = 1  # 1 = hourly prices, 4 = 15-min
 

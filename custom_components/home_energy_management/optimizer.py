@@ -42,6 +42,9 @@ from .const import (
     ACTION_STOP_EV_CHARGE,
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_EV_CHEAP_PRICE_THRESHOLD,
+    DEFAULT_EV_DEPARTURE_TIME,
+    DEFAULT_EV_MIN_DEPARTURE_SOC,
+    DEFAULT_EV_OPTIMIZATION_WINDOW,
     DEFAULT_EV_TARGET_SOC,
     DEFAULT_GRID_CHARGE_MAX_PRICE,
     DEFAULT_GRID_CHARGE_MAX_SOC,
@@ -114,6 +117,15 @@ class Optimizer:
         )
         self.ev_default_target_soc = params.get(
             "ev_default_target_soc", DEFAULT_EV_TARGET_SOC
+        )
+        self.ev_optimization_window = params.get(
+            "ev_optimization_window", DEFAULT_EV_OPTIMIZATION_WINDOW
+        )
+        self.ev_default_departure_time = params.get(
+            "ev_default_departure_time", DEFAULT_EV_DEPARTURE_TIME
+        )
+        self.ev_default_min_departure_soc = params.get(
+            "ev_default_min_departure_soc", DEFAULT_EV_MIN_DEPARTURE_SOC
         )
 
         # EV chargers — list-based config (new) or legacy "easee" dict
@@ -529,20 +541,39 @@ class Optimizer:
 
         # Build candidate hours (shared across vehicles):
         # all plan hours except discharge_battery, ranked by night-adjusted price.
-        candidates = []
+        all_candidates = []
         for i, entry in enumerate(hourly_plan):
             if entry["action"] == ACTION_DISCHARGE_BATTERY:
                 continue
-            candidates.append((i, entry["price"]))
+            all_candidates.append((i, entry["price"], entry["hour"]))
 
         def _night_adjusted(candidate: tuple) -> float:
-            idx, price = candidate
-            hour = hourly_plan[idx]["hour"]
+            idx, price, hour = candidate
             if hour >= self.ev_night_start or hour < self.ev_night_end:
                 return price - self.ev_night_preference
             return price
 
-        candidates.sort(key=_night_adjusted)
+        all_candidates.sort(key=_night_adjusted)
+
+        # Helper: parse "HH:MM" → hour int for deadline filtering
+        def _parse_departure(dep_str: str) -> int:
+            """Return the deadline hour from 'HH:MM' string."""
+            try:
+                parts = dep_str.split(":")
+                return int(parts[0])
+            except (ValueError, IndexError, AttributeError):
+                return self.ev_night_end
+
+        # Helper: check if a plan-hour falls before the departure deadline.
+        # Hours wrap around midnight (start_hour → 23 → 0 → departure).
+        def _is_before_departure(hour: int, departure_hour: int) -> bool:
+            """True if *hour* falls in the charging window before departure."""
+            if departure_hour > start_hour:
+                # Same-day window: start_hour .. departure_hour
+                return start_hour <= hour < departure_hour
+            else:
+                # Crosses midnight: start_hour..23, 0..departure_hour
+                return hour >= start_hour or hour < departure_hour
 
         # Per-vehicle scheduling
         vehicle_plans = []
@@ -554,8 +585,18 @@ class Optimizer:
             charging_w = ev.get("vehicle_charging_power_w", 0)
             connected = ev.get("connected", False)
 
-            # Use optimizer's default target (100%) — not the vehicle API target
-            target = self.ev_default_target_soc
+            # Per-vehicle departure config (from variable_mapping).
+            # departure_time is optional — when absent or empty, all
+            # candidate hours are eligible (no deadline filtering).
+            departure_str = ev.get("departure_time") or ""
+            departure_hour = _parse_departure(departure_str) if departure_str else None
+            min_dep_soc = ev.get(
+                "min_departure_soc", self.ev_default_min_departure_soc
+            )
+
+            # Target SoC: use per-vehicle min_departure_soc if set,
+            # otherwise fall back to the global default target.
+            target = min_dep_soc if min_dep_soc > 0 else self.ev_default_target_soc
 
             # Friday: lower target so Saturday starts lower (solar fills rest)
             if is_friday and self.ev_weekend_target_soc < target:
@@ -590,15 +631,28 @@ class Optimizer:
                     "hours_needed": 0,
                     "connected": connected,
                     "scheduled_hours": [],
+                    "departure_time": departure_str,
+                    "min_departure_soc": min_dep_soc,
                 })
                 continue
 
             kwh_needed = (target - soc) / 100.0 * capacity
 
+            # Filter candidates to hours before this vehicle's departure
+            # (only when a departure time is explicitly configured).
+            if departure_hour is not None:
+                vehicle_candidates = [
+                    (idx, price, hour)
+                    for idx, price, hour in all_candidates
+                    if _is_before_departure(hour, departure_hour)
+                ]
+            else:
+                vehicle_candidates = all_candidates
+
             # Schedule this vehicle in cheapest available hours
             remaining = kwh_needed
             scheduled_hours = []
-            for idx, _price in candidates:
+            for idx, _price, _hour in vehicle_candidates:
                 if remaining <= 0:
                     break
                 charge_kwh = min(charging_kw, remaining)
@@ -620,6 +674,8 @@ class Optimizer:
                 "hours_needed": round(hours_needed_f, 1),
                 "connected": connected,
                 "scheduled_hours": sorted(scheduled_hours),
+                "departure_time": departure_str,
+                "min_departure_soc": min_dep_soc,
             })
 
         # Round totals in schedule
@@ -877,8 +933,11 @@ class Optimizer:
             if vehicle:
                 vehicle_soc = vehicle.get("vehicle_soc", 0)
 
-                # Use optimizer's default target (matches the schedule)
-                effective_target = self.ev_default_target_soc
+                # Per-vehicle departure target (matches the schedule)
+                min_dep_soc = vehicle.get(
+                    "min_departure_soc", self.ev_default_min_departure_soc
+                )
+                effective_target = min_dep_soc if min_dep_soc > 0 else self.ev_default_target_soc
                 if is_friday and self.ev_weekend_target_soc < effective_target:
                     effective_target = self.ev_weekend_target_soc
 

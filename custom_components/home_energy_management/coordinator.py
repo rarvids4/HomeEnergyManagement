@@ -273,6 +273,9 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 "vehicle_capacity_kwh": vehicle_capacity,
                 "vehicle_target_soc": vehicle_target_soc if vehicle_target_soc > 0 else 100.0,
                 "vehicle_charging_power_w": vehicle_charging_power,
+                # Per-vehicle departure settings (from config)
+                "departure_time": charger.get("departure_time", "07:00"),
+                "min_departure_soc": int(charger.get("min_departure_soc", 0)) or 0,
             })
 
         data["ev_power"] = total_ev_power

@@ -63,19 +63,16 @@ async def async_register_services(hass: HomeAssistant) -> None:
     )
 
     async def handle_read_local_config(call: ServiceCall) -> None:
-        """Read local variable mapping and expose via sensor state.
+        """Read local variable mapping and expose via a temporary sensor.
 
-        Reads the deployed mapping from the coordinator's live config
-        and sets it as the optimization_status sensor's state temporarily.
+        Sets the coordinator's live mapping as attributes on a debug
+        sensor entity, allowing inspection without SSH access.
         """
-        # Get the coordinator's mapping directly from memory
         for entry_data in hass.data.get(DOMAIN, {}).values():
-            coordinator = entry_data.get("coordinator")
             mapping = entry_data.get("mapping")
             if mapping:
                 import json as _json
                 content = _json.dumps(mapping, indent=2, default=str)
-                # Write content to a state entity we can read
                 hass.states.async_set(
                     f"sensor.{DOMAIN}_debug_config",
                     "loaded",

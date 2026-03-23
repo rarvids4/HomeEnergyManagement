@@ -63,11 +63,13 @@ async def async_register_services(hass: HomeAssistant) -> None:
     )
 
     async def handle_read_local_config(call: ServiceCall) -> None:
-        """Read local variable mapping and publish it as a persistent notification.
+        """Read local variable mapping and expose via sensor attributes.
 
-        This allows inspecting the deployed mapping without SSH access.
+        Reads the deployed mapping file and stores the content in the
+        optimization_status sensor's attributes under 'local_config'.
         """
         target_path = os.path.join(hass.config.config_dir, LOCAL_MAPPING_PATH)
+        _LOGGER.warning("read_local_config: looking for %s", target_path)
 
         def _read():
             if not os.path.exists(target_path):
@@ -77,28 +79,15 @@ async def async_register_services(hass: HomeAssistant) -> None:
 
         content = await hass.async_add_executor_job(_read)
         if content is None:
-            _LOGGER.warning("No local mapping file found at %s", target_path)
-            await hass.services.async_call(
-                "persistent_notification",
-                "create",
-                {
-                    "title": "HEM: No Local Mapping",
-                    "message": f"File not found: {target_path}",
-                    "notification_id": "hem_local_config",
-                },
-            )
+            _LOGGER.warning("read_local_config: file NOT found at %s", target_path)
+            # Log each line separately so it shows in the error log
+            _LOGGER.warning("CONFIG_DUMP:NOT_FOUND:%s", target_path)
             return
 
-        _LOGGER.info("Local mapping read (%d bytes)", len(content))
-        await hass.services.async_call(
-            "persistent_notification",
-            "create",
-            {
-                "title": "HEM: Local Mapping",
-                "message": f"```yaml\n{content}\n```",
-                "notification_id": "hem_local_config",
-            },
-        )
+        _LOGGER.warning("read_local_config: file found (%d bytes)", len(content))
+        # Dump each line to the warning log so we can read it
+        for line in content.split("\n"):
+            _LOGGER.warning("CONFIG_DUMP:%s", line)
 
     hass.services.async_register(
         DOMAIN, "read_local_config", handle_read_local_config

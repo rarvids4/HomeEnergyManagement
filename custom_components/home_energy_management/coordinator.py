@@ -122,7 +122,9 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             "Setting changed: %s (%s → %s) — triggering replan",
             entity_id, old_val, new_val,
         )
-        self.async_request_refresh()
+        # async_request_refresh is a coroutine in some HA versions;
+        # schedule it as a task so it runs in the event loop.
+        self.hass.async_create_task(self.async_request_refresh())
 
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from HA sensors, run prediction & optimization."""

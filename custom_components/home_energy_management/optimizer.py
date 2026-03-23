@@ -704,6 +704,13 @@ class Optimizer:
             # urgently (near-term) to reach the floor, then defer
             # the rest (floor→target) to cheapest hours across the
             # full window (which may include day-2 when opt_days=2).
+            #
+            # Urgent pass: schedule CHRONOLOGICALLY (earliest first)
+            # so the car reaches min_charge_level as fast as possible,
+            # regardless of price.
+            #
+            # Deferred pass: schedule by CHEAPEST price across the
+            # full optimisation window (including day-2 when enabled).
             scheduled_hours = []
             used_indices: set[int] = set()
 
@@ -711,11 +718,22 @@ class Optimizer:
                 urgent_kwh = (min_charge_level - soc) / 100.0 * capacity
                 deferred_kwh = max(0, kwh_needed - urgent_kwh)
 
-                # Pass 1: urgent — only near-term candidates
+                _LOGGER.debug(
+                    "EV %s: two-pass scheduling — urgent %.1f kWh "
+                    "(SoC %.0f%% → floor %.0f%%), deferred %.1f kWh "
+                    "(floor → target %.0f%%)",
+                    name, urgent_kwh, soc, min_charge_level,
+                    deferred_kwh, target,
+                )
+
+                # Pass 1: urgent — near-term candidates sorted by
+                # INDEX (chronological) so charging starts ASAP.
                 near_candidates = [
                     (idx, p, h) for idx, p, h in vehicle_candidates
                     if idx < boundary
                 ]
+                near_candidates.sort(key=lambda c: c[0])
+
                 remaining = urgent_kwh
                 for idx, _price, _hour in near_candidates:
                     if remaining <= 0:

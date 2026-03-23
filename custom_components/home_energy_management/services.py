@@ -63,31 +63,28 @@ async def async_register_services(hass: HomeAssistant) -> None:
     )
 
     async def handle_read_local_config(call: ServiceCall) -> None:
-        """Read local variable mapping and expose via sensor attributes.
+        """Read local variable mapping and expose via sensor state.
 
-        Reads the deployed mapping file and stores the content in the
-        optimization_status sensor's attributes under 'local_config'.
+        Reads the deployed mapping from the coordinator's live config
+        and sets it as the optimization_status sensor's state temporarily.
         """
-        target_path = os.path.join(hass.config.config_dir, LOCAL_MAPPING_PATH)
-        _LOGGER.warning("read_local_config: looking for %s", target_path)
+        # Get the coordinator's mapping directly from memory
+        for entry_data in hass.data.get(DOMAIN, {}).values():
+            coordinator = entry_data.get("coordinator")
+            mapping = entry_data.get("mapping")
+            if mapping:
+                import json as _json
+                content = _json.dumps(mapping, indent=2, default=str)
+                # Write content to a state entity we can read
+                hass.states.async_set(
+                    f"sensor.{DOMAIN}_debug_config",
+                    "loaded",
+                    {"config": content, "friendly_name": "HEM Debug Config"},
+                )
+                _LOGGER.info("Config exposed on sensor.%s_debug_config", DOMAIN)
+                return
 
-        def _read():
-            if not os.path.exists(target_path):
-                return None
-            with open(target_path, "r", encoding="utf-8") as fh:
-                return fh.read()
-
-        content = await hass.async_add_executor_job(_read)
-        if content is None:
-            _LOGGER.warning("read_local_config: file NOT found at %s", target_path)
-            # Log each line separately so it shows in the error log
-            _LOGGER.warning("CONFIG_DUMP:NOT_FOUND:%s", target_path)
-            return
-
-        _LOGGER.warning("read_local_config: file found (%d bytes)", len(content))
-        # Dump each line to the warning log so we can read it
-        for line in content.split("\n"):
-            _LOGGER.warning("CONFIG_DUMP:%s", line)
+        _LOGGER.warning("read_local_config: no coordinator found")
 
     hass.services.async_register(
         DOMAIN, "read_local_config", handle_read_local_config

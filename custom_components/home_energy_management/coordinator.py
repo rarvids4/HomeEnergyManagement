@@ -75,11 +75,13 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         self._unsub_state_listeners: list = []
         watched = self._collect_watched_entities()
         if watched:
-            _LOGGER.info("Auto-replan: watching %s", watched)
+            _LOGGER.warning("Auto-replan: watching %s", watched)
             unsub = async_track_state_change_event(
                 hass, watched, self._on_setting_changed,
             )
             self._unsub_state_listeners.append(unsub)
+        else:
+            _LOGGER.warning("Auto-replan: NO entities to watch")
 
     # ------------------------------------------------------------------
     # Auto-replan helpers
@@ -116,7 +118,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         new_state = event.data.get("new_state")
         old_val = old_state.state if old_state else "?"
         new_val = new_state.state if new_state else "?"
-        _LOGGER.info(
+        _LOGGER.warning(
             "Setting changed: %s (%s → %s) — triggering replan",
             entity_id, old_val, new_val,
         )

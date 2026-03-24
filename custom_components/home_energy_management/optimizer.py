@@ -716,23 +716,34 @@ class Optimizer:
             #
             # Deferred pass: schedule by CHEAPEST price across the
             # full optimisation window (including day-2 when enabled).
-            # When optimization_window >= 2 and min_charge_level > 0,
-            # the deferred portion is NOT constrained by departure_time
-            # — the car already has min_charge_level for the next trip
-            # and the rest can wait for the cheapest prices anywhere
-            # in the extended window (including hours after departure).
+            # Day-1 slots still honour the departure filter so the
+            # charger stops before the user leaves.  Day-2 slots
+            # bypass the departure filter — the car already has
+            # min_charge_level for the next trip and the rest can
+            # wait for cheap prices tomorrow.
             scheduled_hours = []
             used_indices: set[int] = set()
 
-            # When the plan was extended beyond the near-term boundary,
-            # the deferred/opportunistic portion can use the full
-            # window without departure filtering.
+            # When the plan spans two days the deferred/opportunistic
+            # portion may use cheap day-2 hours without the departure
+            # filter.  However, day-1 hours must STILL respect the
+            # departure filter so the charger stops before the user
+            # leaves (the car already has min_charge_level for the
+            # trip; the rest can wait for tomorrow's cheap hours).
             has_extended_window = boundary < len(hourly_plan)
-            deferred_pool = (
-                all_candidates
-                if has_extended_window and min_charge_level > 0
-                else vehicle_candidates
-            )
+            if has_extended_window and min_charge_level > 0:
+                # Day-1 portion: departure-filtered candidates
+                day1_filtered = [
+                    c for c in vehicle_candidates if c[0] < boundary
+                ]
+                # Day-2 portion: all candidates (no departure filter)
+                day2_all = [
+                    c for c in all_candidates if c[0] >= boundary
+                ]
+                deferred_pool = day1_filtered + day2_all
+                deferred_pool.sort(key=_night_adjusted)
+            else:
+                deferred_pool = vehicle_candidates
 
             if min_charge_level > 0 and soc < min_charge_level:
                 urgent_kwh = (min_charge_level - soc) / 100.0 * capacity
@@ -767,10 +778,9 @@ class Optimizer:
                     remaining -= charge_kwh
 
                 # Pass 2: deferred — cheapest across full window.
-                # When extended window is active, this pool includes
-                # ALL hours (no departure filter) so the car can
-                # charge at the cheapest prices across the full
-                # optimization window.
+                # Day-1 slots still respect departure filter; day-2
+                # slots bypass it so cheap daytime hours tomorrow
+                # can be used.
                 remaining = deferred_kwh
                 for idx, _price, _hour in deferred_pool:
                     if remaining <= 0:
@@ -786,9 +796,8 @@ class Optimizer:
                     remaining -= charge_kwh
             elif min_charge_level > 0:
                 # SoC is already above the floor — all remaining
-                # charge is "deferred" and can use the full window
-                # when extended (no departure filter needed since
-                # the car already meets the minimum for driving).
+                # charge is "deferred".  Day-1 slots still respect
+                # departure; day-2 slots are unrestricted.
                 remaining = kwh_needed
                 for idx, _price, _hour in deferred_pool:
                     if remaining <= 0:

@@ -3719,3 +3719,88 @@ class TestEVOptimizationDays:
             assert h < 7, (
                 f"Window=1: departure at 07:00 should restrict to 0-6, got {h}"
             )
+
+    def test_two_day_deferred_day1_still_respects_departure(
+        self, two_day_params, default_outputs
+    ):
+        """Regression test: when the optimizer recalculates mid-morning
+        with optimization_window=2, day-1 hours AFTER the departure time
+        must NOT be scheduled — only day-2 hours may bypass the departure
+        filter.
+
+        Scenario (matches the real-world bug): current_hour=6 CET,
+        departure=07:00, SoC=85% > floor=70%, target=100%.
+        Day-1 hour 6 is cheap (0.08) and before departure → eligible.
+        Day-1 hours 7-23 are after departure → must be excluded.
+        Day-2 has cheap hours at 0.02 → should be used instead.
+        """
+        ev = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 85,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "departure_time": "07:00",
+            "min_departure_soc": 100,
+            "min_charge_level": 70,
+        }]
+
+        opt = Optimizer(two_day_params, default_outputs)
+
+        # Today: hour 6 cheap (0.08), hours 7+ moderate (0.15).
+        # Tomorrow: hours 10-16 very cheap (0.02).
+        today_prices = [0.25] * 6 + [0.08] + [0.15] * 17
+        tomorrow_prices = [0.25] * 10 + [0.02] * 7 + [0.25] * 7
+
+        with patch("custom_components.home_energy_management.optimizer.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2024, 3, 12, 6, 0)  # 06:00
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            result = opt.optimize(
+                prices={
+                    "today": today_prices,
+                    "tomorrow": tomorrow_prices,
+                    "currency": "SEK",
+                },
+                predicted_consumption=[1.0] * 24,
+                battery_soc=50,
+                ev_connected=True,
+                ev_vehicles=ev,
+            )
+
+        plan = result["ev_charge_schedule"]
+        schedule = plan["schedule"]
+
+        # Collect all hours where EX90 is scheduled to charge
+        charging_entries = [
+            (i, e["hour"], e["price"], e["vehicles"].get("ex90", 0))
+            for i, e in enumerate(schedule)
+            if e["vehicles"].get("ex90", 0) > 0
+        ]
+
+        # Day-1 hours after departure (7-23) must NOT appear
+        near_term = len(result["hourly_plan"])
+        day1_after_departure = [
+            (i, h, p, kwh)
+            for i, h, p, kwh in charging_entries
+            if i < near_term and h >= 7
+        ]
+        assert len(day1_after_departure) == 0, (
+            f"Day-1 hours after departure (>=07:00) must NOT be scheduled "
+            f"when window=2. Got: {[(h, p) for _, h, p, _ in day1_after_departure]}. "
+            f"All charging: {[(h, p) for _, h, p, _ in charging_entries]}"
+        )
+
+        # Day-2 cheap hours SHOULD be scheduled
+        day2_entries = [
+            (i, h, p, kwh)
+            for i, h, p, kwh in charging_entries
+            if i >= near_term
+        ]
+        assert len(day2_entries) > 0, (
+            f"Day-2 cheap hours should be used for deferred charging. "
+            f"All charging: {[(h, p) for _, h, p, _ in charging_entries]}"
+        )

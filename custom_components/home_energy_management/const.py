@@ -91,6 +91,16 @@ DEFAULT_EV_MIN_CHARGE_LEVEL = 20  # %
 # 2 = consider up to 48 h ahead (requires tomorrow prices or weather)
 DEFAULT_EV_OPTIMIZATION_WINDOW = 1  # days
 
+# --- Grid transfer tariffs ---
+# Added to spot price to get the effective cost per kWh.
+# Peak hours (default 06:00–22:00) typically have higher network fees.
+# Set these to your grid operator's actual rates.  Defaults are 0
+# so existing setups are unaffected until configured.
+DEFAULT_GRID_TARIFF_PEAK_SEK = 0.0
+DEFAULT_GRID_TARIFF_OFFPEAK_SEK = 0.0
+DEFAULT_GRID_TARIFF_PEAK_START = 6   # 06:00
+DEFAULT_GRID_TARIFF_PEAK_END = 22    # 22:00
+
 # --- Nordpool ---
 DEFAULT_ENTRIES_PER_HOUR = 1  # 1 = hourly prices, 4 = 15-min
 

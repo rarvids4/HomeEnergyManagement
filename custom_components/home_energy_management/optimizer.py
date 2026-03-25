@@ -42,6 +42,10 @@ from .const import (
     ACTION_STOP_EV_CHARGE,
     DEFAULT_BATTERY_CAPACITY,
     DEFAULT_EV_CHEAP_PRICE_THRESHOLD,
+    DEFAULT_GRID_TARIFF_OFFPEAK_SEK,
+    DEFAULT_GRID_TARIFF_PEAK_END,
+    DEFAULT_GRID_TARIFF_PEAK_SEK,
+    DEFAULT_GRID_TARIFF_PEAK_START,
     DEFAULT_EV_DEPARTURE_TIME,
     DEFAULT_EV_MIN_CHARGE_LEVEL,
     DEFAULT_EV_MIN_DEPARTURE_SOC,
@@ -107,6 +111,20 @@ class Optimizer:
             "solar_surplus_threshold_w", DEFAULT_SOLAR_SURPLUS_THRESHOLD
         )
 
+        # Grid transfer tariffs (SEK/kWh) — added to spot price
+        self.grid_tariff_peak = params.get(
+            "grid_tariff_peak_sek", DEFAULT_GRID_TARIFF_PEAK_SEK
+        )
+        self.grid_tariff_offpeak = params.get(
+            "grid_tariff_offpeak_sek", DEFAULT_GRID_TARIFF_OFFPEAK_SEK
+        )
+        self.grid_tariff_peak_start = params.get(
+            "grid_tariff_peak_start", DEFAULT_GRID_TARIFF_PEAK_START
+        )
+        self.grid_tariff_peak_end = params.get(
+            "grid_tariff_peak_end", DEFAULT_GRID_TARIFF_PEAK_END
+        )
+
         # EV grid minimization: night preference & weekend target
         self.ev_night_start = params.get("ev_night_start", DEFAULT_EV_NIGHT_START)
         self.ev_night_end = params.get("ev_night_end", DEFAULT_EV_NIGHT_END)
@@ -138,6 +156,24 @@ class Optimizer:
             legacy = outputs.get(OUTPUT_EASEE, {})
             if legacy:
                 self.ev_chargers_cfg = [legacy]
+
+    # ------------------------------------------------------------------
+    # Grid tariff helpers
+    # ------------------------------------------------------------------
+
+    def _get_grid_tariff(self, hour: int) -> float:
+        """Return the grid transfer tariff (SEK/kWh) for *hour* of day.
+
+        Peak hours (default 06–22) carry ``grid_tariff_peak``;
+        off-peak hours carry ``grid_tariff_offpeak``.
+        """
+        if self.grid_tariff_peak_start <= hour < self.grid_tariff_peak_end:
+            return self.grid_tariff_peak
+        return self.grid_tariff_offpeak
+
+    def _effective_price(self, spot_price: float, hour: int) -> float:
+        """Spot price + applicable grid tariff."""
+        return spot_price + self._get_grid_tariff(hour)
 
     def optimize(
         self,
@@ -186,6 +222,17 @@ class Optimizer:
         if not horizon_prices:
             horizon_prices = all_prices[current_hour:]
 
+        # Apply grid transfer tariffs to get effective prices.
+        # All optimisation decisions (battery charge/discharge, EV
+        # scheduling) use the effective price so the real cost of
+        # consuming a kWh — including time-of-use network fees — is
+        # properly accounted for.
+        spot_prices = list(horizon_prices)  # keep originals for reference
+        horizon_prices = [
+            price + self._get_grid_tariff((current_hour + i) % 24)
+            for i, price in enumerate(horizon_prices)
+        ]
+
         # Compute price statistics (over positive prices only for thresholds)
         avg_price = sum(horizon_prices) / len(horizon_prices) if horizon_prices else 0
         min_price = min(horizon_prices) if horizon_prices else 0
@@ -201,6 +248,7 @@ class Optimizer:
 
         for i, price in enumerate(horizon_prices):
             hour = (current_hour + i) % 24
+            spot = spot_prices[i] if i < len(spot_prices) else price
             consumption = predicted_consumption[i] if i < len(predicted_consumption) else 0
 
             # Look ahead: are there negative prices coming soon?
@@ -223,6 +271,7 @@ class Optimizer:
                 "action": action,
                 "reason": reason,
                 "price": round(price, 4),
+                "spot_price": round(spot, 4),
                 "predicted_consumption_kwh": round(consumption, 2),
             })
 
@@ -252,11 +301,14 @@ class Optimizer:
                 ev_plan_for_scheduling = list(hourly_plan)  # copy
                 for i in range(len(hourly_plan), len(extended_prices)):
                     hour = (current_hour + i) % 24
+                    spot = extended_prices[i]
+                    eff = spot + self._get_grid_tariff(hour)
                     ev_plan_for_scheduling.append({
                         "hour": hour,
                         "action": ACTION_SELF_CONSUMPTION,
                         "reason": "Extended window (day 2)",
-                        "price": round(extended_prices[i], 4),
+                        "price": round(eff, 4),
+                        "spot_price": round(spot, 4),
                         "predicted_consumption_kwh": 0,
                     })
 
@@ -287,13 +339,21 @@ class Optimizer:
         expensive_hours = [h for h in hourly_plan if h["action"] == ACTION_DISCHARGE_BATTERY]
         ev_charge_hours = [h for h in ev_charge_plan.get("schedule", []) if h.get("charging")]
 
+        has_tariff = self.grid_tariff_peak > 0 or self.grid_tariff_offpeak > 0
+        tariff_note = (
+            f" (incl. tariff {self.grid_tariff_offpeak:.2f}/"
+            f"{self.grid_tariff_peak:.2f})"
+            if has_tariff else ""
+        )
+
         summary = (
             f"Plan: {len(neg_hours)} negative-price (maximize), "
             f"{len(pre_dis_hours)} pre-discharge, "
             f"{len(cheap_hours)} charge, "
             f"{len(expensive_hours)} discharge, "
             f"{len(ev_charge_hours)} EV-charge hours. "
-            f"Price range: {min_price:.2f}–{max_price:.2f} {prices.get('currency', 'SEK')}/kWh. "
+            f"Price range: {min_price:.2f}–{max_price:.2f} "
+            f"{prices.get('currency', 'SEK')}/kWh{tariff_note}. "
             f"Spread: {price_spread:.2f}."
         )
 
@@ -307,6 +367,8 @@ class Optimizer:
                 "min_price": round(min_price, 4),
                 "max_price": round(max_price, 4),
                 "price_spread": round(price_spread, 4),
+                "grid_tariff_peak": self.grid_tariff_peak,
+                "grid_tariff_offpeak": self.grid_tariff_offpeak,
             },
         }
 
@@ -560,6 +622,7 @@ class Optimizer:
             {
                 "hour": entry["hour"],
                 "price": entry["price"],
+                "spot_price": entry.get("spot_price", entry["price"]),
                 "charging": False,
                 "total_power_kw": 0.0,
                 "vehicles": {},

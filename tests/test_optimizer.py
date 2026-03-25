@@ -3804,3 +3804,239 @@ class TestEVOptimizationDays:
             f"Day-2 cheap hours should be used for deferred charging. "
             f"All charging: {[(h, p) for _, h, p, _ in charging_entries]}"
         )
+
+
+class TestGridTariff:
+    """Tests for grid transfer tariff support.
+
+    When grid_tariff_peak_sek / grid_tariff_offpeak_sek are set, the
+    optimizer should use effective prices (spot + tariff) for ALL
+    decisions — battery scheduling and EV charging.
+    """
+
+    @pytest.fixture
+    def tariff_params(self):
+        """Parameters with realistic Swedish grid tariffs."""
+        return {
+            "min_price_spread": 0.30,
+            "planning_horizon_hours": 24,
+            "enable_charger_control": True,
+            "enable_battery_control": True,
+            "grid_tariff_peak_sek": 0.30,
+            "grid_tariff_offpeak_sek": 0.10,
+            "grid_tariff_peak_start": 6,
+            "grid_tariff_peak_end": 22,
+        }
+
+    @pytest.fixture
+    def default_outputs(self):
+        return {
+            "sungrow": {
+                "force_charge": {
+                    "service": "script.turn_on",
+                    "entity_id": "script.sg_set_forced_charge_battery_mode",
+                },
+                "force_discharge": {
+                    "service": "script.turn_on",
+                    "entity_id": "script.sg_set_forced_discharge_battery_mode",
+                },
+                "self_consumption": {
+                    "service": "script.turn_on",
+                    "entity_id": "script.sg_set_self_consumption_mode",
+                },
+                "min_soc": 10,
+                "max_soc": 100,
+                "capacity_kwh": 10.0,
+            },
+            "ev_chargers": [{
+                "name": "ev1",
+                "start_charging": {
+                    "service": "switch.turn_on",
+                    "entity_id": "switch.ev1",
+                },
+                "stop_charging": {
+                    "service": "switch.turn_off",
+                    "entity_id": "switch.ev1",
+                },
+            }],
+        }
+
+    def test_tariff_affects_effective_price(self, tariff_params, default_outputs):
+        """Effective prices should include the grid tariff."""
+        opt = Optimizer(tariff_params, default_outputs)
+
+        # Flat spot prices of 0.10 SEK all day
+        prices = {"today": [0.10] * 24, "tomorrow": [], "currency": "SEK"}
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        # Hour 0 is off-peak → effective = 0.10 + 0.10 = 0.20
+        assert plan[0]["price"] == pytest.approx(0.20, abs=0.001)
+        assert plan[0]["spot_price"] == pytest.approx(0.10, abs=0.001)
+
+        # Hour 6 is peak → effective = 0.10 + 0.30 = 0.40
+        assert plan[6]["price"] == pytest.approx(0.40, abs=0.001)
+        assert plan[6]["spot_price"] == pytest.approx(0.10, abs=0.001)
+
+    def test_tariff_shifts_battery_charging_to_offpeak(
+        self, tariff_params, default_outputs
+    ):
+        """Battery charging should prefer off-peak hours when tariffs
+        make them significantly cheaper, even with same spot price."""
+        # Override to allow higher grid charge SoC so we see charge actions
+        tariff_params["grid_charge_max_soc"] = 80
+        tariff_params["grid_charge_max_price"] = 0.50
+        opt = Optimizer(tariff_params, default_outputs)
+
+        # Spot prices: hours 0-5 = 0.08 (night), hours 6-21 = 0.08 (day),
+        # hours 22-23 = 0.08. Same spot price everywhere.
+        # But effective: night = 0.08+0.10=0.18, day = 0.08+0.30=0.38
+        prices = {"today": [0.08] * 24, "tomorrow": [], "currency": "SEK"}
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=10,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        charge_hours = [h["hour"] for h in plan if h["action"] == "charge_battery"]
+
+        # With tariff, off-peak hours (0-5, 22-23) have effective 0.18
+        # and peak hours (6-21) have effective 0.38.  Battery should
+        # only charge during off-peak since 0.38 may exceed cheap threshold.
+        for h in charge_hours:
+            is_offpeak = h >= 22 or h < 6
+            assert is_offpeak, (
+                f"Battery should charge in off-peak hours with tariff, "
+                f"but charged at hour {h}"
+            )
+
+    def test_tariff_shifts_ev_to_offpeak(self, tariff_params, default_outputs):
+        """EV charging should strongly prefer off-peak hours when
+        tariffs make them cheaper."""
+        opt = Optimizer(tariff_params, default_outputs)
+
+        ev = [{
+            "name": "ev1",
+            "power_w": 7400,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 80,
+            "vehicle_capacity_kwh": 75,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 7400,
+        }]
+
+        # Spot prices: all same at 0.15 SEK/kWh
+        # Effective: off-peak = 0.25, peak = 0.45
+        prices = {"today": [0.15] * 24, "tomorrow": [], "currency": "SEK"}
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev,
+        )
+
+        plan = result["ev_charge_schedule"]
+        charging_hours = [
+            e["hour"] for e in plan["schedule"]
+            if e["vehicles"].get("ev1", 0) > 0
+        ]
+
+        # All EV charging should be in off-peak hours (22-06)
+        for h in charging_hours:
+            is_offpeak = h >= 22 or h < 6
+            assert is_offpeak, (
+                f"EV should charge in off-peak hours with tariff, "
+                f"but charged at hour {h}. All: {charging_hours}"
+            )
+
+    def test_no_tariff_preserves_old_behavior(self, default_outputs):
+        """With tariffs set to 0, prices should be unchanged (spot only)."""
+        params = {
+            "min_price_spread": 0.30,
+            "planning_horizon_hours": 24,
+            "enable_battery_control": True,
+            "grid_tariff_peak_sek": 0.0,
+            "grid_tariff_offpeak_sek": 0.0,
+        }
+        opt = Optimizer(params, default_outputs)
+
+        prices = {"today": [0.50] * 24, "tomorrow": [], "currency": "SEK"}
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+        )
+
+        plan = result["hourly_plan"]
+        # All prices should equal spot (no tariff added)
+        for entry in plan:
+            assert entry["price"] == pytest.approx(0.50, abs=0.001)
+            assert entry["spot_price"] == pytest.approx(0.50, abs=0.001)
+
+    def test_tariff_stats_include_effective_prices(
+        self, tariff_params, default_outputs
+    ):
+        """Stats (min/max/avg/spread) should use effective prices
+        so thresholds are compared against real costs."""
+        opt = Optimizer(tariff_params, default_outputs)
+
+        # Flat spot = 0.20.  Effective: off-peak = 0.30, peak = 0.50
+        prices = {"today": [0.20] * 24, "tomorrow": [], "currency": "SEK"}
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+        )
+
+        stats = result["stats"]
+        # Min should be 0.30 (off-peak effective)
+        assert stats["min_price"] == pytest.approx(0.30, abs=0.001)
+        # Max should be 0.50 (peak effective)
+        assert stats["max_price"] == pytest.approx(0.50, abs=0.001)
+        # Tariff info in stats
+        assert stats["grid_tariff_peak"] == pytest.approx(0.30)
+        assert stats["grid_tariff_offpeak"] == pytest.approx(0.10)
+
+    def test_ev_schedule_includes_spot_price(self, tariff_params, default_outputs):
+        """EV schedule entries should have both price (effective) and
+        spot_price fields."""
+        opt = Optimizer(tariff_params, default_outputs)
+
+        prices = {"today": [0.15] * 24, "tomorrow": [], "currency": "SEK"}
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=[{
+                "name": "ev1",
+                "power_w": 7400,
+                "status": "charging",
+                "connected": True,
+                "vehicle_soc": 90,
+                "vehicle_capacity_kwh": 75,
+                "vehicle_target_soc": 100,
+                "vehicle_charging_power_w": 7400,
+            }],
+        )
+
+        for entry in result["ev_charge_schedule"]["schedule"]:
+            assert "spot_price" in entry, "EV schedule should have spot_price"
+            assert entry["spot_price"] == pytest.approx(0.15, abs=0.001)

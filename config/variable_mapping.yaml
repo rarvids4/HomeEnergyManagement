@@ -218,5 +218,15 @@ parameters:
   ev_optimization_window: 1
   # Optional HA input helper to override ev_optimization_window from UI
   optimization_days_entity: "input_number.CHANGE_ME_ev_optimization_days"
+  # --- Grid transfer tariffs ---
+  # Added to Nordpool spot prices to get the effective cost per kWh.
+  # This lets the optimizer account for time-of-use network fees when
+  # deciding when to charge the battery and EVs.
+  # Set these to your grid operator's actual rates (SEK/kWh).
+  # Peak hours (06:00–22:00 by default) carry higher fees.
+  grid_tariff_peak_sek: 0.0        # e.g. 0.30 — your daytime grid fee
+  grid_tariff_offpeak_sek: 0.0     # e.g. 0.10 — your nighttime grid fee
+  grid_tariff_peak_start: 6        # hour when peak tariff begins
+  grid_tariff_peak_end: 22         # hour when peak tariff ends
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"

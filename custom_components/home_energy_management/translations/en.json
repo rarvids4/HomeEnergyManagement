@@ -12,5 +12,19 @@
     "error": {
       "mapping_not_found": "Mapping file not found or invalid YAML. Check the path."
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Grid Tariffs",
+        "description": "Set your grid operator's transfer tariffs (SEK/kWh incl. VAT). These are added to the Nordpool spot price when the optimizer decides when to charge.",
+        "data": {
+          "grid_tariff_peak_sek": "Peak tariff (SEK/kWh)",
+          "grid_tariff_offpeak_sek": "Off-peak tariff (SEK/kWh)",
+          "grid_tariff_peak_start": "Peak hours start (0-23)",
+          "grid_tariff_peak_end": "Peak hours end (0-23)"
+        }
+      }
+    }
   }
 }

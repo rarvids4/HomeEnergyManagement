@@ -895,6 +895,18 @@ class Optimizer:
 
             hours_needed_f = kwh_needed / charging_kw if charging_kw > 0 else 0
 
+            sorted_hours = sorted(scheduled_hours)
+            # Compute start/stop times from scheduled hours.
+            # The last scheduled hour's charging ends at hour+1.
+            if sorted_hours:
+                charge_start_hour = sorted_hours[0]
+                charge_stop_hour = (sorted_hours[-1] + 1) % 24
+                charge_start_time = f"{charge_start_hour:02d}:00"
+                charge_stop_time = f"{charge_stop_hour:02d}:00"
+            else:
+                charge_start_time = None
+                charge_stop_time = None
+
             vehicle_plans.append({
                 "name": name,
                 "soc": round(soc, 1),
@@ -904,7 +916,9 @@ class Optimizer:
                 "charging_power_kw": round(charging_kw, 1),
                 "hours_needed": round(hours_needed_f, 1),
                 "connected": connected,
-                "scheduled_hours": sorted(scheduled_hours),
+                "scheduled_hours": sorted_hours,
+                "charge_start_time": charge_start_time,
+                "charge_stop_time": charge_stop_time,
                 "departure_time": departure_str,
                 "min_departure_soc": min_dep_soc,
                 "min_charge_level": min_charge_level,
@@ -926,6 +940,18 @@ class Optimizer:
             len([s for s in schedule if s["charging"]]),
         )
 
+        # Overall charge window across all vehicles
+        all_stop_times = [
+            v["charge_stop_time"] for v in vehicle_plans
+            if v.get("charge_stop_time")
+        ]
+        all_start_times = [
+            v["charge_start_time"] for v in vehicle_plans
+            if v.get("charge_start_time")
+        ]
+        overall_stop = max(all_stop_times) if all_stop_times else None
+        overall_start = min(all_start_times) if all_start_times else None
+
         return {
             "schedule": schedule,
             "total_kwh_needed": round(total_kwh, 1),
@@ -933,6 +959,8 @@ class Optimizer:
             "hours_needed": round(total_kwh / total_kw, 1) if total_kw > 0 else 0,
             "vehicles": vehicle_plans,
             "start_hour": start_hour,
+            "charge_start_time": overall_start,
+            "charge_stop_time": overall_stop,
         }
 
     # ------------------------------------------------------------------

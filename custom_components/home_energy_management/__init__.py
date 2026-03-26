@@ -77,6 +77,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "mapping": mapping,
     }
 
+    # Apply any saved options (tariffs) to the optimizer
+    _apply_options(coordinator, entry.options)
+
+    # Listen for options changes (tariff edits from the UI)
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
+
     # Forward setup to sensor platform
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
@@ -89,6 +95,37 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
     return unload_ok
+
+
+def _apply_options(coordinator: EnergyManagementCoordinator, options: dict) -> None:
+    """Apply config entry options (tariffs) to the optimizer."""
+    if not options:
+        return
+    opt = coordinator.optimizer
+    if "grid_tariff_peak_sek" in options:
+        opt.grid_tariff_peak = options["grid_tariff_peak_sek"]
+    if "grid_tariff_offpeak_sek" in options:
+        opt.grid_tariff_offpeak = options["grid_tariff_offpeak_sek"]
+    if "grid_tariff_peak_start" in options:
+        opt.grid_tariff_peak_start = options["grid_tariff_peak_start"]
+    if "grid_tariff_peak_end" in options:
+        opt.grid_tariff_peak_end = options["grid_tariff_peak_end"]
+    _LOGGER.info(
+        "Applied tariff options: peak=%.3f offpeak=%.3f hours=%d-%d",
+        opt.grid_tariff_peak, opt.grid_tariff_offpeak,
+        opt.grid_tariff_peak_start, opt.grid_tariff_peak_end,
+    )
+
+
+async def _async_options_updated(
+    hass: HomeAssistant, entry: ConfigEntry
+) -> None:
+    """Handle options update — apply new tariffs and trigger replan."""
+    data = hass.data.get(DOMAIN, {}).get(entry.entry_id, {})
+    coordinator = data.get("coordinator")
+    if coordinator:
+        _apply_options(coordinator, entry.options)
+        await coordinator.async_request_refresh()
 
 
 def _load_mapping(path: str) -> dict | None:

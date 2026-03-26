@@ -278,6 +278,17 @@ class ChargerPlanSensor(EnergyManagementSensor):
         # Build graph-friendly schedule: each entry has per-vehicle kWh
         raw_schedule = ev_plan.get("schedule", [])
 
+        # Overall charge window from the optimizer
+        overall_start = ev_plan.get("charge_start_time")
+        overall_stop = ev_plan.get("charge_stop_time")
+
+        # Active tariff values from the optimizer
+        opt = self.coordinator.optimizer
+        tariff_peak = getattr(opt, "grid_tariff_peak", 0.0)
+        tariff_offpeak = getattr(opt, "grid_tariff_offpeak", 0.0)
+        tariff_peak_start = getattr(opt, "grid_tariff_peak_start", 6)
+        tariff_peak_end = getattr(opt, "grid_tariff_peak_end", 22)
+
         return {
             "ev_connected": sensor.get("ev_connected", False),
             "ev_power_kw": round(ev_power_w / 1000, 2) if ev_power_w else 0,
@@ -292,6 +303,13 @@ class ChargerPlanSensor(EnergyManagementSensor):
             "ev_hours_needed": ev_plan.get("hours_needed", 0),
             "ev_vehicles": vehicles,
             "start_hour": ev_plan.get("start_hour", 0),
+            # Charge window
+            "charge_start_time": overall_start,
+            "charge_stop_time": overall_stop,
+            # Active tariffs
+            "grid_tariff_peak": tariff_peak,
+            "grid_tariff_offpeak": tariff_offpeak,
+            "grid_tariff_peak_hours": f"{tariff_peak_start:02d}:00-{tariff_peak_end:02d}:00",
         }
 
     @property

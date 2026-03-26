@@ -69,3 +69,49 @@ class HomeEnergyManagementConfigFlow(
             ),
             errors=errors,
         )
+
+    @staticmethod
+    def async_get_options_flow(
+        config_entry: config_entries.ConfigEntry,
+    ) -> config_entries.OptionsFlow:
+        """Return the options flow handler."""
+        return HomeEnergyManagementOptionsFlow(config_entry)
+
+
+class HomeEnergyManagementOptionsFlow(config_entries.OptionsFlow):
+    """Handle options for Home Energy Management (tariffs, etc.)."""
+
+    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
+        """Initialise options flow."""
+        self.config_entry = config_entry
+
+    async def async_step_init(self, user_input=None):
+        """Main options step — grid tariffs."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current = self.config_entry.options
+
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Optional(
+                        "grid_tariff_peak_sek",
+                        default=current.get("grid_tariff_peak_sek", 0.0),
+                    ): vol.Coerce(float),
+                    vol.Optional(
+                        "grid_tariff_offpeak_sek",
+                        default=current.get("grid_tariff_offpeak_sek", 0.0),
+                    ): vol.Coerce(float),
+                    vol.Optional(
+                        "grid_tariff_peak_start",
+                        default=current.get("grid_tariff_peak_start", 6),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=0, max=23)),
+                    vol.Optional(
+                        "grid_tariff_peak_end",
+                        default=current.get("grid_tariff_peak_end", 22),
+                    ): vol.All(vol.Coerce(int), vol.Range(min=0, max=23)),
+                }
+            ),
+        )

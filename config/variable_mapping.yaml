@@ -228,5 +228,9 @@ parameters:
   grid_tariff_offpeak_sek: 0.0     # e.g. 0.10 — your nighttime grid fee
   grid_tariff_peak_start: 6        # hour when peak tariff begins
   grid_tariff_peak_end: 22         # hour when peak tariff ends
+  # Optional HA input helpers to override tariffs from the UI
+  # (takes precedence over the static values above when > 0)
+  grid_tariff_peak_entity: "input_number.CHANGE_ME_grid_tariff_peak"
+  grid_tariff_offpeak_entity: "input_number.CHANGE_ME_grid_tariff_offpeak"
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"

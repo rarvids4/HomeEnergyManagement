@@ -100,6 +100,12 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         if opt_days_entity:
             entities.append(opt_days_entity)
 
+        # Grid tariff input helpers
+        for key in ("grid_tariff_peak_entity", "grid_tariff_offpeak_entity"):
+            entity = self.params.get(key)
+            if entity:
+                entities.append(entity)
+
         # Per-vehicle settings
         ev_chargers_cfg = self.inputs.get(INPUT_EV_CHARGERS, [])
         for charger in (ev_chargers_cfg if isinstance(ev_chargers_cfg, list) else []):
@@ -156,6 +162,19 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 opt_days_val = self._get_state_float(opt_days_entity)
                 if opt_days_val >= 1:
                     self.optimizer.ev_optimization_window = int(opt_days_val)
+
+            # Grid tariff overrides (input_number helpers)
+            tariff_peak_entity = self.params.get("grid_tariff_peak_entity")
+            if tariff_peak_entity:
+                val = self._get_state_float(tariff_peak_entity)
+                if val > 0:
+                    self.optimizer.grid_tariff_peak = val
+
+            tariff_offpeak_entity = self.params.get("grid_tariff_offpeak_entity")
+            if tariff_offpeak_entity:
+                val = self._get_state_float(tariff_offpeak_entity)
+                if val > 0:
+                    self.optimizer.grid_tariff_offpeak = val
 
             # 6. Run optimizer to produce a schedule
             schedule = self.optimizer.optimize(

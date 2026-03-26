@@ -71,6 +71,12 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             log_level=self.params.get("log_level", "info"),
         )
 
+        # --- Manual override tracking ---
+        # When a user manually turns off a charger switch, we respect
+        # that choice for one full optimisation cycle.  Maps entity_id
+        # to the datetime of the manual override.
+        self._manual_overrides: dict[str, Any] = {}
+
         # --- Auto-replan: re-run optimisation when UI settings change ---
         self._unsub_state_listeners: list = []
         watched = self._collect_watched_entities()
@@ -436,7 +442,13 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
 
     async def _execute_actions(self, schedule: dict) -> None:
         """Execute the immediate actions from the optimizer schedule."""
+        from datetime import datetime, timedelta
+
         actions = schedule.get("immediate_actions", [])
+        cooldown = timedelta(minutes=max(
+            self.params.get("optimization_interval_minutes", 15) * 2, 30
+        ))
+
         for action in actions:
             service = action.get("service")
             entity_id = action.get("entity_id")
@@ -448,6 +460,31 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             domain, service_name = service.split(".", 1) if "." in service else (service, "")
             if not service_name:
                 continue
+
+            # --- Manual override detection ---
+            # If this is a switch.turn_on and the switch is currently
+            # OFF because a *user* manually turned it off, respect
+            # their choice for a cooldown period (2× optimisation
+            # interval, minimum 30 min).
+            is_switch_on = (domain == "switch" and service_name == "turn_on")
+            if is_switch_on and entity_id.startswith("switch."):
+                state = self.hass.states.get(entity_id)
+                if state and state.state == "off":
+                    ctx = state.context
+                    if ctx and ctx.user_id:
+                        # Last change was by a human user
+                        override_ts = state.last_changed
+                        if override_ts and (
+                            datetime.now(override_ts.tzinfo) - override_ts
+                        ) < cooldown:
+                            _LOGGER.info(
+                                "Skipping %s on %s — user manually "
+                                "turned it off %s ago (cooldown %s)",
+                                service, entity_id,
+                                datetime.now(override_ts.tzinfo) - override_ts,
+                                cooldown,
+                            )
+                            continue
 
             _LOGGER.info(
                 "Executing action: %s on %s with data %s",

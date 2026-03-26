@@ -33,7 +33,7 @@ INPUT_EASEE = "easee"
 # --- Output sub-sections ---
 OUTPUT_EV_CHARGERS = "ev_chargers"
 OUTPUT_SUNGROW = "sungrow"
-# Note: sungrow_2 is a slave inverter — all control goes through the master.
+# Note: sungrow_2 is a solar-only inverter — no battery control needed.
 # No OUTPUT_SUNGROW_2 needed.
 
 # Backward compat alias

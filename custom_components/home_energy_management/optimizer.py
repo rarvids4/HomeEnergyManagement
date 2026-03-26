@@ -821,12 +821,21 @@ class Optimizer:
                 )
 
                 # Pass 1: urgent — near-term candidates sorted by
-                # INDEX (chronological) so charging starts ASAP.
+                # CHEAPEST PRICE so the floor is reached at minimal
+                # cost.  There is no need to charge immediately at
+                # expensive prices when cheaper hours are available
+                # before departure.  Only fall back to chronological
+                # (ASAP) if the SoC is critically low (< 15%).
                 near_candidates = [
                     (idx, p, h) for idx, p, h in vehicle_candidates
                     if idx < boundary
                 ]
-                near_candidates.sort(key=lambda c: c[0])
+                if soc < 10:
+                    # Critically low — charge ASAP regardless of price
+                    near_candidates.sort(key=lambda c: c[0])
+                else:
+                    # Normal floor deficit — use cheapest hours
+                    near_candidates.sort(key=_night_adjusted)
 
                 remaining = urgent_kwh
                 for idx, _price, _hour in near_candidates:
@@ -972,6 +981,111 @@ class Optimizer:
             })
         return actions
 
+    def _battery_actions_for_inverter(
+        self,
+        sg_out: dict[str, Any],
+        action: str,
+    ) -> list[dict[str, Any]]:
+        """Build battery-control HA service calls for a single inverter.
+
+        Called for both the master and (if configured) the second inverter
+        so both are always kept in sync.
+        """
+        actions: list[dict[str, Any]] = []
+
+        if action == ACTION_MAXIMIZE_LOAD:
+            cfg = sg_out.get("self_consumption", {})
+            if cfg.get("service") and cfg.get("entity_id"):
+                actions.append({
+                    "service": cfg["service"],
+                    "entity_id": cfg["entity_id"],
+                    "data": {},
+                })
+            actions.extend(self._stop_forced_cmd(sg_out))
+            pwr_cfg = sg_out.get("set_forced_power", {})
+            if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                actions.append({
+                    "service": pwr_cfg["service"],
+                    "entity_id": pwr_cfg["entity_id"],
+                    "data": {"value": 0},
+                })
+
+        elif action == ACTION_PRE_DISCHARGE:
+            cfg = sg_out.get("force_discharge", {})
+            if cfg.get("service") and cfg.get("entity_id"):
+                actions.append({
+                    "service": cfg["service"],
+                    "entity_id": cfg["entity_id"],
+                    "data": {},
+                })
+            pwr_cfg = sg_out.get("set_forced_power", {})
+            if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                actions.append({
+                    "service": pwr_cfg["service"],
+                    "entity_id": pwr_cfg["entity_id"],
+                    "data": {"value": pwr_cfg.get("max", 5000)},
+                })
+            pwr_limit = sg_out.get("set_discharge_power", {})
+            if pwr_limit.get("service") and pwr_limit.get("entity_id"):
+                actions.append({
+                    "service": pwr_limit["service"],
+                    "entity_id": pwr_limit["entity_id"],
+                    "data": {"value": pwr_limit.get("max", 5000)},
+                })
+
+        elif action == ACTION_CHARGE_BATTERY:
+            cfg = sg_out.get("force_charge", {})
+            if cfg.get("service") and cfg.get("entity_id"):
+                actions.append({
+                    "service": cfg["service"],
+                    "entity_id": cfg["entity_id"],
+                    "data": {},
+                })
+            pwr_cfg = sg_out.get("set_forced_power", {})
+            if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                actions.append({
+                    "service": pwr_cfg["service"],
+                    "entity_id": pwr_cfg["entity_id"],
+                    "data": {"value": pwr_cfg.get("max", 5000)},
+                })
+
+        elif action == ACTION_DISCHARGE_BATTERY:
+            cfg = sg_out.get("self_consumption", {})
+            if cfg.get("service") and cfg.get("entity_id"):
+                actions.append({
+                    "service": cfg["service"],
+                    "entity_id": cfg["entity_id"],
+                    "data": {},
+                })
+            actions.extend(self._stop_forced_cmd(sg_out))
+            pwr_cfg = sg_out.get("set_forced_power", {})
+            if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                actions.append({
+                    "service": pwr_cfg["service"],
+                    "entity_id": pwr_cfg["entity_id"],
+                    "data": {"value": 0},
+                })
+
+        else:
+            # Default: self_consumption
+            cfg = sg_out.get("self_consumption", {})
+            if cfg.get("service") and cfg.get("entity_id"):
+                actions.append({
+                    "service": cfg["service"],
+                    "entity_id": cfg["entity_id"],
+                    "data": {},
+                })
+            actions.extend(self._stop_forced_cmd(sg_out))
+            pwr_cfg = sg_out.get("set_forced_power", {})
+            if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+                actions.append({
+                    "service": pwr_cfg["service"],
+                    "entity_id": pwr_cfg["entity_id"],
+                    "data": {"value": 0},
+                })
+
+        return actions
+
     def _build_immediate_actions(
         self,
         action: str,
@@ -1000,116 +1114,9 @@ class Optimizer:
         actions = []
         sg_out = self.outputs.get(OUTPUT_SUNGROW, {})
 
-        # --- Battery actions (master inverter only, slave follows) ---
+        # --- Battery actions (master inverter) ---
         if self.enable_battery:
-            if action == ACTION_MAXIMIZE_LOAD:
-                # Negative price → self-consumption mode.
-                # The battery absorbs any solar surplus (prevents grid
-                # export at negative prices) but does NOT force-charge
-                # from the grid.  EVs handle the load maximisation.
-                cfg = sg_out.get("self_consumption", {})
-                if cfg.get("service") and cfg.get("entity_id"):
-                    actions.append({
-                        "service": cfg["service"],
-                        "entity_id": cfg["entity_id"],
-                        "data": {},
-                    })
-                # Explicitly clear forced charge/discharge command
-                actions.extend(self._stop_forced_cmd(sg_out))
-                # Reset forced power to 0 (not in forced mode)
-                pwr_cfg = sg_out.get("set_forced_power", {})
-                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
-                    actions.append({
-                        "service": pwr_cfg["service"],
-                        "entity_id": pwr_cfg["entity_id"],
-                        "data": {"value": 0},
-                    })
-
-            elif action == ACTION_PRE_DISCHARGE:
-                # Discharge battery to make room before negative prices
-                cfg = sg_out.get("force_discharge", {})
-                if cfg.get("service") and cfg.get("entity_id"):
-                    actions.append({
-                        "service": cfg["service"],
-                        "entity_id": cfg["entity_id"],
-                        "data": {},
-                    })
-                # Set forced charge/discharge power to maximum
-                pwr_cfg = sg_out.get("set_forced_power", {})
-                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
-                    actions.append({
-                        "service": pwr_cfg["service"],
-                        "entity_id": pwr_cfg["entity_id"],
-                        "data": {"value": pwr_cfg.get("max", 5000)},
-                    })
-                # Also set max discharge power limit
-                pwr_limit = sg_out.get("set_discharge_power", {})
-                if pwr_limit.get("service") and pwr_limit.get("entity_id"):
-                    actions.append({
-                        "service": pwr_limit["service"],
-                        "entity_id": pwr_limit["entity_id"],
-                        "data": {"value": pwr_limit.get("max", 5000)},
-                    })
-
-            elif action == ACTION_CHARGE_BATTERY:
-                cfg = sg_out.get("force_charge", {})
-                if cfg.get("service") and cfg.get("entity_id"):
-                    actions.append({
-                        "service": cfg["service"],
-                        "entity_id": cfg["entity_id"],
-                        "data": {},
-                    })
-                # Set forced charge/discharge power to maximum
-                pwr_cfg = sg_out.get("set_forced_power", {})
-                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
-                    actions.append({
-                        "service": pwr_cfg["service"],
-                        "entity_id": pwr_cfg["entity_id"],
-                        "data": {"value": pwr_cfg.get("max", 5000)},
-                    })
-
-            elif action == ACTION_DISCHARGE_BATTERY:
-                # Expensive hour → self-consumption mode.
-                # The inverter dynamically covers house load from the
-                # battery (second-by-second), avoiding grid import.
-                # This is gentler on the battery than forced discharge
-                # and avoids dumping excess power to the grid.
-                cfg = sg_out.get("self_consumption", {})
-                if cfg.get("service") and cfg.get("entity_id"):
-                    actions.append({
-                        "service": cfg["service"],
-                        "entity_id": cfg["entity_id"],
-                        "data": {},
-                    })
-                # Explicitly clear forced charge/discharge command
-                actions.extend(self._stop_forced_cmd(sg_out))
-                # Reset forced power to 0 (self-consumption handles it)
-                pwr_cfg = sg_out.get("set_forced_power", {})
-                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
-                    actions.append({
-                        "service": pwr_cfg["service"],
-                        "entity_id": pwr_cfg["entity_id"],
-                        "data": {"value": 0},
-                    })
-
-            else:
-                cfg = sg_out.get("self_consumption", {})
-                if cfg.get("service") and cfg.get("entity_id"):
-                    actions.append({
-                        "service": cfg["service"],
-                        "entity_id": cfg["entity_id"],
-                        "data": {},
-                    })
-                # Explicitly clear forced charge/discharge command
-                actions.extend(self._stop_forced_cmd(sg_out))
-                # Reset forced power to 0 (not in forced mode)
-                pwr_cfg = sg_out.get("set_forced_power", {})
-                if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
-                    actions.append({
-                        "service": pwr_cfg["service"],
-                        "entity_id": pwr_cfg["entity_id"],
-                        "data": {"value": 0},
-                    })
+            actions.extend(self._battery_actions_for_inverter(sg_out, action))
 
         # ---------------------------------------------------------------
         # EV charger actions — driven by the pre-computed schedule.

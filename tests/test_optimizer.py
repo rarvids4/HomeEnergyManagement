@@ -3385,14 +3385,14 @@ class TestEVOptimizationDays:
     def test_urgent_floor_charges_earliest_not_cheapest(
         self, two_day_params, default_outputs
     ):
-        """Urgent charging to reach min_charge_level should pick the
-        EARLIEST available hours (chronological), not the cheapest.
+        """When SoC is above critical threshold (10%), the urgent pass
+        uses cheapest-price scheduling, NOT chronological ASAP.
 
-        Scenario: current hour 14, all near-term prices are 0.25 SEK
-        (uniform, spread < min_price_spread → no discharge exclusion).
-        Night preference (0.10) makes hours 22-23 appear cheapest in
-        the price-sorted order.  Urgent charging must still start at
-        the earliest index (hour 14), not at the cheapest night hours.
+        Scenario: current hour 14, today uniform 0.25 SEK, tomorrow
+        uniform 0.10 SEK.  SoC=10% with floor=30%, target=100%.
+        Urgent (10→30%) should use cheapest near-term hours (night
+        hours get preference), NOT the earliest chronological hours.
+        Deferred (30→100%) should prefer cheapest day-2 hours.
         """
         ev = [{
             "name": "ex90",
@@ -3427,45 +3427,41 @@ class TestEVOptimizationDays:
 
         plan = result["ev_charge_schedule"]
         schedule = plan["schedule"]
+        near_term = len(result["hourly_plan"])
 
-        # Urgent kWh: (30-10)/100 * 111 = 22.2 kWh
-        # At 8.25 kW, that's ~3 hours (indices 0, 1, 2).
-        # Night-adjusted sort would put indices 8-9 (hours 22-23) first,
-        # but chronological ordering should pick indices 0, 1, 2.
-        first_charging_idx = next(
-            i for i, e in enumerate(schedule) if e["vehicles"].get("ex90", 0) > 0
+        # SoC=10% is NOT critically low (threshold is < 10), so the
+        # urgent pass uses cheapest-price scheduling.  With night
+        # preference, night hours (22-23) should appear before
+        # daytime hours (14-21) when prices are uniform.
+        charging_indices = [
+            i for i, e in enumerate(schedule)
+            if e["vehicles"].get("ex90", 0) > 0 and i < near_term
+        ]
+        assert len(charging_indices) > 0, "Should have some day-1 charging"
+
+        # Verify NOT strictly chronological from index 0 — the
+        # cheapest-price sort should pick night hours first.
+        # With uniform prices, night preference gives hours 22-23
+        # (indices 8-9 from start_hour=14) a lower effective price.
+        # So first charging index should NOT be 0.
+        first_idx = charging_indices[0]
+        assert first_idx > 0, (
+            f"Cheapest-price urgent pass should NOT start at index 0 "
+            f"(chronological), but it did. Indices: {charging_indices}"
         )
-        assert first_charging_idx == 0, (
-            f"Urgent charging should start at earliest slot (index 0 = hour 14), "
-            f"but first charging is at index {first_charging_idx}"
-        )
-
-        # Collect the urgent portion (first ~22.2 kWh)
-        urgent_indices = []
-        urgent_kwh = 0.0
-        for i, entry in enumerate(schedule):
-            kwh = entry["vehicles"].get("ex90", 0)
-            if kwh > 0 and urgent_kwh < 22.2:
-                urgent_indices.append(i)
-                urgent_kwh += kwh
-
-        # All urgent indices should be consecutive from the start
-        for rank, idx in enumerate(urgent_indices):
-            assert idx == rank, (
-                f"Urgent slot #{rank} should be index {rank} (chronological), "
-                f"got index {idx}. Urgent slots: {urgent_indices}"
-            )
 
     def test_urgent_chronological_deferred_cheapest(
         self, two_day_params, default_outputs
     ):
-        """Verify the two-pass split: urgent portion is chronological,
-        deferred portion picks cheapest hours across the full window.
+        """Verify the two-pass split: urgent portion uses cheapest hours
+        (not chronological) when SoC is above the critical threshold
+        (10%).  Deferred portion picks cheapest hours across the full
+        window including day-2.
 
         Today: uniform 0.25 SEK from hour 10 (spread < 0.30 → no
         discharge exclusion).  Tomorrow: 0.10 SEK (cheaper).
         Car at 15% with 40% floor, target 100%.
-        Urgent (15→40%) should be scheduled ASAP in earliest hours.
+        Urgent (15→40%) should prefer cheapest hours (not ASAP).
         Deferred (40→100%) should prefer cheapest day-2 hours.
         """
         ev = [{
@@ -3501,9 +3497,6 @@ class TestEVOptimizationDays:
         schedule = plan["schedule"]
         near_term = len(result["hourly_plan"])  # day-1 boundary
 
-        # Urgent: (40-15)/100 * 111 = 27.75 kWh → ~4 hours at 8.25 kW
-        # These should be indices 0,1,2,3 (hours 10,11,12,13) — chosen
-        # because they're the EARLIEST, not cheapest.
         day1_charging = [
             (i, e["vehicles"].get("ex90", 0))
             for i, e in enumerate(schedule)
@@ -3515,18 +3508,72 @@ class TestEVOptimizationDays:
             if e["vehicles"].get("ex90", 0) > 0 and i >= near_term
         ]
 
-        # The earliest day-1 charging slots should start at index 0
-        if day1_charging:
-            first_idx = day1_charging[0][0]
-            assert first_idx == 0, (
-                f"Urgent pass should start at index 0, got {first_idx}"
-            )
+        # SoC=15% is above the critical threshold (10%), so the urgent
+        # pass uses cheapest-price scheduling, NOT chronological.
+        # With uniform prices (0.25 today), urgent hours may appear
+        # anywhere in day-1 (not necessarily starting at index 0).
+        # The important thing is that deferred uses cheaper day-2.
+        assert len(day1_charging) > 0, "Should have some day-1 charging"
 
         # Deferred portion should predominantly go to day 2 (cheaper)
         day2_kwh = sum(kwh for _, kwh in day2_charging)
         assert day2_kwh > 0, (
             "Deferred portion should use cheaper day-2 hours"
         )
+
+    def test_urgent_critical_soc_charges_asap(
+        self, two_day_params, default_outputs
+    ):
+        """When SoC is critically low (< 10%), the urgent pass charges
+        ASAP (chronologically) regardless of price.
+        """
+        ev = [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 5,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+            "min_charge_level": 40,
+        }]
+
+        opt = Optimizer(two_day_params, default_outputs)
+
+        # Use uniform prices to avoid discharge exclusions that
+        # would remove index 0 from candidates.
+        today_prices = [0.25] * 24
+        tomorrow_prices = [0.10] * 24
+
+        with patch("custom_components.home_energy_management.optimizer.datetime") as mock_dt:
+            mock_dt.now.return_value = datetime(2024, 3, 12, 10, 0)  # Tuesday 10:00
+            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+
+            result = opt.optimize(
+                prices={"today": today_prices, "tomorrow": tomorrow_prices, "currency": "SEK"},
+                predicted_consumption=[1.0] * 24,
+                battery_soc=50,
+                ev_connected=True,
+                ev_vehicles=ev,
+            )
+
+        plan = result["ev_charge_schedule"]
+        schedule = plan["schedule"]
+        near_term = len(result["hourly_plan"])
+
+        day1_charging = [
+            (i, e["vehicles"].get("ex90", 0))
+            for i, e in enumerate(schedule)
+            if e["vehicles"].get("ex90", 0) > 0 and i < near_term
+        ]
+
+        # Critically low SoC → urgent pass should start at index 0
+        if day1_charging:
+            first_idx = day1_charging[0][0]
+            assert first_idx == 0, (
+                f"Critical SoC should charge ASAP at index 0, got {first_idx}"
+            )
 
     def test_two_day_deferred_ignores_departure_filter(
         self, two_day_params, default_outputs

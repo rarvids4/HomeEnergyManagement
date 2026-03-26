@@ -897,10 +897,34 @@ class Optimizer:
 
             sorted_hours = sorted(scheduled_hours)
             # Compute start/stop times from scheduled hours.
-            # The last scheduled hour's charging ends at hour+1.
+            # Handle midnight wraparound: if there is a gap > 1 hour
+            # in the sorted sequence, the block wraps midnight.
             if sorted_hours:
-                charge_start_hour = sorted_hours[0]
-                charge_stop_hour = (sorted_hours[-1] + 1) % 24
+                # Detect the largest gap between consecutive hours
+                # (including the wrap from last back to first + 24)
+                gaps = []
+                for i in range(len(sorted_hours) - 1):
+                    gaps.append(
+                        (sorted_hours[i + 1] - sorted_hours[i], i)
+                    )
+                # Wrap gap: from last hour back to first + 24
+                wrap_gap = (sorted_hours[0] + 24 - sorted_hours[-1], len(sorted_hours) - 1)
+                gaps.append(wrap_gap)
+
+                max_gap_size, max_gap_idx = max(gaps, key=lambda g: g[0])
+
+                if max_gap_size > 1:
+                    # Charging starts after the gap
+                    charge_start_hour = sorted_hours[
+                        (max_gap_idx + 1) % len(sorted_hours)
+                    ]
+                    # Charging ends 1 hour after the hour before the gap
+                    charge_stop_hour = (sorted_hours[max_gap_idx] + 1) % 24
+                else:
+                    # Contiguous block (no gap > 1)
+                    charge_start_hour = sorted_hours[0]
+                    charge_stop_hour = (sorted_hours[-1] + 1) % 24
+
                 charge_start_time = f"{charge_start_hour:02d}:00"
                 charge_stop_time = f"{charge_stop_hour:02d}:00"
             else:

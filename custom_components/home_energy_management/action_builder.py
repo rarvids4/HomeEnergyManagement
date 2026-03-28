@@ -291,6 +291,37 @@ class ActionBuilder:
         if vehicle:
             charger_connected = vehicle.get("connected", ev_connected)
 
+        # --- FREE ENERGY OVERRIDES (checked first — never waste free power) ---
+        # Negative prices: always charge — we get paid, ignore SoC limits
+        if price_is_negative:
+            vehicle_target = 100
+            vehicle_soc = 0
+            if vehicle:
+                vehicle_target = vehicle.get("vehicle_target_soc", 100)
+                vehicle_soc = vehicle.get("vehicle_soc", 0)
+            if vehicle_soc <= 0 or vehicle_soc < vehicle_target:
+                _LOGGER.info(
+                    "EV %s: Negative price (%.3f) — charging",
+                    charger_name, current_price,
+                )
+                return self._start_charger(charger_cfg)
+
+        # Solar surplus: charge up to the vehicle's own target SoC
+        # (disregard the departure/min SoC limits — this is free solar)
+        if charger_connected and solar_surplus and not price_is_expensive:
+            vehicle_target = 100
+            vehicle_soc = 0
+            if vehicle:
+                vehicle_target = vehicle.get("vehicle_target_soc", 100)
+                vehicle_soc = vehicle.get("vehicle_soc", 0)
+            if vehicle_soc <= 0 or vehicle_soc < vehicle_target:
+                _LOGGER.info(
+                    "EV %s: Solar surplus (%.0f W export) — charging "
+                    "(SoC %.0f%% < vehicle limit %.0f%%)",
+                    charger_name, grid_export_w, vehicle_soc, vehicle_target,
+                )
+                return self._start_charger(charger_cfg)
+
         # --- RAMP-DOWN: stop if vehicle at/above target SoC ---
         if vehicle:
             vehicle_soc = vehicle.get("vehicle_soc", 0)
@@ -305,32 +336,14 @@ class ActionBuilder:
                 effective_target = self.ev_weekend_target_soc
 
             if vehicle_soc > 0 and vehicle_soc >= effective_target:
-                vehicle_target = vehicle.get("vehicle_target_soc", 100)
-                if price_is_negative and vehicle_soc < vehicle_target:
-                    pass  # Exploit negative prices
-                else:
-                    _LOGGER.info(
-                        "EV %s: SoC %.0f%% >= target %.0f%% — stopping (ramp-down)",
-                        charger_name, vehicle_soc, effective_target,
-                    )
-                    return self._stop_charger(charger_cfg)
+                _LOGGER.info(
+                    "EV %s: SoC %.0f%% >= target %.0f%% — stopping (ramp-down)",
+                    charger_name, vehicle_soc, effective_target,
+                )
+                return self._stop_charger(charger_cfg)
 
-        # --- Schedule-based + real-time overrides ---
+        # --- Schedule-based + remaining overrides ---
         is_scheduled = charger_name in scheduled_vehicles
-
-        if price_is_negative:
-            _LOGGER.info(
-                "EV %s: Negative price (%.3f) — charging",
-                charger_name, current_price,
-            )
-            return self._start_charger(charger_cfg)
-
-        if charger_connected and solar_surplus and not price_is_expensive:
-            _LOGGER.info(
-                "EV %s: Solar surplus (%.0f W) — charging",
-                charger_name, grid_export_w,
-            )
-            return self._start_charger(charger_cfg)
 
         if charger_connected and is_scheduled:
             _LOGGER.info(

@@ -10,7 +10,8 @@ HA_URL = "http://172.16.0.9:8123"
 WS_URL = "ws://172.16.0.9:8123/api/websocket"
 token = Path(__file__).parent.joinpath(".ha_token").read_text().strip()
 
-# New ApexCharts card to replace the old history-graph
+# New ApexCharts card — uses existing sensor.load_power (W, has full history)
+# and converts predicted_consumption from kWh-per-15min → W (×4000).
 NEW_CARD = {
     "type": "custom:apexcharts-card",
     "header": {
@@ -18,14 +19,13 @@ NEW_CARD = {
         "show": True,
     },
     "graph_span": "48h",
-    "span": {"end": "now"},
     "yaxis": [
         {
-            "id": "kwh",
+            "id": "watts",
             "min": 0,
-            "decimals": 2,
+            "decimals": 0,
             "apex_config": {
-                "title": {"text": "kWh"},
+                "title": {"text": "W"},
             },
         }
     ],
@@ -37,18 +37,24 @@ NEW_CARD = {
             "color": "#2196F3",
             "stroke_width": 2,
             "curve": "stepline",
-            "yaxis_id": "kwh",
+            "yaxis_id": "watts",
             "extend_to": False,
+            "transform": "return x * 4000;",
         },
         {
-            "entity": "sensor.home_energy_management_actual_consumption",
+            "entity": "sensor.load_power",
             "name": "Actual",
             "type": "line",
             "color": "#F44336",
-            "stroke_width": 2,
-            "curve": "stepline",
-            "yaxis_id": "kwh",
+            "stroke_width": 1,
+            "curve": "smooth",
+            "yaxis_id": "watts",
             "extend_to": False,
+            "transform": "return Math.abs(x);",
+            "group_by": {
+                "func": "avg",
+                "duration": "15min",
+            },
         },
     ],
 }
@@ -81,11 +87,17 @@ async def main():
             cards = view["cards"]
             replaced = False
             for i, card in enumerate(cards):
+                if card.get("type") == "custom:apexcharts-card" and "Predicted" in card.get("header", {}).get("title", ""):
+                    print(f"Found apexcharts card at index {i}: {card.get('header', {}).get('title')}")
+                    cards[i] = NEW_CARD
+                    replaced = True
+                    break
+
                 if (
                     card.get("type") == "history-graph"
                     and "Predicted Consumption" in card.get("title", "")
                 ):
-                    print(f"Found card at index {i}: {card.get('title')}")
+                    print(f"Found history-graph card at index {i}: {card.get('title')}")
                     cards[i] = NEW_CARD
                     replaced = True
                     break

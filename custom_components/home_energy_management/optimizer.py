@@ -81,6 +81,7 @@ class Optimizer:
         ev_connected: bool,
         grid_export_power: float = 0.0,
         ev_vehicles: list[dict[str, Any]] | None = None,
+        predicted_solar: list[float] | None = None,
     ) -> dict[str, Any]:
         """Produce an hour-by-hour schedule and immediate actions.
 
@@ -136,6 +137,17 @@ class Optimizer:
         immediate_actions = []
         if hourly_plan:
             current_plan = hourly_plan[0]
+            pred_consumption_0 = predicted_consumption[0] if predicted_consumption else 0.0
+            pred_solar_0 = predicted_solar[0] if predicted_solar else 0.0
+            # Compute the minimum SoC needed to meet the plan (sum of all charge actions)
+            planned_soc = max(
+                (h["predicted_consumption_kwh"] for h in hourly_plan if h["action"] == "charge_battery"),
+                default=0.0
+            )
+            # Clamp target_soc to not exceed max_soc
+            sg_out = self.outputs.get(OUTPUT_SUNGROW, {})
+            max_soc = sg_out.get("max_soc", 100)
+            target_soc = min(max_soc, planned_soc)
             immediate_actions = self._actions.build_immediate_actions(
                 action=current_plan["action"],
                 ev_connected=ev_connected,
@@ -147,6 +159,9 @@ class Optimizer:
                 ev_vehicles=ev_vehicles or [],
                 ev_charge_plan=ev_charge_plan,
                 now=now,
+                predicted_consumption=pred_consumption_0,
+                predicted_solar=pred_solar_0,
+                target_soc=target_soc,
             )
 
         # ── Summary ────────────────────────────────────────────────

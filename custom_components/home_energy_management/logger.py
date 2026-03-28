@@ -279,3 +279,36 @@ class PredictionLogger:
         }
 
         return summary
+
+    def get_actual_vs_predicted_history(
+        self,
+        stream: str = "total",
+        last_n: int = 48,
+    ) -> list[dict[str, Any]]:
+        """Return a chart-ready timeseries of predicted vs actual values.
+
+        Each entry contains ``timestamp``, ``predicted_kwh``,
+        ``actual_kwh``, and ``error_kwh`` — suitable for overlaying
+        two lines on an ApexCharts card.
+
+        Parameters
+        ----------
+        stream : str
+            Which stream to return (``total``, ``house_base``,
+            ``ev_charging``).
+        last_n : int
+            Number of most recent data points to return.
+        """
+        records = [
+            r for r in self._accuracy_records if r["stream"] == stream
+        ]
+        records = records[-last_n:]
+        return [
+            {
+                "timestamp": r["timestamp"],
+                "predicted_kwh": r["predicted_kwh"],
+                "actual_kwh": r["actual_kwh"],
+                "error_kwh": r["error_kwh"],
+            }
+            for r in records
+        ]

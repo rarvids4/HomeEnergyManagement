@@ -79,6 +79,9 @@ class ActionBuilder:
         ev_vehicles: list[dict[str, Any]] | None = None,
         ev_charge_plan: dict[str, Any] | None = None,
         now: datetime | None = None,
+        predicted_consumption: float = 0.0,
+        predicted_solar: float = 0.0,
+        target_soc: float = 100.0,
     ) -> list[dict[str, Any]]:
         """Convert the current hour's plan into HA service calls.
 
@@ -91,7 +94,7 @@ class ActionBuilder:
 
         # --- Battery actions ---
         if self.enable_battery:
-            actions.extend(self._battery_actions(sg_out, action))
+            actions.extend(self._battery_actions(sg_out, action, predicted_consumption, predicted_solar, target_soc))
 
         # --- EV charger actions ---
         ev_chargers = (
@@ -142,6 +145,9 @@ class ActionBuilder:
         self,
         sg_out: dict[str, Any],
         action: str,
+        predicted_consumption: float = 0.0,
+        predicted_solar: float = 0.0,
+        target_soc: float = 100.0,
     ) -> list[dict[str, Any]]:
         """Build battery-control service calls for the inverter."""
         actions: list[dict[str, Any]] = []
@@ -182,7 +188,20 @@ class ActionBuilder:
                     "entity_id": cfg["entity_id"],
                     "data": {},
                 })
-            self._set_forced_power(sg_out, actions, sg_out.get("set_forced_power", {}).get("max", 5000))
+            inverter_max = sg_out.get("set_forced_power", {}).get("max", 5000)
+            grid_limit = 4500
+            # Clamp SoC to target_soc (do not overcharge)
+            current_soc = sg_out.get("soc", 0)
+            soc_to_charge = max(0, target_soc - current_soc)
+            # Convert SoC % to kWh (if battery_capacity available)
+            battery_capacity = sg_out.get("capacity_kwh", 10)
+            kwh_to_charge = soc_to_charge / 100.0 * battery_capacity
+            # Convert kWh to W for 1 hour (assume 1h slot)
+            w_to_charge = kwh_to_charge * 1000
+            # grid_import = predicted_consumption - predicted_solar + battery_charge_power
+            battery_charge_power = min(w_to_charge, grid_limit - (predicted_consumption - predicted_solar), inverter_max)
+            battery_charge_power = max(0, battery_charge_power)
+            self._set_forced_power(sg_out, actions, int(battery_charge_power))
 
         elif action == ACTION_DISCHARGE_BATTERY:
             # Self-consumption mode — inverter covers house load from battery

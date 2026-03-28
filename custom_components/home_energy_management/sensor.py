@@ -38,6 +38,7 @@ async def async_setup_entry(
         CurrentPriceSensor(coordinator, entry),
         NextActionSensor(coordinator, entry),
         PredictedConsumptionSensor(coordinator, entry),
+        ActualConsumptionSensor(coordinator, entry),
         BatteryPlanSensor(coordinator, entry),
         ChargerPlanSensor(coordinator, entry),
         DailySavingsSensor(coordinator, entry),
@@ -196,6 +197,15 @@ class PredictedConsumptionSensor(EnergyManagementSensor):
         split = data.get("prediction_split", {})
         house = split.get("house_base", [])
         ev = split.get("ev_charging", [])
+
+        # Chart-ready actual vs predicted history from the accuracy logger
+        history = self.coordinator.prediction_logger.get_actual_vs_predicted_history(
+            stream="total", last_n=48,
+        )
+        house_history = self.coordinator.prediction_logger.get_actual_vs_predicted_history(
+            stream="house_base", last_n=48,
+        )
+
         return {
             "next_24h": predictions[:24],
             "house_base_24h": house[:24],
@@ -203,11 +213,50 @@ class PredictedConsumptionSensor(EnergyManagementSensor):
             "total_predicted_24h": round(sum(predictions[:24]), 2) if predictions else 0,
             "total_house_base_24h": round(sum(house[:24]), 2) if house else 0,
             "total_ev_charging_24h": round(sum(ev[:24]), 2) if ev else 0,
+            # Actual vs predicted timeseries for ApexCharts overlay
+            "actual_vs_predicted": history,
+            "actual_vs_predicted_house": house_history,
         }
 
     @property
     def icon(self) -> str:
         return "mdi:chart-line"
+
+
+class ActualConsumptionSensor(EnergyManagementSensor):
+    """Actual measured consumption for the current interval.
+
+    Matches the same kWh-per-interval unit as PredictedConsumptionSensor
+    so both can be plotted on the same chart for easy comparison.
+    """
+
+    _attr_device_class = SensorDeviceClass.ENERGY
+    _attr_state_class = SensorStateClass.MEASUREMENT
+    _attr_native_unit_of_measurement = "kWh"
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "actual_consumption", "Actual Consumption")
+
+    @property
+    def native_value(self) -> float:
+        data = self.coordinator.data or {}
+        return data.get("actual_consumption_kwh", 0)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data or {}
+        sensor = data.get("sensor_data", {})
+        return {
+            "house_load_w": sensor.get("house_load", 0),
+            "ev_power_w": sensor.get("ev_power", 0),
+            "house_base_w": max(
+                sensor.get("house_load", 0) - sensor.get("ev_power", 0), 0
+            ),
+        }
+
+    @property
+    def icon(self) -> str:
+        return "mdi:flash"
 
 
 class BatteryPlanSensor(EnergyManagementSensor):
@@ -432,6 +481,18 @@ class PredictionAccuracySensor(EnergyManagementSensor):
         combined = accuracy.get("combined", {})
         at_combined = combined.get("all_time", {})
         attrs["recent_errors"] = at_combined.get("recent_errors", [])
+
+        # Chart-ready timeseries: actual vs predicted (48 data points per stream)
+        logger = self.coordinator.prediction_logger
+        attrs["actual_vs_predicted_total"] = logger.get_actual_vs_predicted_history(
+            stream="total", last_n=48,
+        )
+        attrs["actual_vs_predicted_house"] = logger.get_actual_vs_predicted_history(
+            stream="house_base", last_n=48,
+        )
+        attrs["actual_vs_predicted_ev"] = logger.get_actual_vs_predicted_history(
+            stream="ev_charging", last_n=48,
+        )
 
         return attrs
 

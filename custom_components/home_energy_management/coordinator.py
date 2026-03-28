@@ -189,10 +189,16 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             # 7. Execute immediate actions
             await self._execute_actions(schedule)
 
-            # 8. Log actual vs previous prediction (before overwriting)
+            # 8. Compute actual consumption in same kWh unit as predictions
+            interval_h = self.update_interval.total_seconds() / 3600.0
+            actual_consumption_kwh = round(
+                (sensor_data.get("house_load", 0) / 1000.0) * interval_h, 3
+            )
+
+            # 9. Log actual vs previous prediction (before overwriting)
             self._log_actuals(sensor_data)
 
-            # 9. Log the new decision (stores predictions for next comparison)
+            # 10. Log the new decision (stores predictions for next comparison)
             self.prediction_logger.log_decision(
                 prices=prices,
                 predicted_consumption=predicted_consumption,
@@ -206,6 +212,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 "prices": prices,
                 "predicted_consumption": predicted_consumption,
                 "prediction_split": prediction_split,
+                "actual_consumption_kwh": actual_consumption_kwh,
                 "schedule": schedule,
                 "log_entries": self.prediction_logger.get_recent_entries(20),
                 "accuracy": self.prediction_logger.get_accuracy_summary(),

@@ -1,3 +1,8 @@
+# ============================================================
+# Home Energy Management — .gitignore
+# ============================================================
+
+# --- Python ---
 .venv/
 __pycache__/
 *.pyc
@@ -6,22 +11,43 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-.env
 
-# --- Local RPi configuration (NEVER commit) ---
-# The actual mapping with your real entity IDs
-config/variable_mapping.local.yaml
-# Any local secrets / tokens
+# --- Environment / secrets (NEVER commit) ---
+.env
 .ha_token
 secrets.yaml
+
+# --- Local configuration (contains real entity IDs) ---
+config/variable_mapping.local.yaml
+
+# --- Dev / debug / deploy scripts ---
+# These contain hardcoded IP addresses (172.16.0.9) and read .ha_token.
+# They are personal tooling — not part of the integration.
 check_ssh.py
-deploy.py
-ha_deploy_commands.sh
 check_entities.py
+debug_card.py
 debug_apexcharts.py
+debug_zoe_charging.py
+deploy.py
 diagnose_crash.py
 diagnose_crash2.py
 diagnose_crash3.py
 diagnose_ha.py
+find_modbus.py
+fix_price_ev_chart_scaling.py
 force_update_hacs.py
+ha_deploy_commands.sh
+ha_restart.py
+hacs_deploy.py
+push_config.py
 rename_renault_entities.py
+update_predict_card.py
+
+# --- IDE / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

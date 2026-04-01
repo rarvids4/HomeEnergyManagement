@@ -72,6 +72,7 @@ class ActionBuilder:
         action: str,
         ev_connected: bool,
         current_price: float = 0.0,
+        spot_price: float = 0.0,
         avg_price: float = 0.0,
         min_price: float = 0.0,
         price_spread: float = 0.0,
@@ -94,7 +95,10 @@ class ActionBuilder:
 
         # --- Battery actions ---
         if self.enable_battery:
-            actions.extend(self._battery_actions(sg_out, action, predicted_consumption, predicted_solar, target_soc))
+            actions.extend(self._battery_actions(
+                sg_out, action, predicted_consumption, predicted_solar,
+                target_soc, spot_price=spot_price,
+            ))
 
         # --- EV charger actions ---
         ev_chargers = (
@@ -126,14 +130,14 @@ class ActionBuilder:
         is_friday = now.weekday() == 4
 
         for charger_cfg in ev_chargers:
-            charger_action = self._decide_charger_action(
+            charger_actions = self._decide_charger_action(
                 charger_cfg, vehicle_map, scheduled_vehicles,
                 ev_connected, price_is_negative, solar_surplus,
                 price_is_expensive, current_price, grid_export_w,
                 is_friday,
             )
-            if charger_action:
-                actions.append(charger_action)
+            if charger_actions:
+                actions.extend(charger_actions)
 
         return actions
 
@@ -148,20 +152,49 @@ class ActionBuilder:
         predicted_consumption: float = 0.0,
         predicted_solar: float = 0.0,
         target_soc: float = 100.0,
+        *,
+        spot_price: float = 0.0,
     ) -> list[dict[str, Any]]:
         """Build battery-control service calls for the inverter."""
         actions: list[dict[str, Any]] = []
 
         if action == ACTION_MAXIMIZE_LOAD:
-            cfg = sg_out.get("self_consumption", {})
-            if cfg.get("service") and cfg.get("entity_id"):
-                actions.append({
-                    "service": cfg["service"],
-                    "entity_id": cfg["entity_id"],
-                    "data": {},
-                })
-            actions.extend(self._stop_forced_cmd(sg_out))
-            self._set_forced_power(sg_out, actions, 0)
+            # Negative price — absorb as much as possible, minimize grid export.
+            # If solar is actively exporting (grid_export_w > 0), force-charge
+            # the battery to soak up surplus; otherwise self-consumption is fine.
+            net_solar_w = (predicted_solar - predicted_consumption) * 1000
+            battery_soc = sg_out.get("soc", 0)
+            max_soc = sg_out.get("max_soc", 100)
+            can_charge = battery_soc < max_soc
+
+            if can_charge and net_solar_w > 0:
+                # Solar exceeds consumption — force-charge battery to absorb it
+                cfg = sg_out.get("force_charge", {})
+                if cfg.get("service") and cfg.get("entity_id"):
+                    actions.append({
+                        "service": cfg["service"],
+                        "entity_id": cfg["entity_id"],
+                        "data": {},
+                    })
+                inverter_max = sg_out.get("set_forced_power", {}).get("max", 5000)
+                charge_power = min(int(net_solar_w), inverter_max)
+                self._set_forced_power(sg_out, actions, charge_power)
+                _LOGGER.info(
+                    "Negative price + solar surplus: force-charging battery "
+                    "at %d W to minimize grid export (SoC %.0f%%)",
+                    charge_power, battery_soc,
+                )
+            else:
+                # No solar surplus or battery full — self-consumption is fine
+                cfg = sg_out.get("self_consumption", {})
+                if cfg.get("service") and cfg.get("entity_id"):
+                    actions.append({
+                        "service": cfg["service"],
+                        "entity_id": cfg["entity_id"],
+                        "data": {},
+                    })
+                actions.extend(self._stop_forced_cmd(sg_out))
+                self._set_forced_power(sg_out, actions, 0)
 
         elif action == ACTION_PRE_DISCHARGE:
             cfg = sg_out.get("force_discharge", {})
@@ -199,21 +232,52 @@ class ActionBuilder:
             # Convert kWh to W for 1 hour (assume 1h slot)
             w_to_charge = kwh_to_charge * 1000
             # grid_import = predicted_consumption - predicted_solar + battery_charge_power
-            battery_charge_power = min(w_to_charge, grid_limit - (predicted_consumption - predicted_solar), inverter_max)
+            # predicted values are kWh (1 h slot) → multiply by 1000 for W
+            net_consumption_w = (predicted_consumption - predicted_solar) * 1000
+            battery_charge_power = min(w_to_charge, grid_limit - net_consumption_w, inverter_max)
             battery_charge_power = max(0, battery_charge_power)
             self._set_forced_power(sg_out, actions, int(battery_charge_power))
 
         elif action == ACTION_DISCHARGE_BATTERY:
-            # Self-consumption mode — inverter covers house load from battery
-            cfg = sg_out.get("self_consumption", {})
+            # Force-discharge — actively drain battery during expensive hours.
+            # The battery MUST NOT charge during this mode, even if solar
+            # production exceeds household consumption.
+            cfg = sg_out.get("force_discharge", {})
             if cfg.get("service") and cfg.get("entity_id"):
                 actions.append({
                     "service": cfg["service"],
                     "entity_id": cfg["entity_id"],
                     "data": {},
                 })
-            actions.extend(self._stop_forced_cmd(sg_out))
-            self._set_forced_power(sg_out, actions, 0)
+            inverter_max = sg_out.get("set_forced_power", {}).get("max", 5000)
+            # Minimum forced discharge — guarantees the battery never charges
+            # (solar surplus would otherwise be absorbed by the battery).
+            min_discharge_w = 500
+
+            # Net household load after solar (W).
+            # predicted_consumption/predicted_solar are in kWh (1 h slot)
+            # → multiply by 1000 to get average watts.
+            net_load_w = (predicted_consumption - predicted_solar) * 1000
+
+            if net_load_w > 0:
+                # House needs more than solar → discharge to cover the gap
+                discharge_power = int(net_load_w)
+            else:
+                # Solar covers (or exceeds) house load → still discharge
+                # to export stored energy at the expensive grid price
+                discharge_power = inverter_max
+
+            # Clamp: at least min_discharge, at most inverter_max
+            discharge_power = max(min_discharge_w, min(discharge_power, inverter_max))
+
+            self._set_forced_power(sg_out, actions, discharge_power)
+            pwr_limit = sg_out.get("set_discharge_power", {})
+            if pwr_limit.get("service") and pwr_limit.get("entity_id"):
+                actions.append({
+                    "service": pwr_limit["service"],
+                    "entity_id": pwr_limit["entity_id"],
+                    "data": {"value": discharge_power},
+                })
 
         else:
             # Default: self-consumption
@@ -226,6 +290,24 @@ class ActionBuilder:
                 })
             actions.extend(self._stop_forced_cmd(sg_out))
             self._set_forced_power(sg_out, actions, 0)
+
+        # ── Export power limit (based on raw Nordpool spot price) ──
+        # When the *spot* price is negative, exporting to the grid
+        # means we pay — cap the inverter's grid feed-in.  Grid
+        # tariffs and VAT only apply to import, so we compare against
+        # the raw spot price, not the effective consumer price.
+        if spot_price < 0:
+            neg_limit = sg_out.get("set_export_limit", {}).get(
+                "negative_price_limit", 100
+            )
+            _LOGGER.info(
+                "Spot price %.4f < 0 — capping grid export to %d W",
+                spot_price, neg_limit,
+            )
+            self._set_export_limit(sg_out, actions, neg_limit)
+        else:
+            # Spot price ≥ 0 — exporting earns money, remove cap
+            self._set_export_limit(sg_out, actions, None)
 
         return actions
 
@@ -263,6 +345,34 @@ class ActionBuilder:
             })
         return actions
 
+    @staticmethod
+    def _set_export_limit(
+        sg_out: dict[str, Any],
+        actions: list[dict[str, Any]],
+        value: int | None,
+    ) -> None:
+        """Set the inverter grid export power limit (register 13088).
+
+        If the set_export_limit output is not configured, this is a no-op.
+        Pass *value* in watts.  Pass None to reset to max (uncapped).
+        """
+        cfg = sg_out.get("set_export_limit", {})
+        service = cfg.get("service")
+        entity_id = cfg.get("entity_id")
+        if not service or not entity_id:
+            return
+
+        max_export = cfg.get("max", 5000)
+        limit_w = value if value is not None else max_export
+        limit_w = max(cfg.get("min", 0), min(limit_w, max_export))
+
+        _LOGGER.info("Setting grid export limit to %d W", limit_w)
+        actions.append({
+            "service": service,
+            "entity_id": entity_id,
+            "data": {"value": limit_w},
+        })
+
     # ------------------------------------------------------------------
     # EV charger decisions
     # ------------------------------------------------------------------
@@ -279,10 +389,11 @@ class ActionBuilder:
         current_price: float,
         grid_export_w: float,
         is_friday: bool,
-    ) -> dict[str, Any] | None:
-        """Decide the action for a single EV charger.
+    ) -> list[dict[str, Any]] | None:
+        """Decide the action(s) for a single EV charger.
 
-        Returns a single service-call dict, or None.
+        Returns a list of service-call dicts, or None.
+        May include a dynamic current limit action alongside start/stop.
         """
         charger_name = charger_cfg.get("name", "")
         vehicle = vehicle_map.get(charger_name)
@@ -291,8 +402,13 @@ class ActionBuilder:
         if vehicle:
             charger_connected = vehicle.get("connected", ev_connected)
 
+        # Current charger power (W) for dynamic limit calculation
+        current_ev_power_w = 0.0
+        if vehicle:
+            current_ev_power_w = vehicle.get("power_w", 0.0)
+
         # --- FREE ENERGY OVERRIDES (checked first — never waste free power) ---
-        # Negative prices: always charge — we get paid, ignore SoC limits
+        # Negative prices: always charge at max — we get paid, ignore SoC limits
         if price_is_negative:
             vehicle_target = 100
             vehicle_soc = 0
@@ -301,10 +417,17 @@ class ActionBuilder:
                 vehicle_soc = vehicle.get("vehicle_soc", 0)
             if vehicle_soc <= 0 or vehicle_soc < vehicle_target:
                 _LOGGER.info(
-                    "EV %s: Negative price (%.3f) — charging",
+                    "EV %s: Negative price (%.3f) — charging at max",
                     charger_name, current_price,
                 )
-                return self._start_charger(charger_cfg)
+                actions = self._start_charger(charger_cfg)
+                # Negative price → charge at max current
+                limit_action = self._set_charger_dynamic_limit(
+                    charger_cfg, None,
+                )
+                if limit_action:
+                    actions.append(limit_action)
+                return actions
 
         # Solar surplus: charge up to the vehicle's own target SoC
         # (disregard the departure/min SoC limits — this is free solar)
@@ -315,12 +438,23 @@ class ActionBuilder:
                 vehicle_target = vehicle.get("vehicle_target_soc", 100)
                 vehicle_soc = vehicle.get("vehicle_soc", 0)
             if vehicle_soc <= 0 or vehicle_soc < vehicle_target:
-                _LOGGER.info(
-                    "EV %s: Solar surplus (%.0f W export) — charging "
-                    "(SoC %.0f%% < vehicle limit %.0f%%)",
-                    charger_name, grid_export_w, vehicle_soc, vehicle_target,
+                # Calculate dynamic current based on available surplus
+                target_amps = self._calc_surplus_amps(
+                    charger_cfg, grid_export_w, current_ev_power_w,
                 )
-                return self._start_charger(charger_cfg)
+                _LOGGER.info(
+                    "EV %s: Solar surplus (%.0f W export, %.0f W charger) "
+                    "— charging at %dA (SoC %.0f%% < vehicle limit %.0f%%)",
+                    charger_name, grid_export_w, current_ev_power_w,
+                    target_amps, vehicle_soc, vehicle_target,
+                )
+                actions = self._start_charger(charger_cfg)
+                limit_action = self._set_charger_dynamic_limit(
+                    charger_cfg, target_amps,
+                )
+                if limit_action:
+                    actions.append(limit_action)
+                return actions
 
         # --- RAMP-DOWN: stop if vehicle at/above target SoC ---
         if vehicle:
@@ -340,7 +474,14 @@ class ActionBuilder:
                     "EV %s: SoC %.0f%% >= target %.0f%% — stopping (ramp-down)",
                     charger_name, vehicle_soc, effective_target,
                 )
-                return self._stop_charger(charger_cfg)
+                actions = self._stop_charger(charger_cfg)
+                # Reset dynamic limit to max for next charge session
+                limit_action = self._set_charger_dynamic_limit(
+                    charger_cfg, None,
+                )
+                if limit_action:
+                    actions.append(limit_action)
+                return actions
 
         # --- Schedule-based + remaining overrides ---
         is_scheduled = charger_name in scheduled_vehicles
@@ -350,7 +491,14 @@ class ActionBuilder:
                 "EV %s: Scheduled this hour (%.2f kWh)",
                 charger_name, scheduled_vehicles.get(charger_name, 0),
             )
-            return self._start_charger(charger_cfg)
+            actions = self._start_charger(charger_cfg)
+            # Scheduled charging → max current
+            limit_action = self._set_charger_dynamic_limit(
+                charger_cfg, None,
+            )
+            if limit_action:
+                actions.append(limit_action)
+            return actions
 
         if charger_connected and price_is_expensive:
             _LOGGER.info(
@@ -366,23 +514,71 @@ class ActionBuilder:
         return None
 
     @staticmethod
-    def _start_charger(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    def _start_charger(cfg: dict[str, Any]) -> list[dict[str, Any]]:
         start = cfg.get("start_charging", {})
         if start.get("service"):
-            return {
+            return [{
                 "service": start["service"],
                 "entity_id": start["entity_id"],
                 "data": {},
-            }
-        return None
+            }]
+        return []
 
     @staticmethod
-    def _stop_charger(cfg: dict[str, Any]) -> dict[str, Any] | None:
+    def _stop_charger(cfg: dict[str, Any]) -> list[dict[str, Any]]:
         stop = cfg.get("stop_charging", {})
         if stop.get("service"):
-            return {
+            return [{
                 "service": stop["service"],
                 "entity_id": stop["entity_id"],
                 "data": {},
-            }
-        return None
+            }]
+        return []
+
+    @staticmethod
+    def _calc_surplus_amps(
+        charger_cfg: dict[str, Any],
+        grid_export_w: float,
+        current_ev_power_w: float,
+    ) -> int:
+        """Calculate target charger amps from available solar surplus.
+
+        total_available = grid_export + what the charger is already drawing.
+        target_amps = floor(total_available / (voltage × phases)).
+        """
+        dyn_cfg = charger_cfg.get("set_dynamic_limit", {})
+        voltage = dyn_cfg.get("voltage", 230)
+        phases = dyn_cfg.get("phases", 3)
+        min_current = dyn_cfg.get("min_current", 6)
+        max_current = dyn_cfg.get("max_current", 32)
+
+        total_available_w = grid_export_w + current_ev_power_w
+        target_amps = int(total_available_w / (voltage * phases))
+        return max(min_current, min(max_current, target_amps))
+
+    @staticmethod
+    def _set_charger_dynamic_limit(
+        charger_cfg: dict[str, Any],
+        target_amps: int | None,
+    ) -> dict[str, Any] | None:
+        """Build a dynamic current limit action for the charger.
+
+        If target_amps is None, resets to max_current (full power).
+        Returns None if the charger has no dynamic limit configured.
+        """
+        dyn_cfg = charger_cfg.get("set_dynamic_limit", {})
+        service = dyn_cfg.get("service")
+        device_id = dyn_cfg.get("device_id")
+
+        if not service or not device_id:
+            return None
+
+        max_current = dyn_cfg.get("max_current", 32)
+        amps = target_amps if target_amps is not None else max_current
+
+        _LOGGER.info("Setting charger dynamic limit to %dA", amps)
+        return {
+            "service": service,
+            "device_id": device_id,
+            "data": {"current": amps},
+        }

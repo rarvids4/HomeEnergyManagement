@@ -478,9 +478,10 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         for action in actions:
             service = action.get("service")
             entity_id = action.get("entity_id")
+            device_id = action.get("device_id")
             service_data = action.get("data", {})
 
-            if not service or not entity_id:
+            if not service or (not entity_id and not device_id):
                 continue
 
             domain, service_name = service.split(".", 1) if "." in service else (service, "")
@@ -493,7 +494,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             # their choice for a cooldown period (2× optimisation
             # interval, minimum 30 min).
             is_switch_on = (domain == "switch" and service_name == "turn_on")
-            if is_switch_on and entity_id.startswith("switch."):
+            if is_switch_on and entity_id and entity_id.startswith("switch."):
                 state = self.hass.states.get(entity_id)
                 if state and state.state == "off":
                     ctx = state.context
@@ -512,18 +513,26 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                             )
                             continue
 
+            target = entity_id or device_id
             _LOGGER.info(
                 "Executing action: %s on %s with data %s",
                 service,
-                entity_id,
+                target,
                 service_data,
             )
 
             try:
+                # Build service call data — use device_id or entity_id
+                call_data = dict(service_data)
+                if device_id and not entity_id:
+                    call_data["device_id"] = device_id
+                else:
+                    call_data["entity_id"] = entity_id
+
                 await self.hass.services.async_call(
                     domain,
                     service_name,
-                    {"entity_id": entity_id, **service_data},
+                    call_data,
                     blocking=True,
                 )
             except Exception as exc:

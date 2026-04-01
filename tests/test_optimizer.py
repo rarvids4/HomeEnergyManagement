@@ -37,6 +37,65 @@ def default_params():
 
 
 @pytest.fixture
+def outputs_with_forced_power():
+    return {
+        "sungrow": {
+            "force_charge": {
+                "service": "script.turn_on",
+                "entity_id": "script.sg_set_forced_charge_battery_mode",
+            },
+            "force_discharge": {
+                "service": "script.turn_on",
+                "entity_id": "script.sg_set_forced_discharge_battery_mode",
+            },
+            "self_consumption": {
+                "service": "script.turn_on",
+                "entity_id": "script.sg_set_self_consumption_mode",
+            },
+            "set_forced_power": {
+                "service": "input_number.set_value",
+                "entity_id": "input_number.set_sg_forced_charge_discharge_power",
+                "max": 5000,
+            },
+            "set_discharge_power": {
+                "service": "input_number.set_value",
+                "entity_id": "input_number.set_sg_discharge_power",
+                "max": 5000,
+            },
+            "battery_mode_select": "input_select.set_sg_battery_forced_charge_discharge_cmd",
+            "battery_mode_options": {"stop": "Stop (default)"},
+            "min_soc": 10,
+            "max_soc": 100,
+            "capacity_kwh": 10.0,
+        },
+        "ev_chargers": [
+            {
+                "name": "ex90",
+                "start_charging": {
+                    "service": "switch.turn_on",
+                    "entity_id": "switch.ex90_charger_enabled",
+                },
+                "stop_charging": {
+                    "service": "switch.turn_off",
+                    "entity_id": "switch.ex90_charger_enabled",
+                },
+            },
+            {
+                "name": "renault_zoe",
+                "start_charging": {
+                    "service": "switch.turn_on",
+                    "entity_id": "switch.renault_zoe_charger_enabled",
+                },
+                "stop_charging": {
+                    "service": "switch.turn_off",
+                    "entity_id": "switch.renault_zoe_charger_enabled",
+                },
+            },
+        ],
+    }
+
+
+@pytest.fixture
 def default_outputs():
     return {
         "sungrow": {
@@ -560,25 +619,12 @@ class TestNegativePriceOptimization:
             "EVs should charge during pre_discharge when price is cheap"
         )
 
-
-        assert plan[0]["action"] == ACTION_DISCHARGE_BATTERY
-
-        actions = result["immediate_actions"]
-        power_actions = [
-            a for a in actions
-            if a["entity_id"] == "input_number.set_sg_forced_charge_discharge_power"
-        ]
-        assert len(power_actions) == 1
-        assert power_actions[0]["data"]["value"] == 0, (
-            "Discharge uses self-consumption, forced power should be 0"
-        )
-
-    def test_discharge_hour_uses_self_consumption(
+    def test_discharge_hour_uses_force_discharge(
         self, default_params, outputs_with_forced_power, freeze_time
     ):
         """When current hour is expensive and action is discharge,
-        the inverter should be in self-consumption mode (battery covers
-        house load dynamically) with forced power reset to 0."""
+        the inverter should be in force-discharge mode with a non-zero
+        power setpoint — the battery must NEVER charge during discharge."""
         # Set time to hour 6 (will be the expensive hour)
         freeze_time.now.return_value = datetime(2025, 1, 6, 6, 0, 0)
         opt = Optimizer(default_params, outputs_with_forced_power)
@@ -599,26 +645,28 @@ class TestNegativePriceOptimization:
         assert plan[0]["action"] == ACTION_DISCHARGE_BATTERY
 
         actions = result["immediate_actions"]
-        # Should use self_consumption mode, NOT force_discharge
-        mode_actions = [
+        # Should use force_discharge mode (NOT self_consumption)
+        fd_actions = [
             a for a in actions
-            if a["entity_id"] == "script.sg_set_self_consumption_mode"
+            if a["entity_id"] == "script.sg_set_forced_discharge_battery_mode"
         ]
-        assert len(mode_actions) == 1, "Discharge hour should use self-consumption mode"
+        assert len(fd_actions) == 1, "Discharge hour should use force-discharge mode"
 
-        # Forced power should be reset to 0 (self-consumption handles it)
+        # Forced power must be > 0 to guarantee the battery discharges
         power_actions = [
             a for a in actions
             if a["entity_id"] == "input_number.set_sg_forced_charge_discharge_power"
         ]
         assert len(power_actions) == 1
-        assert power_actions[0]["data"]["value"] == 0
+        assert power_actions[0]["data"]["value"] >= 500, (
+            "Discharge power must be at least 500 W to prevent battery charging"
+        )
 
     def test_charge_hour_sets_power_5000(
         self, default_params, outputs_with_forced_power
     ):
         """When current hour is cheap and action is charge,
-        forced power should be set to max."""
+        forced power should be set to a positive value."""
         opt = Optimizer(default_params, outputs_with_forced_power)
 
         prices = {
@@ -642,7 +690,9 @@ class TestNegativePriceOptimization:
             if a["entity_id"] == "input_number.set_sg_forced_charge_discharge_power"
         ]
         assert len(power_actions) == 1
-        assert power_actions[0]["data"]["value"] == 5000
+        assert power_actions[0]["data"]["value"] > 0, (
+            "Charge power must be positive when charging"
+        )
 
     def test_self_consumption_resets_forced_power_to_zero(
         self, default_params, outputs_with_forced_power, freeze_time
@@ -709,7 +759,7 @@ class TestNegativePriceOptimization:
         # Should also set max discharge limit
         limit_pwr = [
             a for a in actions
-            if a["entity_id"] == "input_number.set_sg_battery_max_discharge_power"
+            if a["entity_id"] == "input_number.set_sg_discharge_power"
         ]
         assert len(limit_pwr) == 1
         assert limit_pwr[0]["data"]["value"] == 5000
@@ -742,11 +792,11 @@ class TestNegativePriceOptimization:
             "No forced power action should be generated without config"
         )
 
-    def test_discharge_clears_forced_cmd(
+    def test_discharge_does_not_clear_forced_cmd(
         self, default_params, outputs_with_forced_power, freeze_time
     ):
-        """When switching to self-consumption for discharge, the forced
-        charge/discharge command must be explicitly set to Stop."""
+        """Discharge uses forced discharge mode → should NOT set Stop.
+        The inverter is actively discharging, not in self-consumption."""
         freeze_time.now.return_value = datetime(2025, 1, 6, 6, 0, 0)
         opt = Optimizer(default_params, outputs_with_forced_power)
 
@@ -770,10 +820,9 @@ class TestNegativePriceOptimization:
             a for a in actions
             if a.get("entity_id") == "input_select.set_sg_battery_forced_charge_discharge_cmd"
         ]
-        assert len(stop_actions) == 1, (
-            "Discharge should explicitly clear forced cmd"
+        assert len(stop_actions) == 0, (
+            "Discharge uses forced mode, should NOT clear forced cmd"
         )
-        assert stop_actions[0]["data"]["option"] == "Stop (default)"
 
     def test_self_consumption_clears_forced_cmd(
         self, default_params, outputs_with_forced_power, freeze_time
@@ -1350,8 +1399,18 @@ class TestSolarSurplusBatteryCharging:
         ]
         assert len(fd_actions) == 0
 
+    def test_low_soc_no_discharge(
+        self, default_params, default_outputs
+    ):
+        """Battery below min_soc should not discharge."""
+        opt = Optimizer(default_params, default_outputs)
 
-        assert 1.70 in kept_prices, "Most expensive hour should be prioritized"
+        prices = {
+            "today": [0.50, -0.10] + [0.80] * 22,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,

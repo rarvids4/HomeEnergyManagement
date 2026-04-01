@@ -152,6 +152,7 @@ class Optimizer:
                 action=current_plan["action"],
                 ev_connected=ev_connected,
                 current_price=current_plan["price"],
+                spot_price=current_plan.get("spot_price", current_plan["price"]),
                 avg_price=pw.avg,
                 min_price=pw.min,
                 price_spread=pw.spread,

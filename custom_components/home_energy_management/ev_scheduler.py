@@ -15,7 +15,7 @@ Strategy per vehicle:
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .const import (
@@ -108,7 +108,8 @@ class EVScheduler:
         -------
         dict with schedule, vehicles, totals, charge window.
         """
-        schedule = self._build_empty_schedule(hourly_plan)
+        now_dt = now or datetime.now()
+        schedule = self._build_empty_schedule(hourly_plan, now_dt)
         empty_result = {
             "schedule": schedule,
             "total_kwh_needed": 0,
@@ -121,7 +122,6 @@ class EVScheduler:
         if not ev_vehicles:
             return empty_result
 
-        now_dt = now or datetime.now()
         is_friday = now_dt.weekday() == 4
 
         # Build candidate hours (shared): all except discharge hours
@@ -173,20 +173,32 @@ class EVScheduler:
     # ------------------------------------------------------------------
 
     def _build_empty_schedule(
-        self, hourly_plan: list[dict[str, Any]]
+        self, hourly_plan: list[dict[str, Any]], now: datetime
     ) -> list[dict[str, Any]]:
-        """Build the base per-hour schedule structure."""
-        return [
-            {
+        """Build the base per-hour schedule structure with timestamps.
+
+        Adds an ISO ``start`` timestamp to each entry so graph cards
+        can align the EV schedule with Nordpool price data.
+        """
+        base_time = now.replace(minute=0, second=0, microsecond=0)
+        schedule = []
+        for i, entry in enumerate(hourly_plan):
+            start_dt = base_time + timedelta(hours=i)
+            # Use timezone-aware isoformat if available, otherwise naive
+            try:
+                start_iso = start_dt.astimezone().isoformat()
+            except (ValueError, OSError):
+                start_iso = start_dt.isoformat()
+            schedule.append({
                 "hour": entry["hour"],
+                "start": start_iso,
                 "price": entry["price"],
                 "spot_price": entry.get("spot_price", entry["price"]),
                 "charging": False,
                 "total_power_kw": 0.0,
                 "vehicles": {},
-            }
-            for entry in hourly_plan
-        ]
+            })
+        return schedule
 
     def _build_candidates(
         self, hourly_plan: list[dict[str, Any]]

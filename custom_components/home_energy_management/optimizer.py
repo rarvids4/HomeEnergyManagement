@@ -13,7 +13,7 @@ This file is the public API — callers import ``Optimizer`` and call
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from .const import (
@@ -113,6 +113,15 @@ class Optimizer:
         hourly_plan = self._battery.plan_battery(
             pw, predicted_consumption, battery_soc, grid_export_power,
         )
+
+        # Add ISO timestamps so dashboard graphs align with Nordpool
+        base_time = now.replace(minute=0, second=0, microsecond=0)
+        for i, entry in enumerate(hourly_plan):
+            start_dt = base_time + timedelta(hours=i)
+            try:
+                entry["start"] = start_dt.astimezone().isoformat()
+            except (ValueError, OSError):
+                entry["start"] = start_dt.isoformat()
 
         # ── Step 3: EV scheduling ──────────────────────────────────
         ev_plan_for_scheduling = hourly_plan
@@ -224,9 +233,15 @@ class Optimizer:
     @staticmethod
     def _safe_default_schedule(now: datetime) -> dict:
         """Return a safe default when no price data is available."""
+        base_time = now.replace(minute=0, second=0, microsecond=0)
+        try:
+            start_iso = base_time.astimezone().isoformat()
+        except (ValueError, OSError):
+            start_iso = base_time.isoformat()
         return {
             "hourly_plan": [{
                 "hour": now.hour,
+                "start": start_iso,
                 "action": ACTION_SELF_CONSUMPTION,
                 "reason": "No price data available",
                 "price": 0,

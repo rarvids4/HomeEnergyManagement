@@ -1545,6 +1545,20 @@ class TestGridChargeLimits:
     Both conditions must be met simultaneously.
     """
 
+    @pytest.fixture
+    def ev_vehicle_ex90(self):
+        """EX90 at 89% — needs a small top-up to 100%."""
+        return [{
+            "name": "ex90",
+            "power_w": 8250,
+            "status": "charging",
+            "connected": True,
+            "vehicle_soc": 89,
+            "vehicle_capacity_kwh": 111,
+            "vehicle_target_soc": 100,
+            "vehicle_charging_power_w": 8250,
+        }]
+
     def test_grid_charge_skipped_when_price_too_high(
         self, default_params, default_outputs
     ):
@@ -2671,11 +2685,11 @@ class TestEVDepartureTime:
         assert zoe_plan["target_soc"] == 80
         assert ex90_plan["target_soc"] == 90
 
-    def test_friday_overrides_departure_soc_when_lower(
+    def test_friday_respects_explicit_departure_soc(
         self, default_params, default_outputs
     ):
-        """On Friday, the weekend target (80%) should override
-        min_departure_soc if it's lower."""
+        """When user explicitly sets min_departure_soc, the Friday
+        weekend target should NOT override it — user's setting wins."""
         ev_vehicle = [{
             "name": "ex90",
             "power_w": 8250,
@@ -2712,9 +2726,10 @@ class TestEVDepartureTime:
             )
 
         vehicles = result["ev_charge_schedule"]["vehicles"]
-        # Friday target (80%) < departure target (90%) → use 80%
-        assert vehicles[0]["target_soc"] == 80, (
-            f"Friday should lower target to 80%, got {vehicles[0]['target_soc']}"
+        # User explicitly set min_departure_soc=90 → their setting wins
+        # over the Friday weekend target (80%)
+        assert vehicles[0]["target_soc"] == 90, (
+            f"User's explicit departure SoC should win, got {vehicles[0]['target_soc']}"
         )
 
 

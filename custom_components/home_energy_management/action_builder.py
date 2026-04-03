@@ -459,14 +459,15 @@ class ActionBuilder:
         # --- RAMP-DOWN: stop if vehicle at/above target SoC ---
         if vehicle:
             vehicle_soc = vehicle.get("vehicle_soc", 0)
-            min_dep_soc = vehicle.get(
-                "min_departure_soc", self.ev_default_min_departure_soc
-            )
+            min_dep_soc = vehicle.get("min_departure_soc", 0)
             effective_target = (
                 min_dep_soc if min_dep_soc > 0
                 else self.ev_default_target_soc
             )
-            if is_friday and self.ev_weekend_target_soc < effective_target:
+            # Weekend optimization: only lower the target on Fridays when
+            # the user hasn't explicitly set a departure SoC.
+            # (min_dep_soc == 0 means no explicit setting from the user.)
+            if is_friday and min_dep_soc <= 0 and self.ev_weekend_target_soc < effective_target:
                 effective_target = self.ev_weekend_target_soc
 
             if vehicle_soc > 0 and vehicle_soc >= effective_target:

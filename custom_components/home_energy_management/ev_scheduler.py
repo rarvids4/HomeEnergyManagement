@@ -233,16 +233,18 @@ class EVScheduler:
         # Per-vehicle departure config
         departure_str = ev.get("departure_time") or ""
         departure_hour = self._parse_departure(departure_str) if departure_str else None
-        min_dep_soc = ev.get(
-            "min_departure_soc", self.ev_default_min_departure_soc
-        )
+        min_dep_soc = ev.get("min_departure_soc", 0)
         min_charge_level = ev.get(
             "min_charge_level", self.ev_default_min_charge_level
         )
 
         # Target SoC
         target = min_dep_soc if min_dep_soc > 0 else self.ev_default_target_soc
-        if is_friday and self.ev_weekend_target_soc < target:
+        # Weekend optimization: lower the target on Fridays to let solar
+        # fill the rest on Saturday.  But ONLY when the user hasn't
+        # explicitly set a departure SoC — their setting always wins.
+        # (min_dep_soc == 0 means no explicit setting from the user.)
+        if is_friday and min_dep_soc <= 0 and self.ev_weekend_target_soc < target:
             target = self.ev_weekend_target_soc
 
         # Charging power (kW)

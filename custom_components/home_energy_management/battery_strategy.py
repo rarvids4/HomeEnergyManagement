@@ -615,7 +615,7 @@ class BatteryStrategy:
         )
 
     # ==================================================================
-    # HEURISTIC FALLBACK  (used when scipy is not installed)
+    # HEURISTIC FALLBACK  (used when LP solver fails)
     # ==================================================================
 
     def _heuristic_plan(

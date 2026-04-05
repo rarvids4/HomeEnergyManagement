@@ -677,7 +677,7 @@ class TestNegativePriceOptimization:
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=10,  # below grid_charge_max_soc (15%)
+            battery_soc=10,  # low SoC — LP should find charging profitable
             ev_connected=False,
         )
 
@@ -932,7 +932,7 @@ class TestNegativePriceOptimization:
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=10,  # below grid_charge_max_soc (15%)
+            battery_soc=10,  # low SoC — LP should find charging profitable
             ev_connected=False,
         )
 
@@ -1247,7 +1247,7 @@ class TestSolarSurplusBatteryCharging:
         result_no_solar = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=10,  # below grid_charge_max_soc (15%)
+            battery_soc=10,  # low SoC
             ev_connected=False,
             grid_export_power=0.0,
         )
@@ -1257,7 +1257,7 @@ class TestSolarSurplusBatteryCharging:
         result_solar = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=10,  # below grid_charge_max_soc (15%)
+            battery_soc=10,  # low SoC
             ev_connected=False,
             grid_export_power=3000.0,  # 3 kW export
         )
@@ -1318,7 +1318,7 @@ class TestSolarSurplusBatteryCharging:
         self, default_params, default_outputs
     ):
         """Solar surplus override should only affect hour 0 (real-time data).
-        Future hours keep their price-based classification."""
+        Future hours keep their LP-based classification."""
         opt = Optimizer(default_params, default_outputs)
 
         prices = {
@@ -1338,8 +1338,10 @@ class TestSolarSurplusBatteryCharging:
         plan = result["hourly_plan"]
         # Hour 0: solar surplus → self_consumption
         assert plan[0]["action"] == ACTION_SELF_CONSUMPTION
-        # Hour 1: no solar data (future) → pre_discharge (negatives at 2-3)
-        assert plan[1]["action"] == ACTION_PRE_DISCHARGE
+        # Hour 1: LP may classify as charge, self_consumption, or
+        # pre_discharge depending on optimal arbitrage.  The key
+        # assertion is that the solar override only touched hour 0.
+        assert plan[1]["action"] != ACTION_SELF_CONSUMPTION or "Solar surplus" not in plan[1].get("reason", "")
 
     def test_pre_discharge_still_works_without_solar(
         self, default_params, default_outputs
@@ -1399,10 +1401,13 @@ class TestSolarSurplusBatteryCharging:
         ]
         assert len(fd_actions) == 0
 
-    def test_low_soc_no_discharge(
+    def test_low_soc_charges_then_discharges(
         self, default_params, default_outputs
     ):
-        """Battery below min_soc should not discharge."""
+        """Battery starting below min_soc should charge first (especially
+        at negative prices) and then discharge profitably.  The LP
+        correctly handles this by respecting SoC constraints while
+        minimising overall cost."""
         opt = Optimizer(default_params, default_outputs)
 
         prices = {
@@ -1414,30 +1419,29 @@ class TestSolarSurplusBatteryCharging:
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=5,  # below min_soc (10%) — can't discharge OR charge
+            battery_soc=5,  # below min_soc (10%)
             ev_connected=False,
         )
 
         plan = result["hourly_plan"]
-        discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
 
-        # Battery below min_soc → no discharge.  Grid charge target (15%)
-        # is above min_soc, but _classify_hour requires soc < grid_charge_max_soc
-        # AND price ≤ max_price.  Even if 1 charge hour runs (5 → 15%),
-        # the limiter should downgrade any resulting discharge since
-        # initial_soc=5 < min_soc=10 → available_kwh ≤ 0.
-        assert len(discharge_hours) == 0
+        # Hour 1 has negative price → should charge (maximize_load)
+        assert plan[1]["action"] == ACTION_MAXIMIZE_LOAD
 
-    def test_downgraded_hours_become_self_consumption(
+        # SoC constraints are respected: LP never drops below min_soc
+        for entry in plan:
+            soc_after = entry.get("lp_soc_after", 100)
+            assert soc_after >= 9.9, (
+                f"SoC dropped to {soc_after}% at hour {entry['hour']}, "
+                f"below min_soc (10%)"
+            )
+
+    def test_small_battery_limits_discharge_to_capacity(
         self, default_params, default_outputs
     ):
-        """Hours that lose discharge status should become self_consumption
-        with an appropriate reason."""
-        params = {
-            **default_params,
-            "grid_charge_max_soc": 100,  # allow full grid charging for this test
-            "grid_charge_max_price": 1.0,
-        }
+        """With a small battery, the LP should limit total discharge to
+        available capacity rather than discharging every expensive hour."""
+        params = {**default_params}
         outputs = {**default_outputs}
         outputs["sungrow"] = {**default_outputs["sungrow"], "capacity_kwh": 5.0}
         opt = Optimizer(params, outputs)
@@ -1452,19 +1456,35 @@ class TestSolarSurplusBatteryCharging:
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=50,  # (50-10)/100 * 5 = 2.0 kWh
+            battery_soc=50,  # (50-10)/100 * 5 = 2.0 kWh available
             ev_connected=False,
         )
 
         plan = result["hourly_plan"]
+        discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
 
-        # Some expensive hours should be downgraded to self_consumption
-        downgraded = [
-            h for h in plan
-            if h["action"] == ACTION_SELF_CONSUMPTION
-            and "capacity limited" in h.get("reason", "")
-        ]
-        assert len(downgraded) > 0, "Some hours should be downgraded due to capacity"
+        # The LP may charge at cheap hours (0.10) to gain extra energy
+        # for discharge at expensive hours.  Total discharge is bounded
+        # by initial energy PLUS any energy charged during the plan.
+        total_charge = sum(h.get("lp_charge_kwh", 0) for h in plan)
+        total_discharge = sum(h.get("lp_discharge_kwh", 0) for h in plan)
+        available_kwh = (50 - 10) / 100.0 * 5.0  # 2.0 kWh from initial SoC
+
+        # Net discharge cannot exceed initial available energy
+        # (charge first, then discharge)
+        net_discharge = total_discharge - total_charge
+        assert net_discharge <= available_kwh * 1.1, (
+            f"Net discharge {net_discharge:.1f} kWh should not exceed "
+            f"available {available_kwh:.1f} kWh (with efficiency margin)"
+        )
+
+        # SoC never drops below min_soc (10%)
+        for entry in plan:
+            soc_after = entry.get("lp_soc_after", 100)
+            assert soc_after >= 9.9, (
+                f"SoC dropped to {soc_after}% at hour {entry['hour']}, "
+                f"below min_soc (10%)"
+            )
 
     def test_consumption_prediction_affects_discharge_count(
         self, default_params, default_outputs
@@ -1506,8 +1526,10 @@ class TestSolarSurplusBatteryCharging:
             f"at least as many discharge hours as higher consumption ({high_discharge})"
         )
 
-    def test_large_battery_covers_all_expensive_hours(self, default_params, default_outputs):
-        """A very large battery should cover all expensive hours without limiting."""
+    def test_large_battery_covers_expensive_hours(self, default_params, default_outputs):
+        """A very large battery should discharge during the most expensive
+        hours.  The LP optimises cost, so it focuses on the highest-value
+        hours and may consolidate discharge."""
         outputs = {**default_outputs}
         outputs["sungrow"] = {**default_outputs["sungrow"], "capacity_kwh": 24.0}
         opt = Optimizer(default_params, outputs)
@@ -1530,19 +1552,30 @@ class TestSolarSurplusBatteryCharging:
         plan = result["hourly_plan"]
         discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
 
-        # All 6 expensive hours should be kept
-        assert len(discharge_hours) >= 6, (
-            f"Large battery should cover all expensive hours, got {len(discharge_hours)}"
+        # LP should discharge during the most expensive hours.
+        # With 16.8 kWh available the LP has plenty of energy; it may
+        # use 4-6 discharge hours depending on price-arbitrage calculus.
+        assert len(discharge_hours) >= 4, (
+            f"Large battery should cover most expensive hours, got {len(discharge_hours)}"
         )
 
+        # The top-3 most expensive hours (1.80, 1.70, 1.60) should always
+        # be covered
+        discharge_hour_nums = {h["hour"] for h in discharge_hours}
+        # Hours 12-17 have prices [1.50, 1.60, 1.70, 1.80, 1.40, 1.30]
+        # Hour 15 = 1.80, hour 14 = 1.70, hour 13 = 1.60
+        for must_discharge in [13, 14, 15]:
+            assert must_discharge in discharge_hour_nums, (
+                f"Hour {must_discharge} should be discharged (top price)"
+            )
 
-class TestGridChargeLimits:
-    """Tests for grid charge limits — SoC cap and price cap.
 
-    The optimizer should only charge from the grid when:
-    1. Battery SoC is below grid_charge_max_soc (default 15%)
-    2. Price is at or below grid_charge_max_price (default 0.40 SEK/kWh)
-    Both conditions must be met simultaneously.
+class TestLPArbitrage:
+    """Tests for LP-based battery charge/discharge arbitrage.
+
+    The LP optimizer charges at cheap hours and discharges at expensive
+    hours based on cost minimisation.  It handles SoC constraints,
+    efficiency losses, and power limits automatically.
     """
 
     @pytest.fixture
@@ -1559,13 +1592,14 @@ class TestGridChargeLimits:
             "vehicle_charging_power_w": 8250,
         }]
 
-    def test_grid_charge_skipped_when_price_too_high(
+    def test_lp_charges_when_arbitrage_profitable(
         self, default_params, default_outputs
     ):
-        """No grid charging when all cheap-band prices exceed the price cap."""
+        """LP charges at cheaper hours and discharges at expensive hours
+        when the spread justifies arbitrage (accounting for efficiency)."""
         opt = Optimizer(default_params, default_outputs)
 
-        # All prices above 0.40 SEK → no grid charging even at low SoC
+        # Spread: 0.50 vs 1.50 = 1.00 SEK → profitable after efficiency loss
         prices = {
             "today": [0.50] * 6 + [1.50] * 12 + [0.50] * 6,
             "tomorrow": [],
@@ -1575,26 +1609,26 @@ class TestGridChargeLimits:
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=10,  # below grid_charge_max_soc (15%)
+            battery_soc=10,
             ev_connected=False,
         )
 
         plan = result["hourly_plan"]
         charge_hours = [h for h in plan if h["action"] == ACTION_CHARGE_BATTERY]
+        discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
 
-        assert len(charge_hours) == 0, (
-            f"No grid charging expected when price > 0.40 SEK, "
-            f"got {len(charge_hours)} charge hours"
-        )
+        # LP should do arbitrage: charge cheap, discharge expensive
+        assert len(charge_hours) > 0, "LP should charge at cheap hours"
+        assert len(discharge_hours) > 0, "LP should discharge at expensive hours"
 
-    def test_grid_charge_skipped_when_soc_above_target(
+    def test_lp_charges_at_cheap_hours_regardless_of_soc(
         self, default_params, default_outputs
     ):
-        """No grid charging when SoC is already at or above grid_charge_max_soc."""
+        """LP charges at very cheap hours regardless of initial SoC,
+        because the arbitrage is profitable."""
         opt = Optimizer(default_params, default_outputs)
 
-        # Cheap prices in morning but SoC already above 15%.
-        # Evening prices above 0.40 to avoid re-charging after discharge.
+        # Very cheap morning (0.10), very expensive midday (1.50)
         prices = {
             "today": [0.10] * 6 + [1.50] * 12 + [0.50] * 6,
             "tomorrow": [],
@@ -1604,14 +1638,17 @@ class TestGridChargeLimits:
         result = opt.optimize(
             prices=prices,
             predicted_consumption=[1.0] * 24,
-            battery_soc=20,  # above grid_charge_max_soc (15%)
+            battery_soc=20,
             ev_connected=False,
         )
 
         plan = result["hourly_plan"]
         charge_hours = [h for h in plan if h["action"] == ACTION_CHARGE_BATTERY]
+        discharge_hours = [h for h in plan if h["action"] == ACTION_DISCHARGE_BATTERY]
 
-        assert len(charge_hours) == 0
+        # Large spread (0.10 → 1.50) justifies arbitrage
+        assert len(charge_hours) > 0, "LP should charge at 0.10 SEK"
+        assert len(discharge_hours) > 0, "LP should discharge at 1.50 SEK"
 
     def test_ev_charges_cheapest_hours_first(
         self, default_params, default_outputs, ev_vehicle_ex90
@@ -3657,9 +3694,6 @@ class TestGridTariff:
     ):
         """Battery charging should prefer off-peak hours when tariffs
         make them significantly cheaper, even with same spot price."""
-        # Override to allow higher grid charge SoC so we see charge actions
-        tariff_params["grid_charge_max_soc"] = 80
-        tariff_params["grid_charge_max_price"] = 0.50
         opt = Optimizer(tariff_params, default_outputs)
 
         # Spot prices: hours 0-5 = 0.08 (night), hours 6-21 = 0.08 (day),

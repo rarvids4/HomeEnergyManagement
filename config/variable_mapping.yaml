@@ -201,10 +201,6 @@ parameters:
   enable_charger_control: true
   # Enable/disable battery control
   enable_battery_control: true
-  # Grid charge limits — only charge battery from grid up to this SoC
-  # and only when price is below the absolute cap.  Solar fills the rest.
-  grid_charge_max_soc: 15       # % — enough to survive morning peak
-  grid_charge_max_price: 0.40   # SEK/kWh — skip grid charging if too expensive
   # EV grid minimization: prefer night charging over daytime grid
   ev_cheap_price_threshold: 0.10
   ev_night_start: 22

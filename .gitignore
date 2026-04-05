@@ -15,10 +15,12 @@ build/
 # --- Environment / secrets (NEVER commit) ---
 .env
 .ha_token
+.ssh_secrets
 secrets.yaml
 
-# --- Local configuration (contains real entity IDs) ---
+# --- Local configuration (contains real entity IDs & connection details) ---
 config/variable_mapping.local.yaml
+local_config.yaml
 
 # --- Dev / debug / deploy scripts ---
 # These contain hardcoded IP addresses (172.16.0.9) and read .ha_token.
@@ -51,3 +53,11 @@ update_predict_card.py
 *~
 .DS_Store
 Thumbs.db
+
+# --- AI coding guidelines (personal, not part of the integration) ---
+CLAUDE.md
+.cursorrules
+.github/copilot-instructions.md
+
+# --- Backup files ---
+*.bak

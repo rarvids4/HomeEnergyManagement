@@ -112,6 +112,7 @@ class Optimizer:
         # ── Step 2: Battery plan ────────────────────────────────────
         hourly_plan = self._battery.plan_battery(
             pw, predicted_consumption, battery_soc, grid_export_power,
+            predicted_solar=predicted_solar,
         )
 
         # Add ISO timestamps so dashboard graphs align with Nordpool

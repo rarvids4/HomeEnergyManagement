@@ -51,11 +51,20 @@ DEFAULT_MIN_SOC = 10  # %
 DEFAULT_MAX_SOC = 100  # %
 DEFAULT_BATTERY_CAPACITY = 10.0  # kWh
 
-# --- Grid charge limits ---
-# Only charge from grid up to this SoC (%) — let solar fill the rest
-DEFAULT_GRID_CHARGE_MAX_SOC = 15  # %
-# Never charge from grid if price exceeds this (SEK/kWh)
-DEFAULT_GRID_CHARGE_MAX_PRICE = 0.40  # SEK/kWh
+# --- Battery LP optimisation ---
+# Round-trip efficiency ≈ 85% for home lithium batteries.
+# Each direction: sqrt(0.85) ≈ 0.922
+#   charge_eff × discharge_eff = 0.922 × 0.922 ≈ 0.85
+DEFAULT_BATTERY_CHARGE_EFFICIENCY = 0.922
+DEFAULT_BATTERY_DISCHARGE_EFFICIENCY = 0.922
+# Default power limits (Watts) — overridden by output config
+DEFAULT_BATTERY_MAX_CHARGE_POWER_W = 5000
+DEFAULT_BATTERY_MAX_DISCHARGE_POWER_W = 5000
+# Fraction of spot price received when selling back to grid (1.0 = full spot)
+DEFAULT_SELL_PRICE_FACTOR = 1.0
+# Hard SoC floor — the LP will never discharge below this percentage,
+# regardless of the user-configured min_soc.  Protects battery health.
+BATTERY_SOC_HARD_FLOOR = 6  # %
 
 # --- Charger limits ---
 DEFAULT_MIN_AMPS = 6

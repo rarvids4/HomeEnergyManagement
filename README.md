@@ -7,7 +7,7 @@
 
 # ⚡ Home Energy Management
 
-> A smart Home Assistant integration that **optimises charging and discharging** of your EV chargers and home battery based on **Nordpool energy prices** and **predicted consumption patterns** — saving you money automatically.
+> A smart Home Assistant integration that **optimises charging and discharging** of your EV chargers and home battery based on **Nordpool energy prices** and **predicted consumption patterns** — saving you money automatically. The battery scheduler uses a **linear-programming (LP) solver** for mathematically optimal charge/discharge decisions.
 
 ---
 
@@ -28,7 +28,7 @@ The integration runs every 15 minutes (configurable) and:
 
 1. **Reads** current and upcoming Nordpool hourly/15-min electricity prices
 2. **Predicts** your household energy consumption using historical patterns (separate house & EV streams)
-3. **Plans** an optimal 24–48 hour charge/discharge schedule with grid tariff awareness
+3. **Plans** a mathematically optimal 24–48 hour charge/discharge schedule via LP solver with grid tariff awareness
 4. **Controls** multiple EV chargers and Sungrow battery automatically
 5. **Manages** per-vehicle departure targets, SoC floors, and two-day price optimization
 6. **Absorbs** solar surplus into EVs with dynamic current limiting
@@ -40,6 +40,7 @@ The integration runs every 15 minutes (configurable) and:
 
 | Feature | Description |
 |---------|-------------|
+| 🧮 **LP-optimized battery** | Linear-programming solver (scipy) finds the mathematically optimal charge/discharge schedule across the full planning horizon |
 | 🔌 **Price-aware scheduling** | Detects price peaks/valleys from Nordpool, plans charge/discharge windows |
 | 💸 **Grid tariff support** | Adds time-of-use network fees (peak/off-peak) to spot prices for accurate cost optimization |
 | 🧠 **Split consumption prediction** | Learns house base load and EV charging patterns separately (weekday/weekend, time-of-day) |
@@ -372,10 +373,31 @@ All tuning parameters live in the `parameters:` section. Every parameter has a b
 |-----------|------|---------|-------------|
 | `optimization_interval_minutes` | int | `15` | How often the optimizer re-runs (minutes) |
 | `planning_horizon_hours` | int | `24` | How many hours ahead to plan |
-| `min_price_spread` | float | `0.30` | Minimum price difference (SEK/kWh) to justify a charge/discharge cycle |
+| `min_price_spread` | float | `0.30` | Minimum price difference (SEK/kWh) to justify a charge/discharge cycle (heuristic fallback) |
 | `enable_charger_control` | bool | `true` | Toggle all EV charger control on/off |
 | `enable_battery_control` | bool | `true` | Toggle all battery control on/off |
 | `log_level` | string | `"info"` | Internal prediction log level (`debug` / `info` / `warning`) |
+
+#### LP Battery Optimizer
+
+The battery schedule is computed by a **linear-programming (LP) solver** (scipy `linprog`, HiGHS method with revised-simplex fallback). It finds the mathematically optimal charge/discharge plan that **minimises total electricity cost** over the planning horizon, subject to:
+
+| Constraint | Detail |
+|------------|--------|
+| **SoC bounds** | SoC stays between a hard floor of **6 %** and `max_soc` (default 100 %) at every hour |
+| **Power limits** | Charge/discharge power capped at `battery_max_charge_power_w` / `battery_max_discharge_power_w` (default 5 000 W each) |
+| **Round-trip efficiency** | **85 %** round-trip (√0.85 ≈ 0.922 applied to both charge and discharge) |
+| **Grid neutrality** | When `self_consumption` is chosen, battery neither charges from nor discharges to grid |
+
+**Pricing model:**
+
+- **Buy price** (grid → battery): Nordpool spot price (incl. 25 % VAT) **+** time-of-use grid tariff (incl. VAT)
+- **Sell price** (battery → grid): Nordpool spot × `sell_price_factor` (default 1.0)
+- **Negative-price check**: Uses spot price only (before tariffs) — when spot < 0, the battery charges at max regardless
+
+The LP solver replaces the earlier heuristic `grid_charge_max_soc` / `grid_charge_max_price` parameters, which have been removed. The solver automatically determines the optimal hours and SoC levels for grid charging based on price differentials and efficiency losses.
+
+> 💡 **Fallback:** If scipy is unavailable or the LP solver fails, a simple heuristic classifier is used instead (charge at cheap hours, discharge at expensive hours, based on `min_price_spread`).
 
 #### Consumption Prediction
 
@@ -385,15 +407,6 @@ All tuning parameters live in the `parameters:` section. Every parameter has a b
 | `prediction_recency_weight` | float | `0.7` | Weight for recent observations (0.0–1.0). Higher = more weight on recent days |
 
 The predictor tracks **house base load** and **EV charging load** as separate streams so that sporadic EV sessions don't distort the regular household pattern.
-
-#### Grid Charge Limits
-
-Controls when the battery is allowed to charge from the grid (as opposed to solar).
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `grid_charge_max_soc` | int | `15` | Only charge from grid up to this SoC (%). Solar fills the rest |
-| `grid_charge_max_price` | float | `0.40` | Never charge from grid if spot price exceeds this (SEK/kWh) |
 
 #### Grid Transfer Tariffs
 
@@ -456,9 +469,6 @@ parameters:
   prediction_recency_weight: 0.7
   enable_charger_control: true
   enable_battery_control: true
-
-  grid_charge_max_soc: 15
-  grid_charge_max_price: 0.40
 
   grid_tariff_peak_sek: 1.40
   grid_tariff_offpeak_sek: 0.831
@@ -541,7 +551,7 @@ HomeEnergyManagement/
 │       ├── coordinator.py       # Data update coordinator (sensor reads, action execution)
 │       ├── optimizer.py         # Orchestrator — delegates to sub-modules
 │       ├── price_analysis.py    # Price horizon, grid tariff, statistics
-│       ├── battery_strategy.py  # Hour classification, charge/discharge decisions
+│       ├── battery_strategy.py  # LP-based hour classification, charge/discharge decisions
 │       ├── ev_scheduler.py      # Per-vehicle EV charging schedule
 │       ├── action_builder.py    # Translates decisions into HA service calls
 │       ├── predictor.py         # Split-stream consumption prediction

@@ -109,7 +109,9 @@ class ActionBuilder:
         if not self.enable_charger or not ev_chargers:
             return actions
 
-        price_is_negative = current_price < 0
+        # Use raw SPOT price for negative-price detection — the
+        # effective price (spot + tariff) may still be positive.
+        price_is_negative = spot_price < 0
         solar_surplus = grid_export_w >= self.solar_surplus_threshold
         price_is_expensive = action == ACTION_DISCHARGE_BATTERY
 

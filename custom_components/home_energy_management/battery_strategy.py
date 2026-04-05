@@ -282,7 +282,7 @@ class BatteryStrategy:
 
         if plan is None:
             plan = self._heuristic_plan(
-                pw, consumption, battery_soc, grid_export_power
+                pw, consumption, solar, battery_soc, grid_export_power
             )
 
         # ==============================================================
@@ -488,6 +488,7 @@ class BatteryStrategy:
                 "price": round(pw.effective[h], 4),
                 "spot_price": round(spot, 4),
                 "predicted_consumption_kwh": round(consumption[h], 2),
+                "predicted_solar_kwh": round(solar[h], 2),
                 "lp_charge_kwh": round(ch, 3),
                 "lp_discharge_kwh": round(dis, 3),
                 "lp_grid_buy_kwh": round(buy, 3),
@@ -590,6 +591,7 @@ class BatteryStrategy:
         self,
         pw: PriceWindow,
         consumption: list[float],
+        solar: list[float],
         battery_soc: float,
         grid_export_power: float = 0.0,
     ) -> list[dict[str, Any]]:
@@ -601,6 +603,7 @@ class BatteryStrategy:
             hour = (pw.current_hour + i) % 24
             spot = pw.spot[i] if i < len(pw.spot) else price
             cons = consumption[i] if i < len(consumption) else 0.0
+            sol = solar[i] if i < len(solar) else 0.0
 
             upcoming = pw.effective[i + 1 : i + 1 + _PRE_DISCHARGE_LOOKAHEAD]
             upcoming_spot_prices = pw.spot[i + 1 : i + 1 + _PRE_DISCHARGE_LOOKAHEAD]
@@ -619,6 +622,8 @@ class BatteryStrategy:
                 upcoming_spot=upcoming_spot_prices,
             )
 
+            battery_soc = self._simulate_soc(battery_soc, action)
+
             hourly_plan.append({
                 "hour": hour,
                 "action": action,
@@ -626,9 +631,9 @@ class BatteryStrategy:
                 "price": round(price, 4),
                 "spot_price": round(spot, 4),
                 "predicted_consumption_kwh": round(cons, 2),
+                "predicted_solar_kwh": round(sol, 2),
+                "soc_after": round(battery_soc, 1),
             })
-
-            battery_soc = self._simulate_soc(battery_soc, action)
 
         hourly_plan = self._limit_discharge_to_capacity(
             hourly_plan, initial_soc, consumption

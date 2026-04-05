@@ -260,7 +260,12 @@ class ActualConsumptionSensor(EnergyManagementSensor):
 
 
 class BatteryPlanSensor(EnergyManagementSensor):
-    """Battery charge/discharge schedule overview."""
+    """Battery charge/discharge schedule overview.
+
+    Exposes graph-friendly parallel arrays alongside the raw full_plan
+    so dashboard cards (ApexCharts, plotly, etc.) can plot timeseries
+    directly without template gymnastics.
+    """
 
     def __init__(self, coordinator, entry):
         super().__init__(coordinator, entry, "battery_plan", "Battery Plan")
@@ -279,10 +284,108 @@ class BatteryPlanSensor(EnergyManagementSensor):
         data = self.coordinator.data or {}
         schedule = data.get("schedule", {})
         plan = schedule.get("hourly_plan", [])
+        ev_plan = schedule.get("ev_charge_schedule", {})
+        ev_schedule = ev_plan.get("schedule", [])
+        ev_vehicles = ev_plan.get("vehicles", [])
+        sensor = data.get("sensor_data", {})
+
+        # ── Battery metadata (scalar context for graphs) ─────────
+        opt = self.coordinator.optimizer
+        bat = opt._battery
+        battery_soc_start = sensor.get("battery_soc", 0)
+        optimizer_method = "lp" if any(
+            "lp_soc_after" in h for h in plan
+        ) else "heuristic"
+        # ── Graph-friendly parallel arrays ────────────────────────
+        # Each array is indexed by hour offset (0 = current hour).
+        timestamps = [h.get("start", "") for h in plan]
+        actions = [h.get("action", "") for h in plan]
+
+        # SoC trajectory: LP uses lp_soc_after, heuristic uses soc_after
+        soc_trajectory = [
+            h.get("lp_soc_after", h.get("soc_after"))
+            for h in plan
+        ]
+
+        # Battery power (kWh per hour)
+        charge_power = [h.get("lp_charge_kwh", 0) for h in plan]
+        discharge_power = [h.get("lp_discharge_kwh", 0) for h in plan]
+
+        # Grid exchange (kWh per hour, LP only)
+        grid_buy = [h.get("lp_grid_buy_kwh", 0) for h in plan]
+        grid_sell = [h.get("lp_grid_sell_kwh", 0) for h in plan]
+
+        # Predicted load used by the optimizer
+        predicted_consumption = [
+            h.get("predicted_consumption_kwh", 0) for h in plan
+        ]
+        predicted_solar = [
+            h.get("predicted_solar_kwh", 0) for h in plan
+        ]
+
+        # Prices
+        spot_prices = [h.get("spot_price", 0) for h in plan]
+        effective_prices = [h.get("price", 0) for h in plan]
+
+        # ── EV charging overlay (aligned to battery plan timeline) ──
+        # Build per-hour total EV charge kW from the EV schedule
+        ev_charge_kwh = [0.0] * len(plan)
+        for i, ev_entry in enumerate(ev_schedule):
+            if i < len(ev_charge_kwh) and ev_entry.get("charging"):
+                ev_charge_kwh[i] = round(ev_entry.get("total_power_kw", 0), 2)
+
+        # Per-vehicle target info for dashboard display
+        ev_vehicle_targets = [
+            {
+                "name": v.get("name", ""),
+                "soc": v.get("soc", 0),
+                "target_soc": v.get("target_soc", 0),
+                "capacity_kwh": v.get("capacity_kwh", 0),
+                "kwh_needed": v.get("kwh_needed", 0),
+                "charging_power_kw": v.get("charging_power_kw", 0),
+                "scheduled_hours": v.get("scheduled_hours", []),
+                "connected": v.get("connected", False),
+            }
+            for v in ev_vehicles
+        ]
+
         return {
-            "charge_hours": [h["hour"] for h in plan if h.get("action") == "charge_battery"],
-            "discharge_hours": [h["hour"] for h in plan if h.get("action") == "discharge_battery"],
+            # Legacy attributes (backward compatible)
+            "charge_hours": [
+                h["hour"] for h in plan
+                if h.get("action") == "charge_battery"
+            ],
+            "discharge_hours": [
+                h["hour"] for h in plan
+                if h.get("action") == "discharge_battery"
+            ],
             "full_plan": plan,
+
+            # Battery metadata (scalar context for reference lines)
+            "battery_soc_start": round(battery_soc_start, 1),
+            "battery_min_soc": bat.min_soc,
+            "battery_max_soc": bat.max_soc,
+            "battery_capacity_kwh": bat.battery_capacity,
+            "battery_max_charge_kw": bat.max_charge_kw,
+            "battery_max_discharge_kw": bat.max_discharge_kw,
+            "optimizer_method": optimizer_method,
+
+            # Graph-friendly parallel arrays
+            "timestamps": timestamps,
+            "actions": actions,
+            "soc_trajectory": soc_trajectory,
+            "charge_power_kwh": charge_power,
+            "discharge_power_kwh": discharge_power,
+            "grid_buy_kwh": grid_buy,
+            "grid_sell_kwh": grid_sell,
+            "predicted_consumption_kwh": predicted_consumption,
+            "predicted_solar_kwh": predicted_solar,
+            "spot_prices": spot_prices,
+            "effective_prices": effective_prices,
+
+            # EV overlay on battery plan timeline
+            "ev_charge_kwh": ev_charge_kwh,
+            "ev_vehicle_targets": ev_vehicle_targets,
         }
 
     @property

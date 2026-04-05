@@ -300,7 +300,7 @@ class ActionBuilder:
         # the raw spot price, not the effective consumer price.
         if spot_price < 0:
             neg_limit = sg_out.get("set_export_limit", {}).get(
-                "negative_price_limit", 100
+                "negative_price_limit", 0
             )
             _LOGGER.info(
                 "Spot price %.4f < 0 — capping grid export to %d W",

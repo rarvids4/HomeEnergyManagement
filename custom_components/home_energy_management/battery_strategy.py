@@ -1,8 +1,8 @@
 """Battery strategy — LP-based optimal charge/discharge scheduling.
 
-Replaces the old heuristic (price-percentile) scheduler with a proper
-Linear Program that minimises total electricity cost over the planning
-horizon.  Falls back to the heuristic when *scipy* is unavailable.
+Uses a pure-Python simplex LP solver (no scipy / numpy) to minimise
+total electricity cost over the planning horizon.  Falls back to a
+heuristic scheduler if the LP fails.
 
 ============================================================
 PRICING MODEL
@@ -38,12 +38,13 @@ Discharging 1 kWh of stored energy delivers only 0.922 kWh.
 LP FORMULATION
 ============================================================
 
-**Decision variables** (per hour *h* = 0 … H−1, 4 × H total):
+**Decision variables** (per hour *h* = 0 … H−1, 5 × H total):
 
   charge[h]     kWh charged into the battery     ≥ 0
   discharge[h]  kWh discharged from the battery   ≥ 0
   grid_buy[h]   kWh purchased from the grid       ≥ 0
   grid_sell[h]  kWh sold back to the grid         ≥ 0
+  curtail[h]    kWh of solar discarded            ≥ 0, ≤ solar[h]
 
 **Objective** — minimise total energy cost:
 
@@ -55,9 +56,10 @@ CONSTRAINTS
 ============================================================
 
 C1  Energy balance  (equality, one per hour)
-    Every kWh consumed or stored must come from somewhere.
+    Every kWh consumed, stored, sold, or wasted must come from
+    somewhere.  Curtailment is solar that the inverter discards.
     solar[h] + discharge[h] + grid_buy[h]
-      = consumption[h] + charge[h] + grid_sell[h]
+      = consumption[h] + charge[h] + grid_sell[h] + curtail[h]
 
 C2  SoC lower bound  (inequality, one per hour)
     The battery must never drop below max(min_soc, 6 %).
@@ -111,8 +113,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-import numpy as np
-
 from .const import (
     ACTION_CHARGE_BATTERY,
     ACTION_DISCHARGE_BATTERY,
@@ -136,23 +136,11 @@ from .price_analysis import PriceWindow
 
 _LOGGER = logging.getLogger(__name__)
 
-# LP variable threshold — values below this are treated as zero
+# Solver threshold — values below this are treated as zero
 _LP_EPS = 0.01  # kWh
 
 # Look-ahead for labelling PRE_DISCHARGE (hours)
 _PRE_DISCHARGE_LOOKAHEAD = 4
-
-# --------------- scipy (optional) ---------------
-try:
-    from scipy.optimize import linprog as _scipy_linprog
-
-    _HAS_SCIPY = True
-except ImportError:  # pragma: no cover
-    _HAS_SCIPY = False
-    _LOGGER.warning(
-        "scipy not installed — LP battery optimisation disabled; "
-        "falling back to heuristic scheduler"
-    )
 
 
 class BatteryStrategy:
@@ -272,13 +260,12 @@ class BatteryStrategy:
 
         plan: list[dict[str, Any]] | None = None
 
-        if _HAS_SCIPY:
-            try:
-                plan = self._solve_lp(pw, consumption, solar, battery_soc)
-            except Exception as exc:
-                _LOGGER.warning(
-                    "LP solver failed (%s), falling back to heuristic", exc
-                )
+        try:
+            plan = self._solve_lp(pw, consumption, solar, battery_soc)
+        except Exception as exc:
+            _LOGGER.warning(
+                "LP solver failed (%s), falling back to heuristic", exc
+            )
 
         if plan is None:
             plan = self._heuristic_plan(
@@ -364,56 +351,83 @@ class BatteryStrategy:
     ) -> list[dict[str, Any]]:
         """Build and solve the LP; return the hourly plan.
 
-        Variable layout  (4 × H total):
-          x = [ charge₀…H₋₁ | discharge₀…H₋₁ | buy₀…H₋₁ | sell₀…H₋₁ ]
-              idx 0…H-1       H…2H-1            2H…3H-1    3H…4H-1
+        Variable layout  (5 × H total):
+          x = [ charge₀…H₋₁ | discharge₀…H₋₁ | buy₀…H₋₁ | sell₀…H₋₁ | curtail₀…H₋₁ ]
+              idx 0…H-1       H…2H-1            2H…3H-1    3H…4H-1      4H…5H-1
+
+        The curtailment variable models solar production that the
+        inverter discards when the battery is full and grid export
+        is uneconomical (e.g. negative spot prices).  It carries
+        zero cost in the objective so the LP will only curtail as
+        a last resort.
+
+        Uses the pure-Python simplex solver from ``lp_solver.py``
+        — no scipy or numpy dependency.
         """
+        from .lp_solver import linprog
+
         H = len(pw.effective)
-        n = 4 * H
+        n = 5 * H
 
         eta_c = self.charge_efficiency
         eta_d = self.discharge_efficiency
         cap = self.battery_capacity
 
         # ── Objective vector (minimise c @ x) ──────────────────────
-        c = np.zeros(n)
+        # Buying from grid: full cost = spot (incl VAT) + grid tariff
+        # Selling to grid: revenue = spot price only (no grid fee back)
+        # The sell_price_factor accounts for retailer margin, VAT
+        # adjustments, etc.  Curtailment has zero cost.
+        #
+        # Time-preference epsilon: when prices are equal the LP may
+        # pick any hour.  A tiny penalty increasing with h makes the
+        # LP prefer to act sooner (charge earlier, discharge earlier),
+        # which is operationally better — earlier action means more
+        # flexibility if forecasts change.
+        _TIME_EPS = 1e-6  # SEK per hour — negligible vs real prices
+        c = [0.0] * n
         for h in range(H):
-            c[2 * H + h] = pw.effective[h]                          # grid_buy cost
-            c[3 * H + h] = -(pw.spot[h] * self.sell_price_factor)   # grid_sell revenue
+            c[h] = _TIME_EPS * h                                     # tiny charge-later penalty
+            c[H + h] = _TIME_EPS * h                                 # tiny discharge-later penalty
+            c[2 * H + h] = pw.effective[h]                           # grid_buy cost
+            c[3 * H + h] = -(pw.spot[h] * self.sell_price_factor)    # grid_sell revenue
 
         # ── C1: Energy balance (equality) ──────────────────────────
-        #   −charge[h] + discharge[h] + buy[h] − sell[h]
-        #     = consumption[h] − solar[h]
-        A_eq = np.zeros((H, n))
-        b_eq = np.zeros(H)
+        #   supply = demand + waste
+        #   solar[h] + discharge[h] + grid_buy[h]
+        #     = consumption[h] + charge[h] + grid_sell[h] + curtail[h]
+        #
+        #   Rearranged: −charge + discharge + buy − sell − curtail
+        #               = consumption − solar
+        A_eq = [[0.0] * n for _ in range(H)]
+        b_eq = [0.0] * H
         for h in range(H):
-            A_eq[h, h] = -1.0            # charge[h]
-            A_eq[h, H + h] = 1.0         # discharge[h]
-            A_eq[h, 2 * H + h] = 1.0     # grid_buy[h]
-            A_eq[h, 3 * H + h] = -1.0    # grid_sell[h]
+            A_eq[h][h] = -1.0             # charge[h]
+            A_eq[h][H + h] = 1.0          # discharge[h]
+            A_eq[h][2 * H + h] = 1.0      # grid_buy[h]
+            A_eq[h][3 * H + h] = -1.0     # grid_sell[h]
+            A_eq[h][4 * H + h] = -1.0     # curtail[h]  (reduces available solar)
             b_eq[h] = consumption[h] - solar[h]
 
-        # ── C2 & C3: SoC bounds (inequality, A_ub @ x ≤ b_ub) ────
-        A_ub = np.zeros((2 * H, n))
-        b_ub = np.zeros(2 * H)
+        # ── C2 & C3: SoC bounds (inequality, A_ub @ x ≤ b_ub) ─────
+        A_ub = [[0.0] * n for _ in range(2 * H)]
+        b_ub = [0.0] * (2 * H)
 
-        # Cumulative factor: soc[h] = soc₀ + Σ_{i≤h}(η_c·charge[i]
-        #   − discharge[i]/η_d) / cap × 100
         for h in range(H):
             # C2 — lower bound:  −cumulative ≤ (soc₀ − min_soc)/100 × cap
             for i in range(h + 1):
-                A_ub[h, i] = -eta_c             # −η_c × charge[i]
-                A_ub[h, H + i] = 1.0 / eta_d   # +discharge[i]/η_d
+                A_ub[h][i] = -eta_c             # −η_c × charge[i]
+                A_ub[h][H + i] = 1.0 / eta_d    # +discharge[i]/η_d
             b_ub[h] = (initial_soc - self.min_soc) / 100.0 * cap
 
             # C3 — upper bound:  +cumulative ≤ (max_soc − soc₀)/100 × cap
             row = H + h
             for i in range(h + 1):
-                A_ub[row, i] = eta_c             # +η_c × charge[i]
-                A_ub[row, H + i] = -1.0 / eta_d  # −discharge[i]/η_d
+                A_ub[row][i] = eta_c              # +η_c × charge[i]
+                A_ub[row][H + i] = -1.0 / eta_d   # −discharge[i]/η_d
             b_ub[row] = (self.max_soc - initial_soc) / 100.0 * cap
 
-        # ── C4–C7: Variable bounds ────────────────────────────────
+        # ── C4–C8: Variable bounds ─────────────────────────────────
         bounds: list[tuple[float, float | None]] = []
 
         # C4: charge bounds
@@ -424,61 +438,67 @@ class BatteryStrategy:
         for h in range(H):
             bounds.append((0.0, self.max_discharge_kw))
 
-        # C6: grid_buy ≥ 0
+        # C6: grid_buy ≥ 0  (unbounded above)
         for h in range(H):
             bounds.append((0.0, None))
 
-        # C7: grid_sell — block export during negative spot prices
+        # C7: grid_sell — only excess solar can be sold to grid.
+        #   The battery NEVER exports to grid; discharge only offsets
+        #   house consumption (self-consumption mode).  So the maximum
+        #   that can ever be sold in an hour is the solar production.
+        #   Block all export during negative spot prices.
         for h in range(H):
             if pw.spot[h] < 0:
                 bounds.append((0.0, 0.0))
             else:
-                bounds.append((0.0, None))
+                bounds.append((0.0, max(0.0, solar[h])))
+
+        # C8: curtailment — cannot curtail more solar than produced
+        for h in range(H):
+            bounds.append((0.0, max(0.0, solar[h])))
 
         # ── Solve ─────────────────────────────────────────────────
-        # Use HiGHS (scipy ≥ 1.9) if available, else revised simplex
-        try:
-            result = _scipy_linprog(
-                c,
-                A_ub=A_ub,
-                b_ub=b_ub,
-                A_eq=A_eq,
-                b_eq=b_eq,
-                bounds=bounds,
-                method="highs",
-            )
-        except (ValueError, TypeError):
-            result = _scipy_linprog(
-                c,
-                A_ub=A_ub,
-                b_ub=b_ub,
-                A_eq=A_eq,
-                b_eq=b_eq,
-                bounds=bounds,
-                method="revised simplex",
-            )
+        result = linprog(
+            c, A_ub=A_ub, b_ub=b_ub, A_eq=A_eq, b_eq=b_eq, bounds=bounds,
+        )
 
         if not result.success:
-            raise RuntimeError(f"LP infeasible: {result.message}")
+            raise RuntimeError(f"LP solver: {result.message}")
 
         x = result.x
+
+        # ── Post-process: cancel simultaneous charge+discharge ────
+        # The simplex can produce degenerate solutions where both
+        # charge[h] and discharge[h] are non-zero.  This is never
+        # physically useful (wastes efficiency both ways).  Reduce
+        # both by the smaller value to get the net effect.
+        for h in range(H):
+            ch_raw = x[h]
+            dis_raw = x[H + h]
+            if ch_raw > _LP_EPS and dis_raw > _LP_EPS:
+                cancel = min(ch_raw, dis_raw)
+                x[h] -= cancel
+                x[H + h] -= cancel
 
         # ── Build hourly plan from solution ───────────────────────
         plan: list[dict[str, Any]] = []
         sim_soc = initial_soc
+        total_curtailed = 0.0
 
         for h in range(H):
             ch = float(x[h])
             dis = float(x[H + h])
             buy = float(x[2 * H + h])
             sell = float(x[3 * H + h])
+            curtail = float(x[4 * H + h])
+            total_curtailed += curtail
 
             sim_soc += (eta_c * ch - dis / eta_d) / cap * 100.0
             hour_of_day = (pw.current_hour + h) % 24
             spot = pw.spot[h] if h < len(pw.spot) else 0.0
 
             action, reason = self._classify_lp_hour(
-                h, H, ch, dis, spot, pw.effective[h], sim_soc, pw.spot
+                h, H, ch, dis, spot, pw.effective[h], sim_soc, pw.spot,
             )
 
             plan.append({
@@ -493,8 +513,15 @@ class BatteryStrategy:
                 "lp_discharge_kwh": round(dis, 3),
                 "lp_grid_buy_kwh": round(buy, 3),
                 "lp_grid_sell_kwh": round(sell, 3),
+                "lp_curtailed_kwh": round(curtail, 3),
                 "lp_soc_after": round(sim_soc, 1),
             })
+
+        if total_curtailed > 0.1:
+            _LOGGER.info(
+                "LP curtailed %.1f kWh of solar (battery full / neg prices)",
+                total_curtailed,
+            )
 
         self._log_lp_summary(plan, result.fun)
         return plan
@@ -529,16 +556,20 @@ class BatteryStrategy:
                 f"Negative spot ({spot:.3f}) — minimize grid export",
             )
 
-        # Charge
-        if charge_kwh > _LP_EPS and discharge_kwh <= _LP_EPS:
+        # Use net battery flow — handles numerical noise where both
+        # charge and discharge are slightly non-zero.
+        net = charge_kwh - discharge_kwh
+
+        # Net charging
+        if net > _LP_EPS:
             return (
                 ACTION_CHARGE_BATTERY,
                 f"LP: charge {charge_kwh:.2f} kWh at {effective:.2f} "
                 f"(SoC → {soc_after:.0f}%)",
             )
 
-        # Discharge — check for pre-discharge label
-        if discharge_kwh > _LP_EPS and charge_kwh <= _LP_EPS:
+        # Net discharging — check for pre-discharge label
+        if net < -_LP_EPS:
             lookahead = all_spot[h + 1 : h + 1 + _PRE_DISCHARGE_LOOKAHEAD]
             if any(p < 0 for p in lookahead):
                 return (
@@ -703,7 +734,7 @@ class BatteryStrategy:
             and check_price > 0
         ):
             return (
-                ACTION_PRE_DISCHARGE,
+                ACTION_SELF_CONSUMPTION,
                 f"Pre-discharging at {price:.2f} — negative spot prices ahead, "
                 f"making room in battery (SoC {battery_soc:.0f}%)",
             )
@@ -720,19 +751,24 @@ class BatteryStrategy:
             and battery_soc < self.max_soc
         ):
             return (
-                ACTION_CHARGE_BATTERY,
+                ACTION_SELF_CONSUMPTION,
                 f"Cheap price ({price:.2f}), charging battery "
                 f"(SoC {battery_soc:.0f}%)",
             )
 
+        # Only discharge if we have meaningful energy above the floor.
+        # At least 10 % above min_soc ensures we don't micro-cycle
+        # a nearly-empty battery for negligible savings.
+        discharge_floor = self.min_soc + 10
         if (
             self.enable_battery
             and price >= expensive_threshold
-            and battery_soc > self.min_soc
+            and battery_soc > discharge_floor
         ):
             return (
                 ACTION_DISCHARGE_BATTERY,
-                f"Expensive price ({price:.2f}), discharging battery",
+                f"Expensive price ({price:.2f}), discharging battery "
+                f"(SoC {battery_soc:.0f}%)",
             )
 
         return (

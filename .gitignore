@@ -27,9 +27,8 @@ local_config.yaml
 # They are personal tooling — not part of the integration.
 check_ssh.py
 check_entities.py
-debug_card.py
-debug_apexcharts.py
-debug_zoe_charging.py
+check_solar.py
+debug_*.py
 deploy.py
 diagnose_crash.py
 diagnose_crash2.py
@@ -58,6 +57,9 @@ Thumbs.db
 CLAUDE.md
 .cursorrules
 .github/copilot-instructions.md
+
+# --- Debug test files (personal, not part of the test suite) ---
+tests/test_lp_debug.py
 
 # --- Backup files ---
 *.bak

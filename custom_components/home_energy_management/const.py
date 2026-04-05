@@ -100,6 +100,16 @@ DEFAULT_EV_MIN_CHARGE_LEVEL = 20  # %
 # 2 = consider up to 48 h ahead (requires tomorrow prices or weather)
 DEFAULT_EV_OPTIMIZATION_WINDOW = 1  # days
 
+# --- Solar prediction ---
+# PV peak power in kW.  0 = no PV system (solar prediction disabled).
+# Set this to your system's effective peak output.  For example,
+# a 20 kWp system with 85 % system efficiency → 17 kW effective,
+# or set to 20 and let the model match your actual clear-sky production.
+DEFAULT_PV_PEAK_POWER_KW = 0.0
+# Cloud opacity: how much cloud coverage reduces PV output (0–1).
+# 0.75 means 100 % clouds → 25 % of clear-sky output (diffuse radiation).
+DEFAULT_CLOUD_OPACITY = 0.75
+
 # --- Grid transfer tariffs ---
 # Added to spot price to get the effective cost per kWh.
 # Peak hours (default 06:00–22:00) typically have higher network fees.

@@ -228,5 +228,13 @@ parameters:
   # (takes precedence over the static values above when > 0)
   grid_tariff_peak_entity: "input_number.CHANGE_ME_grid_tariff_peak"
   grid_tariff_offpeak_entity: "input_number.CHANGE_ME_grid_tariff_offpeak"
+  # --- Solar prediction ---
+  # PV peak power in kW. Set to your system's effective peak output.
+  # 0 = no PV system (solar prediction disabled).
+  # Example: a 20 kWp system that produces ~100 kWh on a clear summer day.
+  pv_peak_power_kw: 0
+  # Cloud opacity: how much cloud cover reduces PV output (0–1).
+  # 0.75 means 100% clouds → 25% of clear-sky output (diffuse radiation).
+  pv_cloud_opacity: 0.75
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"

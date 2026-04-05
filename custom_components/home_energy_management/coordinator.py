@@ -16,7 +16,9 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
+    DEFAULT_CLOUD_OPACITY,
     DEFAULT_ENTRIES_PER_HOUR,
+    DEFAULT_PV_PEAK_POWER_KW,
     DEFAULT_UPDATE_INTERVAL,
     INPUT_EASEE,
     INPUT_EV_CHARGERS,
@@ -32,6 +34,7 @@ from .const import (
 from .logger import PredictionLogger
 from .optimizer import Optimizer
 from .predictor import ConsumptionPredictor, STREAM_EV, STREAM_HOUSE
+from .solar_predictor import SolarPredictor
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -69,6 +72,17 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         self.prediction_logger = PredictionLogger(
             max_entries=500,
             log_level=self.params.get("log_level", "info"),
+        )
+
+        # --- Solar predictor ---
+        # Use HA's configured lat/lon, fall back to mapping params.
+        lat = getattr(hass.config, "latitude", None) or self.params.get("latitude", 58.0)
+        lon = getattr(hass.config, "longitude", None) or self.params.get("longitude", 16.0)
+        self.solar_predictor = SolarPredictor(
+            pv_peak_power_kw=self.params.get("pv_peak_power_kw", DEFAULT_PV_PEAK_POWER_KW),
+            latitude=float(lat),
+            longitude=float(lon),
+            cloud_opacity=self.params.get("pv_cloud_opacity", DEFAULT_CLOUD_OPACITY),
         )
 
         # --- Manual override tracking ---
@@ -176,6 +190,9 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 if val > 0:
                     self.optimizer.grid_tariff_offpeak = val
 
+            # 5b. Predict solar production from weather forecast
+            predicted_solar = await self._predict_solar(horizon)
+
             # 6. Run optimizer to produce a schedule
             schedule = self.optimizer.optimize(
                 prices=prices,
@@ -184,6 +201,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 ev_connected=sensor_data.get("ev_connected", False),
                 grid_export_power=sensor_data.get("grid_export_power", 0.0),
                 ev_vehicles=sensor_data.get("ev_chargers", []),
+                predicted_solar=predicted_solar,
             )
 
             # 7. Execute immediate actions
@@ -461,6 +479,52 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             "tomorrow": tomorrow_prices,
             "currency": np_cfg.get("currency", "SEK"),
         }
+
+    # ------------------------------------------------------------------
+    # Solar prediction
+    # ------------------------------------------------------------------
+
+    async def _predict_solar(self, hours_ahead: int) -> list[float]:
+        """Fetch weather forecast and predict solar production.
+
+        Calls the ``weather.get_forecasts`` HA service to obtain
+        hourly cloud-coverage data, then feeds it to the
+        :class:`SolarPredictor`.  Returns zeros gracefully if the
+        service call fails or PV is not configured.
+        """
+        if self.solar_predictor.pv_peak_power_kw <= 0:
+            return [0.0] * hours_ahead
+
+        weather = self.inputs.get(INPUT_WEATHER, {})
+        weather_entity = weather.get("entity")
+        if not weather_entity:
+            _LOGGER.debug("No weather entity configured — skipping solar prediction")
+            return [0.0] * hours_ahead
+
+        try:
+            response = await self.hass.services.async_call(
+                "weather",
+                "get_forecasts",
+                service_data={"type": "hourly"},
+                target={"entity_id": weather_entity},
+                blocking=True,
+                return_response=True,
+            )
+            forecasts = response.get(weather_entity, {}).get("forecast", [])
+        except Exception as exc:
+            _LOGGER.warning("Weather forecast service call failed: %s", exc)
+            forecasts = []
+
+        if not forecasts:
+            _LOGGER.debug("No weather forecast data — using 50%% cloud default")
+            return self.solar_predictor.predict(hours_ahead)
+
+        from datetime import datetime
+        return self.solar_predictor.predict_from_forecast(
+            hours_ahead=hours_ahead,
+            forecasts=forecasts,
+            now=datetime.now(),
+        )
 
     # ------------------------------------------------------------------
     # Action execution

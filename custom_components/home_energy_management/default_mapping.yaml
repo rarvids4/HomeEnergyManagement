@@ -163,7 +163,7 @@ outputs:
     #   entity_id: "input_number.CHANGE_ME_export_power_limit"
     #   min: 0
     #   max: 5000
-    #   negative_price_limit: 100    # W — cap export during negative prices
+    #   negative_price_limit: 0      # W — block all export during negative prices
 
     # SoC limits
     set_min_soc:
@@ -197,5 +197,13 @@ parameters:
   enable_charger_control: true
   # Enable/disable battery control
   enable_battery_control: true
+  # --- Solar prediction ---
+  # PV peak power in kW. Set to your system's effective peak output.
+  # 0 = no PV system (solar prediction disabled).
+  # Example: a 20 kWp system that produces ~100 kWh on a clear summer day.
+  pv_peak_power_kw: 0
+  # Cloud opacity: how much cloud cover reduces PV output (0–1).
+  # 0.75 means 100% clouds → 25% of clear-sky output (diffuse radiation).
+  pv_cloud_opacity: 0.75
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"

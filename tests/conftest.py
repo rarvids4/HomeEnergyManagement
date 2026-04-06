@@ -50,6 +50,7 @@ sys.modules["homeassistant.core"].Event = MagicMock()
 
 # homeassistant.helpers.event.async_track_state_change_event
 sys.modules["homeassistant.helpers.event"].async_track_state_change_event = MagicMock()
+sys.modules["homeassistant.helpers.event"].async_track_time_interval = MagicMock()
 
 # homeassistant.helpers.update_coordinator.DataUpdateCoordinator / CoordinatorEntity
 sys.modules["homeassistant.helpers.update_coordinator"].DataUpdateCoordinator = type(

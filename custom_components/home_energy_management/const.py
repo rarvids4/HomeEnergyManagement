@@ -64,7 +64,7 @@ DEFAULT_BATTERY_MAX_DISCHARGE_POWER_W = 5000
 DEFAULT_SELL_PRICE_FACTOR = 1.0
 # Hard SoC floor — the LP will never discharge below this percentage,
 # regardless of the user-configured min_soc.  Protects battery health.
-BATTERY_SOC_HARD_FLOOR = 6  # %
+BATTERY_SOC_HARD_FLOOR = 8  # %
 
 # --- Charger limits ---
 DEFAULT_MIN_AMPS = 6
@@ -75,6 +75,26 @@ DEFAULT_MAX_AMPS = 32
 DEFAULT_EV_CHEAP_PRICE_THRESHOLD = 0.10
 # Charge EVs when grid export exceeds this (W) — absorb solar surplus
 DEFAULT_SOLAR_SURPLUS_THRESHOLD = 2000
+# Minimum surplus power (W) per EV — don't start a charger below this.
+# Prevents oscillation and ensures the charger draws meaningful power
+# without pulling from the grid.  Must exceed min_amps × voltage × phases.
+DEFAULT_MIN_SURPLUS_POWER_W = 2000
+# Safety margin (W) subtracted from available surplus when calculating
+# dynamic charger current, to avoid accidentally importing from grid.
+DEFAULT_SURPLUS_SAFETY_MARGIN_W = 200
+
+# --- Fast EV current adjustment ---
+# Interval (seconds) for the lightweight loop that re-reads grid export
+# and adjusts the active surplus-charger's current.  Runs independently
+# of the full optimisation cycle for responsive solar tracking.
+DEFAULT_FAST_EV_UPDATE_INTERVAL = 30  # seconds
+
+# --- Battery charge power floor ---
+# When the LP says charge_battery but the calculated forced-charge
+# power falls below this threshold, switch to self-consumption instead.
+# Self-consumption lets the inverter naturally absorb solar without
+# force-charging at a useless trickle.
+DEFAULT_MIN_CHARGE_POWER_W = 500
 
 # Preferred EV charging window (night, off-peak) to minimize grid load
 DEFAULT_EV_NIGHT_START = 22   # 22:00

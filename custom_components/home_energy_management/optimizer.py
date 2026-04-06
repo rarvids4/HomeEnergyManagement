@@ -149,15 +149,15 @@ class Optimizer:
             current_plan = hourly_plan[0]
             pred_consumption_0 = predicted_consumption[0] if predicted_consumption else 0.0
             pred_solar_0 = predicted_solar[0] if predicted_solar else 0.0
-            # Compute the minimum SoC needed to meet the plan (sum of all charge actions)
-            planned_soc = max(
-                (h["predicted_consumption_kwh"] for h in hourly_plan if h["action"] == "charge_battery"),
-                default=0.0
-            )
-            # Clamp target_soc to not exceed max_soc
+
+            # Target SoC for the current hour's charge action.
+            # Use the LP's planned SoC after this hour (lp_soc_after)
+            # when available — it directly reflects the LP's intent.
+            # Fall back to max_soc for heuristic plans that lack LP fields.
             sg_out = self.outputs.get(OUTPUT_SUNGROW, {})
             max_soc = sg_out.get("max_soc", 100)
-            target_soc = min(max_soc, planned_soc)
+            target_soc = current_plan.get("lp_soc_after", max_soc)
+            target_soc = min(max_soc, target_soc)
             immediate_actions = self._actions.build_immediate_actions(
                 action=current_plan["action"],
                 ev_connected=ev_connected,

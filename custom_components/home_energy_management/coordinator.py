@@ -12,12 +12,16 @@ from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant, callback, Event
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import (
+    async_track_state_change_event,
+    async_track_time_interval,
+)
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
     DEFAULT_CLOUD_OPACITY,
     DEFAULT_ENTRIES_PER_HOUR,
+    DEFAULT_FAST_EV_UPDATE_INTERVAL,
     DEFAULT_PV_PEAK_POWER_KW,
     DEFAULT_UPDATE_INTERVAL,
     INPUT_EASEE,
@@ -100,6 +104,84 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 hass, watched, self._on_setting_changed,
             )
             self._unsub_state_listeners.append(unsub)
+
+        # --- Fast EV surplus current adjustment loop ---
+        # Runs every ~30 s to re-read grid export and adjust the
+        # active surplus charger’s current.  Lightweight — no optimizer.
+        fast_interval_s = self.params.get(
+            "fast_ev_update_interval", DEFAULT_FAST_EV_UPDATE_INTERVAL
+        )
+        self._unsub_fast_ev = async_track_time_interval(
+            hass,
+            self._fast_ev_current_update,
+            timedelta(seconds=fast_interval_s),
+        )
+        _LOGGER.info(
+            "Fast EV current loop: every %d s", fast_interval_s,
+        )
+
+    # ------------------------------------------------------------------
+    # Fast EV surplus current adjustment
+    # ------------------------------------------------------------------
+
+    async def _fast_ev_current_update(self, now=None) -> None:
+        """Lightweight loop: adjust the surplus charger’s current.
+
+        Runs every ~30 s independently of the full optimisation cycle.
+        Reads only the grid-export sensor and the active charger’s
+        power, then recalculates the dynamic current limit.
+        """
+        action_builder = self.optimizer._actions
+        if not action_builder.surplus_charger_name:
+            return  # no surplus charger active — nothing to do
+
+        # Read live grid export
+        sg = self.inputs.get(INPUT_SUNGROW, {})
+        grid_export_w = self._get_state_float(sg.get("grid_export_power"))
+
+        # Read current charger power for the surplus charger
+        surplus_name = action_builder.surplus_charger_name
+        current_ev_power_w = 0.0
+        ev_chargers_cfg = self.inputs.get(INPUT_EV_CHARGERS, [])
+        for charger in (ev_chargers_cfg if isinstance(ev_chargers_cfg, list) else []):
+            if charger.get("name") == surplus_name:
+                raw = self._get_state_float(charger.get("power"))
+                unit = charger.get("power_unit", "W")
+                current_ev_power_w = raw * 1000 if unit == "kW" else raw
+                break
+
+        # Ask the action builder to recalculate
+        actions = action_builder.build_surplus_current_update(
+            grid_export_w, current_ev_power_w,
+        )
+        if not actions:
+            return
+
+        # Execute the resulting service calls
+        for action in actions:
+            service = action.get("service", "")
+            entity_id = action.get("entity_id")
+            device_id = action.get("device_id")
+            service_data = action.get("data", {})
+
+            if not service:
+                continue
+            domain, svc_name = service.split(".", 1) if "." in service else (service, "")
+            if not svc_name:
+                continue
+
+            call_data = dict(service_data)
+            if device_id and not entity_id:
+                call_data["device_id"] = device_id
+            elif entity_id:
+                call_data["entity_id"] = entity_id
+
+            try:
+                await self.hass.services.async_call(
+                    domain, svc_name, call_data, blocking=True,
+                )
+            except Exception as exc:
+                _LOGGER.error("Fast EV update: failed %s: %s", service, exc)
 
     # ------------------------------------------------------------------
     # Auto-replan helpers

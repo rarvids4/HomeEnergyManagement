@@ -39,6 +39,7 @@ from .const import (
     DEFAULT_EV_WEEKEND_TARGET_SOC,
     DEFAULT_MIN_CHARGE_POWER_W,
     DEFAULT_MIN_SURPLUS_POWER_W,
+    DEFAULT_NEG_PRICE_EV_EXPORT_LIMIT_W,
     DEFAULT_SOLAR_SURPLUS_THRESHOLD,
     DEFAULT_SURPLUS_SAFETY_MARGIN_W,
     OUTPUT_EV_CHARGERS,
@@ -78,6 +79,13 @@ class ActionBuilder:
         self.ev_weekend_target_soc = params.get(
             "ev_weekend_target_soc", DEFAULT_EV_WEEKEND_TARGET_SOC
         )
+        self.neg_price_ev_export_limit_w = params.get(
+            "neg_price_ev_export_limit_w", DEFAULT_NEG_PRICE_EV_EXPORT_LIMIT_W
+        )
+
+        # --- Negative-price surplus status (read by sensors) ---
+        # Updated every cycle for dashboard monitoring.
+        self.neg_price_status: dict[str, Any] = {}
 
         # --- Surplus charger tracking ---
         # After build_immediate_actions, this holds the name of the
@@ -137,8 +145,15 @@ class ActionBuilder:
             if isinstance(self.ev_chargers_cfg, list)
             else []
         )
-        if not self.enable_charger or not ev_chargers:
-            return actions
+        has_ev_chargers = self.enable_charger and bool(ev_chargers)
+
+        if not has_ev_chargers:
+            # No EV chargers — still apply export limit for neg prices
+            return self._apply_export_limit(
+                actions, spot_price, grid_export_w,
+                predicted_solar, predicted_consumption,
+                ev_absorbing=False, ev_name=None,
+            )
 
         # Use raw SPOT price for negative-price detection — the
         # effective price (spot + tariff) may still be positive.
@@ -179,6 +194,10 @@ class ActionBuilder:
 
         sorted_chargers = sorted(ev_chargers, key=_charger_sort_key)
 
+        # Track if any EV was started during negative prices
+        neg_price_ev_started = False
+        neg_price_ev_name: str | None = None
+
         for charger_cfg in sorted_chargers:
             # Only the first eligible charger gets surplus
             surplus_for_this = solar_surplus and self.surplus_charger_name is None
@@ -191,6 +210,83 @@ class ActionBuilder:
             )
             if charger_actions:
                 actions.extend(charger_actions)
+                # Detect if an EV was started during negative prices
+                if price_is_negative:
+                    for a in charger_actions:
+                        svc = str(a.get("service", ""))
+                        if svc.endswith("turn_on") or "start" in svc.lower():
+                            neg_price_ev_started = True
+                            neg_price_ev_name = charger_cfg.get("name", "")
+                            break
+
+        # ── Export-limit escalation (applied after EV decisions) ───
+        return self._apply_export_limit(
+            actions, spot_price, grid_export_w,
+            predicted_solar, predicted_consumption,
+            ev_absorbing=neg_price_ev_started or bool(self.surplus_charger_name),
+            ev_name=neg_price_ev_name or self.surplus_charger_name,
+        )
+
+    # ------------------------------------------------------------------
+    # Export power limit — escalation for negative prices
+    # ------------------------------------------------------------------
+
+    def _apply_export_limit(
+        self,
+        actions: list[dict[str, Any]],
+        spot_price: float,
+        grid_export_w: float,
+        predicted_solar: float,
+        predicted_consumption: float,
+        *,
+        ev_absorbing: bool = False,
+        ev_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Apply grid export limit and record status for sensors.
+
+        During negative prices the escalation is:
+          1. EV absorbing surplus → limit = neg_price_ev_export_limit_w
+          2. No EV available     → limit = 0 W (block all export)
+
+        During positive prices → limit removed (mode Disabled).
+        """
+        sg_out = self.outputs.get(OUTPUT_SUNGROW, {})
+
+        if spot_price < 0:
+            if ev_absorbing:
+                limit_w = self.neg_price_ev_export_limit_w
+                _LOGGER.info(
+                    "NEG-PRICE ESCALATION: EV '%s' absorbing surplus "
+                    "— export limit %d W (solar %.0f W, export %.0f W)",
+                    ev_name, limit_w,
+                    predicted_solar * 1000, grid_export_w,
+                )
+            else:
+                limit_w = sg_out.get("set_export_limit", {}).get(
+                    "negative_price_limit", 0
+                )
+                _LOGGER.info(
+                    "NEG-PRICE ESCALATION: no EV available "
+                    "— export limit %d W (solar %.0f W, export %.0f W)",
+                    limit_w, predicted_solar * 1000, grid_export_w,
+                )
+            self._set_export_limit(sg_out, actions, limit_w)
+
+            # Record status for sensor monitoring
+            self.neg_price_status = {
+                "active": True,
+                "spot_price": spot_price,
+                "ev_absorbing": ev_absorbing,
+                "ev_name": ev_name,
+                "export_limit_w": limit_w,
+                "grid_export_w": round(grid_export_w, 0),
+                "predicted_solar_w": round(predicted_solar * 1000, 0),
+                "predicted_consumption_w": round(predicted_consumption * 1000, 0),
+            }
+        else:
+            # Positive price — remove export cap
+            self._set_export_limit(sg_out, actions, None)
+            self.neg_price_status = {"active": False}
 
         return actions
 
@@ -343,24 +439,6 @@ class ActionBuilder:
                 })
             actions.extend(self._stop_forced_cmd(sg_out))
             self._set_forced_power(sg_out, actions, 0)
-
-        # ── Export power limit (based on raw Nordpool spot price) ──
-        # When the *spot* price is negative, exporting to the grid
-        # means we pay — cap the inverter's grid feed-in.  Grid
-        # tariffs and VAT only apply to import, so we compare against
-        # the raw spot price, not the effective consumer price.
-        if spot_price < 0:
-            neg_limit = sg_out.get("set_export_limit", {}).get(
-                "negative_price_limit", 0
-            )
-            _LOGGER.info(
-                "Spot price %.4f < 0 — capping grid export to %d W",
-                spot_price, neg_limit,
-            )
-            self._set_export_limit(sg_out, actions, neg_limit)
-        else:
-            # Spot price ≥ 0 — exporting earns money, remove cap
-            self._set_export_limit(sg_out, actions, None)
 
         return actions
 

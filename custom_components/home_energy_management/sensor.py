@@ -154,13 +154,22 @@ class NextActionSensor(EnergyManagementSensor):
         data = self.coordinator.data or {}
         schedule = data.get("schedule", {})
         plan = schedule.get("hourly_plan", [])
+        attrs: dict[str, Any] = {}
         if plan:
-            return {
-                "reason": plan[0].get("reason", ""),
-                "price": plan[0].get("price", 0),
-                "predicted_consumption": plan[0].get("predicted_consumption_kwh", 0),
-            }
-        return {}
+            attrs["reason"] = plan[0].get("reason", "")
+            attrs["price"] = plan[0].get("price", 0)
+            attrs["predicted_consumption"] = plan[0].get("predicted_consumption_kwh", 0)
+
+        # Negative-price surplus escalation status
+        try:
+            action_builder = self.coordinator.optimizer._actions
+            neg_status = getattr(action_builder, "neg_price_status", {})
+            if neg_status:
+                attrs["neg_price_surplus_status"] = neg_status
+        except (AttributeError, TypeError):
+            pass
+
+        return attrs
 
     @property
     def icon(self) -> str:

@@ -83,6 +83,13 @@ DEFAULT_MIN_SURPLUS_POWER_W = 2000
 # dynamic charger current, to avoid accidentally importing from grid.
 DEFAULT_SURPLUS_SAFETY_MARGIN_W = 200
 
+# --- Negative-price escalation ---
+# When spot price < 0 and solar surplus exists, the integration tries
+# to start an EV charger first.  While an EV is absorbing surplus
+# the export limit is set to this value (W) to allow headroom for
+# charger ramp-up.  If no EV is available, limit falls to 0 W.
+DEFAULT_NEG_PRICE_EV_EXPORT_LIMIT_W = 2100
+
 # --- Fast EV current adjustment ---
 # Interval (seconds) for the lightweight loop that re-reads grid export
 # and adjusts the active surplus-charger's current.  Runs independently

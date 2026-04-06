@@ -253,3 +253,8 @@ parameters:
   pv_cloud_opacity: 0.75
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"
+  # --- Negative-price escalation ---
+  # Export limit (W) when an EV is absorbing surplus during negative
+  # spot prices.  Allows headroom for charger ramp-up.  If no EV is
+  # available the limit falls to negative_price_limit (0 W).
+  neg_price_ev_export_limit_w: 2100

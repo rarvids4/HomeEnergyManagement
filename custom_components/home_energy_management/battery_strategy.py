@@ -103,9 +103,15 @@ ACTION MAPPING  (LP solution → HA action labels)
   spot < 0 and charge > 0    → MAXIMIZE_LOAD
   spot < 0                   → MAXIMIZE_LOAD
   charge > ε                 → CHARGE_BATTERY
-  discharge > ε (neg ahead)  → PRE_DISCHARGE
-  discharge > ε              → DISCHARGE_BATTERY
-  otherwise                  → SELF_CONSUMPTION (grid-neutral)
+  discharge > ε (neg ahead)  → PRE_DISCHARGE   (force-discharge to make room)
+  discharge > ε              → DISCHARGE_BATTERY (self-consumption on inverter)
+  otherwise                  → SELF_CONSUMPTION  (grid-neutral)
+
+Note: DISCHARGE_BATTERY is a *planning label* indicating the LP
+expects stored energy to cover consumption.  The action builder maps
+it to **self-consumption mode** on the inverter — the battery never
+force-discharges or exports to the grid.  Only PRE_DISCHARGE triggers
+actual force-discharge.
 """
 
 from __future__ import annotations

@@ -2,13 +2,24 @@
 
 This module converts the abstract hourly plan into concrete Home
 Assistant service calls:
-  - Battery mode control (force charge, force discharge, self-consumption)
+  - Battery mode control (force charge, self-consumption)
   - Inverter power setpoints
   - EV charger start/stop with real-time overrides:
     * Ramp-down when vehicle hits target SoC
     * Negative price → charge everything
     * Solar surplus → absorb free energy
     * Not scheduled → stop to save grid
+
+Battery discharge policy
+------------------------
+The battery NEVER force-discharges or exports to the grid.
+When the LP labels an hour as "discharge_battery" (expecting stored
+energy to offset consumption), the inverter is set to **self-consumption
+mode** — it naturally covers household load from stored energy and
+charges from any solar surplus.
+
+Only ACTION_PRE_DISCHARGE uses force-discharge: making room in the
+battery before negative-price hours when we must absorb maximum solar.
 """
 
 from __future__ import annotations
@@ -241,45 +252,24 @@ class ActionBuilder:
             self._set_forced_power(sg_out, actions, int(battery_charge_power))
 
         elif action == ACTION_DISCHARGE_BATTERY:
-            # Force-discharge — actively drain battery during expensive hours.
-            # The battery MUST NOT charge during this mode, even if solar
-            # production exceeds household consumption.
-            cfg = sg_out.get("force_discharge", {})
+            # Self-consumption mode — the inverter naturally covers
+            # household load from stored battery energy and charges
+            # from any solar surplus.  We NEVER force-discharge because
+            # the battery must not export to the grid.
+            #
+            # The LP labels hours as "discharge_battery" when it
+            # expects stored energy to offset consumption.  The
+            # inverter's self-consumption mode achieves this without
+            # actively pushing energy out.
+            cfg = sg_out.get("self_consumption", {})
             if cfg.get("service") and cfg.get("entity_id"):
                 actions.append({
                     "service": cfg["service"],
                     "entity_id": cfg["entity_id"],
                     "data": {},
                 })
-            inverter_max = sg_out.get("set_forced_power", {}).get("max", 5000)
-            # Minimum forced discharge — guarantees the battery never charges
-            # (solar surplus would otherwise be absorbed by the battery).
-            min_discharge_w = 500
-
-            # Net household load after solar (W).
-            # predicted_consumption/predicted_solar are in kWh (1 h slot)
-            # → multiply by 1000 to get average watts.
-            net_load_w = (predicted_consumption - predicted_solar) * 1000
-
-            if net_load_w > 0:
-                # House needs more than solar → discharge to cover the gap
-                discharge_power = int(net_load_w)
-            else:
-                # Solar covers (or exceeds) house load → still discharge
-                # to export stored energy at the expensive grid price
-                discharge_power = inverter_max
-
-            # Clamp: at least min_discharge, at most inverter_max
-            discharge_power = max(min_discharge_w, min(discharge_power, inverter_max))
-
-            self._set_forced_power(sg_out, actions, discharge_power)
-            pwr_limit = sg_out.get("set_discharge_power", {})
-            if pwr_limit.get("service") and pwr_limit.get("entity_id"):
-                actions.append({
-                    "service": pwr_limit["service"],
-                    "entity_id": pwr_limit["entity_id"],
-                    "data": {"value": discharge_power},
-                })
+            actions.extend(self._stop_forced_cmd(sg_out))
+            self._set_forced_power(sg_out, actions, 0)
 
         else:
             # Default: self-consumption

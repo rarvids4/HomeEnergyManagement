@@ -619,12 +619,14 @@ class TestNegativePriceOptimization:
             "EVs should charge during pre_discharge when price is cheap"
         )
 
-    def test_discharge_hour_uses_force_discharge(
+    def test_discharge_hour_uses_self_consumption_mode(
         self, default_params, outputs_with_forced_power, freeze_time
     ):
         """When current hour is expensive and action is discharge,
-        the inverter should be in force-discharge mode with a non-zero
-        power setpoint — the battery must NEVER charge during discharge."""
+        the inverter should be in self-consumption mode — NOT force-
+        discharge.  The battery never exports to the grid; the
+        inverter's self-consumption mode naturally covers household
+        load from stored energy."""
         # Set time to hour 6 (will be the expensive hour)
         freeze_time.now.return_value = datetime(2025, 1, 6, 6, 0, 0)
         opt = Optimizer(default_params, outputs_with_forced_power)
@@ -645,21 +647,23 @@ class TestNegativePriceOptimization:
         assert plan[0]["action"] == ACTION_DISCHARGE_BATTERY
 
         actions = result["immediate_actions"]
-        # Should use force_discharge mode (NOT self_consumption)
+        # Should use self_consumption mode (NOT force_discharge)
+        sc_actions = [
+            a for a in actions
+            if a["entity_id"] == "script.sg_set_self_consumption_mode"
+        ]
+        assert len(sc_actions) == 1, (
+            "Discharge hour should use self-consumption mode on inverter"
+        )
+
+        # Force-discharge must NOT be used
         fd_actions = [
             a for a in actions
             if a["entity_id"] == "script.sg_set_forced_discharge_battery_mode"
         ]
-        assert len(fd_actions) == 1, "Discharge hour should use force-discharge mode"
-
-        # Forced power must be > 0 to guarantee the battery discharges
-        power_actions = [
-            a for a in actions
-            if a["entity_id"] == "input_number.set_sg_forced_charge_discharge_power"
-        ]
-        assert len(power_actions) == 1
-        assert power_actions[0]["data"]["value"] >= 500, (
-            "Discharge power must be at least 500 W to prevent battery charging"
+        assert len(fd_actions) == 0, (
+            "Discharge hour must NOT use force-discharge — battery never "
+            "exports to grid"
         )
 
     def test_charge_hour_sets_power_5000(
@@ -792,11 +796,11 @@ class TestNegativePriceOptimization:
             "No forced power action should be generated without config"
         )
 
-    def test_discharge_does_not_clear_forced_cmd(
+    def test_discharge_clears_forced_cmd(
         self, default_params, outputs_with_forced_power, freeze_time
     ):
-        """Discharge uses forced discharge mode → should NOT set Stop.
-        The inverter is actively discharging, not in self-consumption."""
+        """Discharge uses self-consumption mode → should set Stop to
+        clear any latched force-charge/discharge on the inverter."""
         freeze_time.now.return_value = datetime(2025, 1, 6, 6, 0, 0)
         opt = Optimizer(default_params, outputs_with_forced_power)
 
@@ -820,8 +824,8 @@ class TestNegativePriceOptimization:
             a for a in actions
             if a.get("entity_id") == "input_select.set_sg_battery_forced_charge_discharge_cmd"
         ]
-        assert len(stop_actions) == 0, (
-            "Discharge uses forced mode, should NOT clear forced cmd"
+        assert len(stop_actions) == 1, (
+            "Discharge uses self-consumption mode, should clear forced cmd"
         )
 
     def test_self_consumption_clears_forced_cmd(

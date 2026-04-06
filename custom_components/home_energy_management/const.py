@@ -55,13 +55,13 @@ DEFAULT_BATTERY_CAPACITY = 10.0  # kWh
 # Round-trip efficiency ≈ 85% for home lithium batteries.
 # Each direction: sqrt(0.85) ≈ 0.922
 #   charge_eff × discharge_eff = 0.922 × 0.922 ≈ 0.85
-DEFAULT_BATTERY_CHARGE_EFFICIENCY = 0.922
-DEFAULT_BATTERY_DISCHARGE_EFFICIENCY = 0.922
+DEFAULT_BATTERY_CHARGE_EFFICIENCY = 0.9
+DEFAULT_BATTERY_DISCHARGE_EFFICIENCY = 0.9
 # Default power limits (Watts) — overridden by output config
 DEFAULT_BATTERY_MAX_CHARGE_POWER_W = 5000
 DEFAULT_BATTERY_MAX_DISCHARGE_POWER_W = 5000
 # Fraction of spot price received when selling back to grid (1.0 = full spot)
-DEFAULT_SELL_PRICE_FACTOR = 1.0
+DEFAULT_SELL_PRICE_FACTOR = 0.5
 # Hard SoC floor — the LP will never discharge below this percentage,
 # regardless of the user-configured min_soc.  Protects battery health.
 BATTERY_SOC_HARD_FLOOR = 8  # %
@@ -94,7 +94,7 @@ DEFAULT_NEG_PRICE_EV_EXPORT_LIMIT_W = 2100
 # Interval (seconds) for the lightweight loop that re-reads grid export
 # and adjusts the active surplus-charger's current.  Runs independently
 # of the full optimisation cycle for responsive solar tracking.
-DEFAULT_FAST_EV_UPDATE_INTERVAL = 30  # seconds
+DEFAULT_FAST_EV_UPDATE_INTERVAL = 10  # seconds
 
 # --- Battery charge power floor ---
 # When the LP says charge_battery but the calculated forced-charge
@@ -122,17 +122,17 @@ DEFAULT_EV_MIN_DEPARTURE_SOC = 100  # %
 # When optimization_days=2 and cheaper prices exist tomorrow, charging
 # above this level may be deferred, but the car will always be kept
 # at or above this percentage.  0 = no floor (defer everything).
-DEFAULT_EV_MIN_CHARGE_LEVEL = 20  # %
+DEFAULT_EV_MIN_CHARGE_LEVEL = 50  # %
 # Optimization window: 1 = plan within today+tomorrow prices only;
 # 2 = consider up to 48 h ahead (requires tomorrow prices or weather)
-DEFAULT_EV_OPTIMIZATION_WINDOW = 1  # days
+DEFAULT_EV_OPTIMIZATION_WINDOW = 2  # days
 
 # --- Solar prediction ---
 # PV peak power in kW.  0 = no PV system (solar prediction disabled).
 # Set this to your system's effective peak output.  For example,
 # a 20 kWp system with 85 % system efficiency → 17 kW effective,
 # or set to 20 and let the model match your actual clear-sky production.
-DEFAULT_PV_PEAK_POWER_KW = 0.0
+DEFAULT_PV_PEAK_POWER_KW = 14.4
 # Cloud opacity: how much cloud coverage reduces PV output (0–1).
 # 0.75 means 100 % clouds → 25 % of clear-sky output (diffuse radiation).
 DEFAULT_CLOUD_OPACITY = 0.75
@@ -142,8 +142,8 @@ DEFAULT_CLOUD_OPACITY = 0.75
 # Peak hours (default 06:00–22:00) typically have higher network fees.
 # Set these to your grid operator's actual rates.  Defaults are 0
 # so existing setups are unaffected until configured.
-DEFAULT_GRID_TARIFF_PEAK_SEK = 0.0
-DEFAULT_GRID_TARIFF_OFFPEAK_SEK = 0.0
+DEFAULT_GRID_TARIFF_PEAK_SEK = 1.3
+DEFAULT_GRID_TARIFF_OFFPEAK_SEK = 0.8
 DEFAULT_GRID_TARIFF_PEAK_START = 6   # 06:00
 DEFAULT_GRID_TARIFF_PEAK_END = 22    # 22:00
 

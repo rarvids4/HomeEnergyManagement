@@ -404,10 +404,15 @@ class ActionBuilder:
         actions: list[dict[str, Any]],
         value: int | None,
     ) -> None:
-        """Set the inverter grid export power limit (register 13088).
+        """Set the inverter grid export power limit.
 
         If the set_export_limit output is not configured, this is a no-op.
-        Pass *value* in watts.  Pass None to reset to max (uncapped).
+        Pass *value* in watts to enable the limit (mode → Enabled).
+        Pass ``None`` to remove the cap (mode → Disabled).
+
+        Handles two Sungrow registers:
+          - 13088  export power limit value (input_number)
+          - 13087  export power limit mode  (input_select)
         """
         cfg = sg_out.get("set_export_limit", {})
         service = cfg.get("service")
@@ -415,7 +420,27 @@ class ActionBuilder:
         if not service or not entity_id:
             return
 
-        max_export = cfg.get("max", 5000)
+        # ── Mode toggle (Enabled / Disabled) ──
+        mode_entity = cfg.get("mode_entity_id")
+        if mode_entity:
+            if value is not None:
+                # Limiting — enable the cap
+                mode_option = cfg.get("mode_enabled", "Enabled")
+            else:
+                # Uncapping — disable the limit
+                mode_option = cfg.get("mode_disabled", "Disabled")
+            _LOGGER.info(
+                "Setting export limit mode to '%s' on %s",
+                mode_option, mode_entity,
+            )
+            actions.append({
+                "service": "input_select.select_option",
+                "entity_id": mode_entity,
+                "data": {"option": mode_option},
+            })
+
+        # ── Value ──
+        max_export = cfg.get("max", 10000)
         limit_w = value if value is not None else max_export
         limit_w = max(cfg.get("min", 0), min(limit_w, max_export))
 

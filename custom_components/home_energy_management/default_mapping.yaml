@@ -162,8 +162,11 @@ outputs:
     #   service: "input_number.set_value"
     #   entity_id: "input_number.CHANGE_ME_export_power_limit"
     #   min: 0
-    #   max: 5000
+    #   max: 10000
     #   negative_price_limit: 0      # W — block all export during negative prices
+    #   mode_entity_id: "input_select.CHANGE_ME_export_power_limit_mode"
+    #   mode_enabled: "Enabled"
+    #   mode_disabled: "Disabled"
 
     # SoC limits
     set_min_soc:

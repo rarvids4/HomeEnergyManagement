@@ -169,6 +169,21 @@ outputs:
       max: 5000
       step: 100
 
+    # Export power limit (Sungrow register 13087/13088)
+    # Caps how much power the inverter feeds into the grid.
+    # During negative prices the mode is Enabled + limit set to 0 W.
+    # During positive prices the mode is Disabled (no cap).
+    # Uncomment and set your entity_id once the Modbus register is exposed.
+    # set_export_limit:
+    #   service: "input_number.set_value"
+    #   entity_id: "input_number.CHANGE_ME_export_power_limit"
+    #   min: 0
+    #   max: 10000
+    #   negative_price_limit: 0
+    #   mode_entity_id: "input_select.CHANGE_ME_export_power_limit_mode"
+    #   mode_enabled: "Enabled"
+    #   mode_disabled: "Disabled"
+
     # SoC limits
     set_min_soc:
       service: "input_number.set_value"

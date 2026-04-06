@@ -421,9 +421,10 @@ class ActionBuilder:
                     actions.append(limit_action)
                 return actions
 
-        # Solar surplus: charge up to the vehicle's own target SoC
-        # (disregard the departure/min SoC limits — this is free solar)
-        if charger_connected and solar_surplus and not price_is_expensive:
+        # Solar surplus: charge EVs to absorb excess solar and minimise
+        # grid export.  Charge regardless of price — local consumption
+        # of free solar is always better than exporting.
+        if charger_connected and solar_surplus:
             vehicle_target = 100
             vehicle_soc = 0
             if vehicle:

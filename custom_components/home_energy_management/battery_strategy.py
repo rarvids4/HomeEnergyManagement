@@ -148,6 +148,17 @@ _LP_EPS = 0.01  # kWh
 # Look-ahead for labelling PRE_DISCHARGE (hours)
 _PRE_DISCHARGE_LOOKAHEAD = 4
 
+# Minimum SoC (%) to allow pre-discharge (force-discharge).
+# Pre-discharge is aggressive — it actively drains the battery to make
+# room for free solar during upcoming negative-price hours.  Require
+# sufficient stored energy so we don't micro-cycle a nearly-empty battery.
+_PRE_DISCHARGE_MIN_SOC = 20  # %
+
+# Minimum predicted solar (kWh) during negative-price hours to justify
+# pre-discharge.  Without meaningful solar, there's less value in
+# emptying the battery — self-consumption is safer.
+_PRE_DISCHARGE_MIN_SOLAR = 0.5  # kWh total across lookahead hours
+
 
 class BatteryStrategy:
     """LP-based battery charge/discharge optimiser.
@@ -324,17 +335,15 @@ class BatteryStrategy:
 
             # ── G3: Solar surplus → self-consumption ─────────────────
             # When real-time solar surplus is detected, let the inverter
-            # absorb naturally.  Only when:
+            # absorb naturally.  EVs will also be started by the action
+            # builder to minimise grid export.  Only when:
             #   • grid export exceeds the surplus threshold
             #   • battery is not full
             #   • spot price is non-negative (neg prices take priority)
-            #   • planner did NOT schedule discharge (selling stored
-            #     energy at high prices is more valuable)
             elif (
                 grid_export_power >= self.solar_surplus_threshold
                 and battery_soc < self.max_soc
                 and pw.spot[0] >= 0
-                and plan[0]["action"] != ACTION_DISCHARGE_BATTERY
             ):
                 plan[0]["action"] = ACTION_SELF_CONSUMPTION
                 plan[0]["reason"] = (
@@ -504,7 +513,8 @@ class BatteryStrategy:
             spot = pw.spot[h] if h < len(pw.spot) else 0.0
 
             action, reason = self._classify_lp_hour(
-                h, H, ch, dis, spot, pw.effective[h], sim_soc, pw.spot,
+                h, H, ch, dis, spot, pw.effective[h], sim_soc,
+                pw.spot, solar,
             )
 
             plan.append({
@@ -546,8 +556,11 @@ class BatteryStrategy:
         effective: float,
         soc_after: float,
         all_spot: list[float],
+        all_solar: list[float] | None = None,
     ) -> tuple[str, str]:
         """Map LP quantities for a single hour to an action label."""
+        if all_solar is None:
+            all_solar = []
 
         # Negative spot → MAXIMIZE_LOAD (absorb everything)
         if spot < 0:
@@ -576,18 +589,38 @@ class BatteryStrategy:
 
         # Net discharging — check for pre-discharge label
         if net < -_LP_EPS:
-            lookahead = all_spot[h + 1 : h + 1 + _PRE_DISCHARGE_LOOKAHEAD]
-            if any(p < 0 for p in lookahead):
-                return (
-                    ACTION_PRE_DISCHARGE,
-                    f"LP: pre-discharge {discharge_kwh:.2f} kWh at "
-                    f"{effective:.2f} — negative prices ahead "
-                    f"(SoC → {soc_after:.0f}%)",
+            lookahead_spot = all_spot[h + 1 : h + 1 + _PRE_DISCHARGE_LOOKAHEAD]
+            has_neg_ahead = any(p < 0 for p in lookahead_spot)
+
+            if has_neg_ahead:
+                # Pre-discharge conditions (force-discharge to make room):
+                #   1. Negative prices in next 4 hours  (checked above)
+                #   2. SoC after discharge stays ≥ 20 %  (protect battery)
+                #   3. Predicted solar during those neg-price hours
+                #      exceeds threshold (otherwise no free energy to absorb)
+                lookahead_solar = all_solar[h + 1 : h + 1 + _PRE_DISCHARGE_LOOKAHEAD]
+                neg_hour_solar = sum(
+                    s for p, s in zip(lookahead_spot, lookahead_solar)
+                    if p < 0
                 )
+                if (
+                    soc_after >= _PRE_DISCHARGE_MIN_SOC
+                    and neg_hour_solar >= _PRE_DISCHARGE_MIN_SOLAR
+                ):
+                    return (
+                        ACTION_PRE_DISCHARGE,
+                        f"LP: pre-discharge {discharge_kwh:.2f} kWh at "
+                        f"{effective:.2f} — negative prices ahead, "
+                        f"solar {neg_hour_solar:.1f} kWh predicted "
+                        f"(SoC → {soc_after:.0f}%)",
+                    )
+                # Conditions not met — fall through to self-consumption.
+                # The inverter handles discharge passively in SC mode.
+
             return (
-                ACTION_DISCHARGE_BATTERY,
-                f"LP: discharge {discharge_kwh:.2f} kWh at "
-                f"{effective:.2f} (SoC → {soc_after:.0f}%)",
+                ACTION_SELF_CONSUMPTION,
+                f"LP: self-consumption (discharge {discharge_kwh:.2f} kWh) "
+                f"at {effective:.2f} (SoC → {soc_after:.0f}%)",
             )
 
         # Self-consumption (no significant battery action)

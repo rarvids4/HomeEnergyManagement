@@ -66,6 +66,20 @@ DEFAULT_SELL_PRICE_FACTOR = 0.5
 # regardless of the user-configured min_soc.  Protects battery health.
 BATTERY_SOC_HARD_FLOOR = 8  # %
 
+# Terminal SoC value — rolling-horizon correction.
+# In a 24h rolling plan the LP treats energy remaining at the last hour
+# as worthless.  This causes it to sell all solar and deplete the battery
+# instead of recharging for the next day's expensive hours.
+# The terminal value assigns a per-kWh value to stored energy at the end
+# of the horizon, computed as:
+#   Q1(effective_prices) × discharge_efficiency × weight
+# Q1 (lower quartile) naturally separates cheap from expensive hours:
+#   • Discharge penalty < expensive hour price → evening discharge OK
+#   • Discharge penalty ≥ cheap hour price → battery preserved overnight
+#   • Charge reward  >> sell revenue → solar charges battery, not grid
+# Set to 0.0 to disable (original LP behaviour with no terminal value).
+DEFAULT_TERMINAL_SOC_WEIGHT = 1.0
+
 # --- Charger limits ---
 DEFAULT_MIN_AMPS = 6
 DEFAULT_MAX_AMPS = 32

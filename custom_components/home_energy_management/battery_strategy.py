@@ -136,6 +136,7 @@ from .const import (
     DEFAULT_MIN_SOC,
     DEFAULT_SELL_PRICE_FACTOR,
     DEFAULT_SOLAR_SURPLUS_THRESHOLD,
+    DEFAULT_TERMINAL_SOC_WEIGHT,
     OUTPUT_SUNGROW,
 )
 from .price_analysis import PriceWindow
@@ -214,6 +215,11 @@ class BatteryStrategy:
 
         self.solar_surplus_threshold = params.get(
             "solar_surplus_threshold_w", DEFAULT_SOLAR_SURPLUS_THRESHOLD
+        )
+
+        # Terminal SoC value weight (0=off, 1=default)
+        self.terminal_soc_weight: float = params.get(
+            "terminal_soc_weight", DEFAULT_TERMINAL_SOC_WEIGHT
         )
 
     # ==================================================================
@@ -407,6 +413,37 @@ class BatteryStrategy:
             c[2 * H + h] = pw.effective[h]                           # grid_buy cost
             c[3 * H + h] = -(pw.spot[h] * self.sell_price_factor)    # grid_sell revenue
 
+        # ── Terminal SoC value ─────────────────────────────────────
+        # In a rolling 24 h horizon the LP has no incentive to keep
+        # energy stored at the last hour — it sells all solar and
+        # depletes the battery.  The terminal value tells the LP that
+        # stored energy has future worth beyond the horizon.
+        #
+        # terminal_val = Q1(effective) × η_d × weight
+        #
+        # Using the lower quartile naturally separates cheap / expensive
+        # hours:
+        #   • discharge penalty < expensive price → evening discharge OK
+        #   • discharge penalty ≥ cheap price → battery preserved overnight
+        #   • charge reward >> sell revenue → solar charges battery
+        if self.terminal_soc_weight > 0 and H > 0:
+            sorted_eff = sorted(pw.effective)
+            q1_idx = max(0, len(sorted_eff) // 4)
+            terminal_base = sorted_eff[q1_idx]
+            terminal_val = self.terminal_soc_weight * terminal_base * eta_d
+
+            _LOGGER.debug(
+                "LP terminal SoC value: base=%.3f (Q1 effective), "
+                "terminal_val=%.3f SEK/kWh stored",
+                terminal_base, terminal_val,
+            )
+
+            for h in range(H):
+                # Charging stores η_c kWh per kWh charged → reward
+                c[h] += -terminal_val * eta_c
+                # Discharging removes 1/η_d kWh per kWh delivered → penalty
+                c[H + h] += terminal_val / eta_d
+
         # ── C1: Energy balance (equality) ──────────────────────────
         #   supply = demand + waste
         #   solar[h] + discharge[h] + grid_buy[h]
@@ -514,7 +551,7 @@ class BatteryStrategy:
 
             action, reason = self._classify_lp_hour(
                 h, H, ch, dis, spot, pw.effective[h], sim_soc,
-                pw.spot, solar,
+                pw.spot, solar, consumption,
             )
 
             plan.append({
@@ -557,10 +594,13 @@ class BatteryStrategy:
         soc_after: float,
         all_spot: list[float],
         all_solar: list[float] | None = None,
+        all_consumption: list[float] | None = None,
     ) -> tuple[str, str]:
         """Map LP quantities for a single hour to an action label."""
         if all_solar is None:
             all_solar = []
+        if all_consumption is None:
+            all_consumption = []
 
         # Negative spot → MAXIMIZE_LOAD (absorb everything)
         if spot < 0:
@@ -581,6 +621,18 @@ class BatteryStrategy:
 
         # Net charging
         if net > _LP_EPS:
+            # When solar surplus covers the planned charge, classify as
+            # self_consumption — the inverter absorbs solar naturally
+            # without forced grid charging.
+            solar_h = all_solar[h] if h < len(all_solar) else 0.0
+            cons_h = all_consumption[h] if h < len(all_consumption) else 0.0
+            solar_surplus = max(0.0, solar_h - cons_h)
+            if solar_surplus > _LP_EPS and net <= solar_surplus + 0.1:
+                return (
+                    ACTION_SELF_CONSUMPTION,
+                    f"LP: solar → battery {net:.2f} kWh "
+                    f"at {effective:.2f} (SoC → {soc_after:.0f}%)",
+                )
             return (
                 ACTION_CHARGE_BATTERY,
                 f"LP: charge {charge_kwh:.2f} kWh at {effective:.2f} "

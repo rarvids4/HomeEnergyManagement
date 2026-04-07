@@ -33,6 +33,13 @@ def default_params():
         "planning_horizon_hours": 24,
         "enable_charger_control": True,
         "enable_battery_control": True,
+        # Disable terminal SoC value by default so existing tests
+        # are unaffected.  Dedicated tests enable it explicitly.
+        "terminal_soc_weight": 0.0,
+        # Zero grid tariffs so effective prices = spot prices.
+        # Tests that need tariff behaviour override these explicitly.
+        "grid_tariff_peak_sek": 0,
+        "grid_tariff_offpeak_sek": 0,
     }
 
 
@@ -2508,9 +2515,10 @@ class TestEVOptimizationDays:
     def test_single_day_ignores_tomorrow(
         self, default_params, default_outputs, ev_above_floor
     ):
-        """With optimization_window=1 (default), tomorrow prices should not
+        """With optimization_window=1, tomorrow prices should not
         be used for EV scheduling even if available."""
-        opt = Optimizer(default_params, default_outputs)
+        params = {**default_params, "ev_optimization_window": 1}
+        opt = Optimizer(params, default_outputs)
 
         # Today expensive, tomorrow cheap — but window=1 so no deferral
         prices = {
@@ -3439,3 +3447,177 @@ class TestGridTariff:
         for entry in result["ev_charge_schedule"]["schedule"]:
             assert "spot_price" in entry, "EV schedule should have spot_price"
             assert entry["spot_price"] == pytest.approx(0.15, abs=0.001)
+
+
+class TestTerminalSoCValue:
+    """Tests for the terminal SoC value feature.
+
+    The terminal value prevents the LP from treating energy at the end
+    of the 24h horizon as worthless.  Without it, the LP sells all solar
+    and never recharges the battery.
+    """
+
+    def test_solar_charges_battery_with_terminal_value(self, default_outputs):
+        """LP should charge the battery from solar instead of selling everything."""
+        params = {
+            "min_price_spread": 0.30,
+            "planning_horizon_hours": 24,
+            "enable_charger_control": True,
+            "enable_battery_control": True,
+            "terminal_soc_weight": 1.0,
+            "grid_tariff_peak_sek": 0.8,
+            "grid_tariff_offpeak_sek": 0.4,
+        }
+        opt = Optimizer(params, default_outputs)
+
+        # Evening expensive, night cheap, daytime moderate with lots of solar.
+        # Without terminal value the LP would sell all solar.  With terminal
+        # value it should charge the battery during solar hours.
+        prices = {
+            "today": [0.15, 0.12, 0.10, 0.10, 0.12, 0.20,
+                      0.40, 0.50, 0.55, 0.50, 0.45, 0.40,
+                      0.38, 0.35, 0.30, 0.28, 0.30, 0.50,
+                      0.80, 1.00, 0.90, 0.70, 0.40, 0.20],
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        # Significant solar production during hours 6-16
+        predicted_solar = (
+            [0.0] * 6
+            + [1.0, 3.0, 5.0, 7.0, 8.0, 8.0, 7.0, 5.0, 3.0, 1.5, 0.5]
+            + [0.0] * 7
+        )
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=15,  # low initial SoC — room to charge
+            ev_connected=False,
+            predicted_solar=predicted_solar,
+        )
+
+        plan = result["hourly_plan"]
+        # Check that the LP plans significant battery charging during solar hours
+        solar_hour_charge = sum(
+            entry.get("lp_charge_kwh", 0)
+            for entry in plan
+            if entry.get("predicted_solar_kwh", 0) > 2.0
+        )
+        assert solar_hour_charge > 5.0, (
+            f"LP should charge >= 5 kWh from solar, got {solar_hour_charge:.1f} kWh. "
+            f"Terminal value should incentivise storing solar."
+        )
+
+        # SoC should increase from initial 15% due to solar charging
+        # (it also discharges during expensive evening hours, so final
+        # SoC depends on the full plan — just verify it's above starting)
+        final_soc = plan[-1].get("lp_soc_after", 0)
+        assert final_soc > 20, (
+            f"Final SoC should be above 20% after solar charging "
+            f"(started at 15%), got {final_soc:.0f}%"
+        )
+
+    def test_no_terminal_value_sells_solar(self, default_outputs):
+        """Without terminal value the LP sells most solar to grid."""
+        params = {
+            "min_price_spread": 0.30,
+            "planning_horizon_hours": 24,
+            "enable_charger_control": True,
+            "enable_battery_control": True,
+            "terminal_soc_weight": 0.0,  # disabled
+            "grid_tariff_peak_sek": 0.8,
+            "grid_tariff_offpeak_sek": 0.4,
+        }
+        opt = Optimizer(params, default_outputs)
+
+        prices = {
+            "today": [0.15, 0.12, 0.10, 0.10, 0.12, 0.20,
+                      0.40, 0.50, 0.55, 0.50, 0.45, 0.40,
+                      0.38, 0.35, 0.30, 0.28, 0.30, 0.50,
+                      0.80, 1.00, 0.90, 0.70, 0.40, 0.20],
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        predicted_solar = (
+            [0.0] * 6
+            + [1.0, 3.0, 5.0, 7.0, 8.0, 8.0, 7.0, 5.0, 3.0, 1.5, 0.5]
+            + [0.0] * 7
+        )
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=15,
+            ev_connected=False,
+            predicted_solar=predicted_solar,
+        )
+
+        plan = result["hourly_plan"]
+        # Without terminal value, grid sell should be large during solar hours
+        solar_hour_sell = sum(
+            entry.get("lp_grid_sell_kwh", 0)
+            for entry in plan
+            if entry.get("predicted_solar_kwh", 0) > 2.0
+        )
+        solar_hour_charge = sum(
+            entry.get("lp_charge_kwh", 0)
+            for entry in plan
+            if entry.get("predicted_solar_kwh", 0) > 2.0
+        )
+        # Expect much more selling than charging when terminal value is off
+        assert solar_hour_sell > solar_hour_charge, (
+            f"Without terminal value, sell ({solar_hour_sell:.1f}) should "
+            f"exceed charge ({solar_hour_charge:.1f})"
+        )
+
+    def test_solar_hours_classified_as_self_consumption(self, default_outputs):
+        """When solar surplus covers charging, the action should be self_consumption."""
+        params = {
+            "min_price_spread": 0.30,
+            "planning_horizon_hours": 24,
+            "enable_charger_control": True,
+            "enable_battery_control": True,
+            "terminal_soc_weight": 1.0,
+            "grid_tariff_peak_sek": 0.8,
+            "grid_tariff_offpeak_sek": 0.4,
+        }
+        opt = Optimizer(params, default_outputs)
+
+        prices = {
+            "today": [0.15, 0.12, 0.10, 0.10, 0.12, 0.20,
+                      0.40, 0.50, 0.55, 0.50, 0.45, 0.40,
+                      0.38, 0.35, 0.30, 0.28, 0.30, 0.50,
+                      0.80, 1.00, 0.90, 0.70, 0.40, 0.20],
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+
+        predicted_solar = (
+            [0.0] * 6
+            + [1.0, 3.0, 5.0, 7.0, 8.0, 8.0, 7.0, 5.0, 3.0, 1.5, 0.5]
+            + [0.0] * 7
+        )
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=15,
+            ev_connected=False,
+            predicted_solar=predicted_solar,
+        )
+
+        plan = result["hourly_plan"]
+        # During peak solar (solar >> consumption), hours should be
+        # classified as self_consumption, not charge_battery
+        peak_solar_hours = [
+            entry for entry in plan
+            if entry.get("predicted_solar_kwh", 0) > 3.0
+        ]
+        for entry in peak_solar_hours:
+            assert entry["action"] == ACTION_SELF_CONSUMPTION, (
+                f"Hour {entry['hour']} with solar "
+                f"{entry.get('predicted_solar_kwh', 0)} kWh should be "
+                f"self_consumption (solar -> battery), got {entry['action']}"
+            )

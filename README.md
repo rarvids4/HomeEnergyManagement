@@ -395,9 +395,16 @@ The battery schedule is computed by a **linear-programming (LP) solver** (scipy 
 - **Sell price** (battery → grid): Nordpool spot × `sell_price_factor` (default 1.0)
 - **Negative-price check**: Uses spot price only (before tariffs) — when spot < 0, the battery charges at max regardless
 
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `terminal_soc_weight` | float | `1.0` | How much the LP values energy left in the battery at the end of the planning horizon. `0` = fully deplete today (max savings now), `0.5` = balanced, `1.0` = conservative (holds energy overnight). See [Calibration Guidelines](#-calibration-guidelines) |
+| `sell_price_factor` | float | `1.0` | Multiplier applied to spot price when selling to grid (accounts for retailer margin) |
+| `battery_charge_efficiency` | float | `0.922` | One-way charge efficiency (grid → battery). Default = √0.85 |
+| `battery_discharge_efficiency` | float | `0.922` | One-way discharge efficiency (battery → house). Default = √0.85 |
+
 The LP solver replaces the earlier heuristic `grid_charge_max_soc` / `grid_charge_max_price` parameters, which have been removed. The solver automatically determines the optimal hours and SoC levels for grid charging based on price differentials and efficiency losses.
 
-> 💡 **Fallback:** If scipy is unavailable or the LP solver fails, a simple heuristic classifier is used instead (charge at cheap hours, discharge at expensive hours, based on `min_price_spread`).
+> 💡 **Fallback:** If the LP solver fails, a simple heuristic classifier is used instead (charge at cheap hours, discharge at expensive hours, based on `min_price_spread`).
 
 #### Consumption Prediction
 
@@ -587,6 +594,27 @@ HomeEnergyManagement/
 | **Easee** | EV Charger with dynamic current | [easee_hass](https://github.com/fondberg/easee_hass) — supports `set_dynamic_limit` |
 | **Smart Meter** | Grid import/export | Via Sungrow CT or separate P1/HAN integration |
 | **Weather** | Temperature for prediction | Built-in HA weather integration |
+
+---
+
+## 🎛️ Calibration Guidelines
+
+The LP optimizer's behaviour depends heavily on `terminal_soc_weight` — the value it places on energy remaining in the battery at the end of the planning horizon.
+
+| Weight | Behaviour | Best For |
+|--------|-----------|----------|
+| `0.0` | Fully depletes battery today — maximum immediate savings | Summer with reliable solar forecast |
+| `0.5` | Balanced — discharges at evening peak, retains ~50% overnight | **Recommended starting point** |
+| `1.0` | Conservative — holds ~60–65% overnight, may buy from grid at off-peak | Uncertain weather / winter |
+| `1.5–2.0` | Very conservative — barely discharges, battery stays near full | Not recommended for most users |
+
+> 📄 **Detailed analysis with real data:** [Terminal SoC Weight Analysis (PDF)](docs/Terminal%20SoC%20Weight%20Analysis.pdf) — compares SoC trajectories, grid purchases, and costs across different weight values using actual Nordpool SE3 prices and solar/consumption data.
+
+**How to tune:**
+1. Start with `terminal_soc_weight: 0.5`
+2. Monitor the battery plan sensor — check if the battery discharges during evening peak (typically 17–21h)
+3. If it buys from grid while the battery has stored energy → lower the weight
+4. If it depletes the battery and you need energy the next morning → raise the weight
 
 ---
 

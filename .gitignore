@@ -61,5 +61,11 @@ CLAUDE.md
 # --- Debug test files (personal, not part of the test suite) ---
 tests/test_lp_debug.py
 
+# --- Terminal SoC analysis scripts (personal tooling) ---
+test_terminal_soc.py
+test_terminal_soc_weight.ipynb
+terminal_soc_weight_report.html
+/Terminal SoC Weight Analysis.pdf
+
 # --- Backup files ---
 *.bak

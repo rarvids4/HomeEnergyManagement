@@ -3621,3 +3621,220 @@ class TestTerminalSoCValue:
                 f"{entry.get('predicted_solar_kwh', 0)} kWh should be "
                 f"self_consumption (solar -> battery), got {entry['action']}"
             )
+
+
+# ======================================================================
+# Negative-price export-block regression tests
+# ======================================================================
+# Background: a real production incident on 2026-05-02 showed the
+# inverter exporting 6.7 kW during a -0.04 SEK/kWh hour (paying ~270 W
+# of free money to the grid) because the integration was using
+# `force_charge` (EMS = Forced mode) which makes the Sungrow firmware
+# IGNORE the export-power-limit register (13087). The fix:
+#   1. MAXIMIZE_LOAD must use self-consumption mode, NOT force_charge.
+#   2. Export-limit must be writable via direct modbus.write_register
+#      so it works even when the input_helper -> automation chain
+#      doesn't fire (it only triggers on state-change).
+
+class TestNegativePriceExportBlock:
+    """Regression tests for the export-block during negative spot prices."""
+
+    def _outputs_with_export_modbus(self):
+        """Sungrow output with both export-limit input helpers AND modbus."""
+        return {
+            "sungrow": {
+                "force_charge": {
+                    "service": "script.turn_on",
+                    "entity_id": "script.sg_set_forced_charge_battery_mode",
+                },
+                "self_consumption": {
+                    "service": "script.turn_on",
+                    "entity_id": "script.sg_set_self_consumption_mode",
+                },
+                "set_forced_power": {
+                    "service": "input_number.set_value",
+                    "entity_id": "input_number.set_sg_forced_charge_discharge_power",
+                    "max": 5000,
+                },
+                "set_charge_power": {
+                    "service": "input_number.set_value",
+                    "entity_id": "input_number.set_sg_battery_max_charge_power",
+                    "min": 100,
+                    "max": 5000,
+                    "step": 100,
+                },
+                "set_export_limit": {
+                    "service": "input_number.set_value",
+                    "entity_id": "input_number.set_sg_export_power_limit",
+                    "min": 0,
+                    "max": 10000,
+                    "negative_price_limit": 0,
+                    "mode_entity_id": "input_select.set_sg_export_power_limit_mode",
+                    "mode_enabled": "Enabled",
+                    "mode_disabled": "Disabled",
+                    "modbus": {
+                        "hub": "SungrowSHx",
+                        "slave": 1,
+                        "value_register": 13073,
+                        "mode_register": 13086,
+                        "mode_enable_value": 0xAA,
+                        "mode_disable_value": 0x55,
+                    },
+                },
+                "battery_mode_select": (
+                    "input_select.set_sg_battery_forced_charge_discharge_cmd"
+                ),
+                "battery_mode_options": {"stop": "Stop (default)"},
+                "min_soc": 10,
+                "max_soc": 100,
+                "capacity_kwh": 10.0,
+            },
+            "ev_chargers": [],
+        }
+
+    def test_maximize_load_with_solar_surplus_uses_self_consumption(
+        self, default_params
+    ):
+        """The 2026-05-02 production bug: MAXIMIZE_LOAD with predicted
+        solar surplus must use self-consumption mode, NOT force_charge,
+        because Sungrow firmware ignores the export-limit register
+        when EMS is in Forced mode."""
+        outputs = self._outputs_with_export_modbus()
+        opt = Optimizer(default_params, outputs)
+
+        prices = {
+            "today": [-0.10] * 4 + [0.50] * 20,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        # Solar far exceeds load — exactly the conditions that triggered
+        # the bug (6.7 kW solar, 1.4 kW load, force_charge picked).
+        predicted_solar = [8.0] * 4 + [0.0] * 20
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.4] * 24,
+            battery_soc=20,
+            ev_connected=False,
+            predicted_solar=predicted_solar,
+        )
+
+        assert result["hourly_plan"][0]["action"] == ACTION_MAXIMIZE_LOAD
+        actions = result["immediate_actions"]
+
+        # MUST use self_consumption (so EMS = Self-consumption, so the
+        # export-limit register is honored by the inverter firmware).
+        assert any(
+            a.get("entity_id") == "script.sg_set_self_consumption_mode"
+            for a in actions
+        ), "MAXIMIZE_LOAD with solar surplus must use self-consumption mode"
+
+        # MUST NOT use force_charge (it sets EMS = Forced, which makes
+        # the inverter ignore the export limit and dump solar to grid).
+        assert not any(
+            a.get("entity_id") == "script.sg_set_forced_charge_battery_mode"
+            for a in actions
+        ), "MAXIMIZE_LOAD must NEVER use force_charge — that breaks export limit"
+
+    def test_maximize_load_writes_export_limit_via_modbus(
+        self, default_params
+    ):
+        """Export-limit must be written via direct modbus.write_register
+        so it works regardless of input_helper state-change automations."""
+        outputs = self._outputs_with_export_modbus()
+        opt = Optimizer(default_params, outputs)
+
+        prices = {
+            "today": [-0.10] * 4 + [0.50] * 20,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.4] * 24,
+            battery_soc=20,
+            ev_connected=False,
+            predicted_solar=[8.0] * 4 + [0.0] * 20,
+        )
+
+        actions = result["immediate_actions"]
+        modbus_writes = [
+            a for a in actions if a.get("service") == "modbus.write_register"
+        ]
+        # Expect at least 2 writes: one for the value (0 W), one for the mode (0xAA).
+        addrs = {a["data"]["address"] for a in modbus_writes}
+        assert 13073 in addrs, "Must write export-limit value register 13073"
+        assert 13086 in addrs, "Must write export-limit mode register 13086"
+
+        value_write = next(a for a in modbus_writes if a["data"]["address"] == 13073)
+        mode_write = next(a for a in modbus_writes if a["data"]["address"] == 13086)
+        assert value_write["data"]["value"] == 0, (
+            "Export limit value must be 0 W during negative prices"
+        )
+        assert mode_write["data"]["value"] == 0xAA, (
+            "Export limit mode must be Enabled (0xAA) during negative prices"
+        )
+        assert value_write["data"]["hub"] == "SungrowSHx"
+        assert value_write["data"]["slave"] == 1
+
+    def test_positive_price_disables_export_limit_via_modbus(
+        self, default_params
+    ):
+        """During positive prices the export cap must be removed
+        (mode = Disabled / 0x55) so we can sell surplus normally."""
+        outputs = self._outputs_with_export_modbus()
+        opt = Optimizer(default_params, outputs)
+
+        prices = {
+            "today": [0.50] * 24,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=False,
+        )
+
+        actions = result["immediate_actions"]
+        modbus_writes = [
+            a for a in actions if a.get("service") == "modbus.write_register"
+        ]
+        mode_writes = [a for a in modbus_writes if a["data"]["address"] == 13086]
+        assert mode_writes, "Must always assert mode register"
+        assert mode_writes[0]["data"]["value"] == 0x55, (
+            "Positive-price export limit mode must be Disabled (0x55)"
+        )
+
+    def test_maximize_load_cranks_battery_max_charge_power(
+        self, default_params
+    ):
+        """In self-consumption mode, the battery only absorbs surplus up
+        to its max-charge-power setting. We must crank it high so the
+        inverter can soak all solar and avoid curtailment."""
+        outputs = self._outputs_with_export_modbus()
+        opt = Optimizer(default_params, outputs)
+
+        prices = {
+            "today": [-0.10] * 4 + [0.50] * 20,
+            "tomorrow": [],
+            "currency": "SEK",
+        }
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.4] * 24,
+            battery_soc=20,
+            ev_connected=False,
+            predicted_solar=[8.0] * 4 + [0.0] * 20,
+        )
+
+        actions = result["immediate_actions"]
+        chg_writes = [
+            a for a in actions
+            if a.get("entity_id") == "input_number.set_sg_battery_max_charge_power"
+        ]
+        assert chg_writes, "Must set battery max-charge power during MAXIMIZE_LOAD"
+        assert chg_writes[-1]["data"]["value"] == 5000, (
+            "Max-charge power must be cranked to inverter max (5000 W)"
+        )

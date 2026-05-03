@@ -246,7 +246,10 @@ class ActionBuilder:
 
         During negative prices the escalation is:
           1. EV absorbing surplus → limit = neg_price_ev_export_limit_w
-          2. No EV available     → limit = 0 W (block all export)
+          2. No EV available     → limit = negative_price_limit (small
+             headroom, e.g. 90 W — a hard 0 W cap can make the inverter
+             overshoot into grid IMPORT, which is the opposite of what
+             we want during negative prices).
 
         During positive prices → limit removed (mode Disabled).
         """
@@ -308,42 +311,51 @@ class ActionBuilder:
         actions: list[dict[str, Any]] = []
 
         if action == ACTION_MAXIMIZE_LOAD:
-            # Negative price — absorb as much as possible, minimize grid export.
-            # If solar is actively exporting (grid_export_w > 0), force-charge
-            # the battery to soak up surplus; otherwise self-consumption is fine.
-            net_solar_w = (predicted_solar - predicted_consumption) * 1000
-            battery_soc = sg_out.get("soc", 0)
-            max_soc = sg_out.get("max_soc", 100)
-            can_charge = battery_soc < max_soc
+            # Negative price — block grid export at the inverter level.
+            #
+            # IMPORTANT (Sungrow firmware constraint):
+            # The "Feed-in limitation" register (13087) is ONLY honored
+            # when EMS mode is "Self-consumption" (raw=0). In "Forced"
+            # mode (which `force_charge` activates) the inverter ignores
+            # the export cap entirely — solar surplus is dumped to the
+            # grid even with the limit set to 0 W. We have observed
+            # this in production: paying to export 6.7 kW of solar
+            # while the export-limit register read "Disabled" because
+            # EMS was Forced.
+            #
+            # So in MAXIMIZE_LOAD we ALWAYS use self-consumption mode
+            # and crank the battery max-charge power to the inverter
+            # max. The export cap (set to 0 W in `_apply_export_limit`)
+            # then makes the inverter throttle solar so nothing leaves
+            # the property. Battery soaks surplus up to its max charge
+            # rate; if the battery is full, solar is curtailed.
+            cfg = sg_out.get("self_consumption", {})
+            if cfg.get("service") and cfg.get("entity_id"):
+                actions.append({
+                    "service": cfg["service"],
+                    "entity_id": cfg["entity_id"],
+                    "data": {},
+                })
+            actions.extend(self._stop_forced_cmd(sg_out))
+            self._set_forced_power(sg_out, actions, 0)
 
-            if can_charge and net_solar_w > 0:
-                # Solar exceeds consumption — force-charge battery to absorb it
-                cfg = sg_out.get("force_charge", {})
-                if cfg.get("service") and cfg.get("entity_id"):
-                    actions.append({
-                        "service": cfg["service"],
-                        "entity_id": cfg["entity_id"],
-                        "data": {},
-                    })
-                inverter_max = sg_out.get("set_forced_power", {}).get("max", 5000)
-                charge_power = min(int(net_solar_w), inverter_max)
-                self._set_forced_power(sg_out, actions, charge_power)
-                _LOGGER.info(
-                    "Negative price + solar surplus: force-charging battery "
-                    "at %d W to minimize grid export (SoC %.0f%%)",
-                    charge_power, battery_soc,
-                )
-            else:
-                # No solar surplus or battery full — self-consumption is fine
-                cfg = sg_out.get("self_consumption", {})
-                if cfg.get("service") and cfg.get("entity_id"):
-                    actions.append({
-                        "service": cfg["service"],
-                        "entity_id": cfg["entity_id"],
-                        "data": {},
-                    })
-                actions.extend(self._stop_forced_cmd(sg_out))
-                self._set_forced_power(sg_out, actions, 0)
+            # Crank battery max-charge so it absorbs all available
+            # surplus while in self-consumption mode.
+            chg_cfg = sg_out.get("set_charge_power", {})
+            if chg_cfg.get("service") and chg_cfg.get("entity_id"):
+                max_chg = chg_cfg.get("max", 5000)
+                actions.append({
+                    "service": chg_cfg["service"],
+                    "entity_id": chg_cfg["entity_id"],
+                    "data": {"value": max_chg},
+                })
+
+            _LOGGER.info(
+                "Negative price MAXIMIZE_LOAD: self-consumption + "
+                "battery max charge (SoC %.0f%%, predicted solar %.2f kWh, "
+                "load %.2f kWh) — export blocked at inverter via reg 13087",
+                sg_out.get("soc", 0), predicted_solar, predicted_consumption,
+            )
 
         elif action == ACTION_PRE_DISCHARGE:
             cfg = sg_out.get("force_discharge", {})
@@ -488,27 +500,95 @@ class ActionBuilder:
         Pass *value* in watts to enable the limit (mode → Enabled).
         Pass ``None`` to remove the cap (mode → Disabled).
 
-        Handles two Sungrow registers:
-          - 13088  export power limit value (input_number)
-          - 13087  export power limit mode  (input_select)
+        Two write paths are supported and both are emitted (the modbus
+        path is the reliable one; the input-helper path is kept for
+        users without modbus access and to keep the UI in sync):
+
+        1. **Direct modbus write** (preferred). Configured under
+           ``set_export_limit.modbus`` in the mapping with ``hub``,
+           ``slave``, ``value_register``, ``mode_register``,
+           ``mode_enable_value`` (default 0xAA) and ``mode_disable_value``
+           (default 0x55). This bypasses the input_select →
+           automation → modbus chain, which is unreliable: the
+           automation only fires on *state change*, so once the helper
+           is "Enabled" further "Enabled" writes are ignored even if
+           the inverter register has reverted to Disabled (which
+           happens whenever EMS mode toggles to/from Forced).
+
+        2. **Input-helper write** (fallback for UI sync). Sets
+           ``input_select.set_sg_export_power_limit_mode`` and
+           ``input_number.set_sg_export_power_limit``.
+
+        Sungrow registers (0-indexed addresses):
+          - 13073  export power limit value (W)         (spec reg 13074)
+          - 13086  export power limit mode  0xAA / 0x55 (spec reg 13087)
         """
         cfg = sg_out.get("set_export_limit", {})
+        if not cfg:
+            return
+
+        max_export = cfg.get("max", 10000)
+        limit_w = value if value is not None else max_export
+        limit_w = max(cfg.get("min", 0), min(int(limit_w), max_export))
+
+        # ── 1) Direct modbus write (preferred path) ──
+        modbus_cfg = cfg.get("modbus")
+        if modbus_cfg:
+            hub = modbus_cfg.get("hub")
+            slave = modbus_cfg.get("slave")
+            val_reg = modbus_cfg.get("value_register")
+            mode_reg = modbus_cfg.get("mode_register")
+            enable_v = modbus_cfg.get("mode_enable_value", 0xAA)
+            disable_v = modbus_cfg.get("mode_disable_value", 0x55)
+
+            if hub is not None and slave is not None and val_reg is not None:
+                _LOGGER.info(
+                    "Modbus write: export limit value reg %s = %d W "
+                    "(hub=%s slave=%s)",
+                    val_reg, limit_w, hub, slave,
+                )
+                actions.append({
+                    "service": "modbus.write_register",
+                    "data": {
+                        "hub": hub,
+                        "slave": slave,
+                        "address": val_reg,
+                        "value": limit_w,
+                    },
+                })
+            if hub is not None and slave is not None and mode_reg is not None:
+                mode_val = enable_v if value is not None else disable_v
+                _LOGGER.info(
+                    "Modbus write: export limit mode reg %s = 0x%02X "
+                    "(%s)",
+                    mode_reg, mode_val,
+                    "Enabled" if value is not None else "Disabled",
+                )
+                actions.append({
+                    "service": "modbus.write_register",
+                    "data": {
+                        "hub": hub,
+                        "slave": slave,
+                        "address": mode_reg,
+                        "value": mode_val,
+                    },
+                })
+
+        # ── 2) Input-helper writes (UI sync, may be no-ops) ──
         service = cfg.get("service")
         entity_id = cfg.get("entity_id")
         if not service or not entity_id:
             return
 
-        # ── Mode toggle (Enabled / Disabled) ──
+        # Mode toggle (Enabled / Disabled)
         mode_entity = cfg.get("mode_entity_id")
         if mode_entity:
             if value is not None:
-                # Limiting — enable the cap
                 mode_option = cfg.get("mode_enabled", "Enabled")
             else:
-                # Uncapping — disable the limit
                 mode_option = cfg.get("mode_disabled", "Disabled")
-            _LOGGER.info(
-                "Setting export limit mode to '%s' on %s",
+            _LOGGER.debug(
+                "Setting export limit mode helper to '%s' on %s",
                 mode_option, mode_entity,
             )
             actions.append({
@@ -517,12 +597,7 @@ class ActionBuilder:
                 "data": {"option": mode_option},
             })
 
-        # ── Value ──
-        max_export = cfg.get("max", 10000)
-        limit_w = value if value is not None else max_export
-        limit_w = max(cfg.get("min", 0), min(limit_w, max_export))
-
-        _LOGGER.info("Setting grid export limit to %d W", limit_w)
+        _LOGGER.debug("Setting grid export limit helper to %d W", limit_w)
         actions.append({
             "service": service,
             "entity_id": entity_id,

@@ -78,7 +78,7 @@ BATTERY_SOC_HARD_FLOOR = 8  # %
 #   • Discharge penalty ≥ cheap hour price → battery preserved overnight
 #   • Charge reward  >> sell revenue → solar charges battery, not grid
 # Set to 0.0 to disable (original LP behaviour with no terminal value).
-DEFAULT_TERMINAL_SOC_WEIGHT = 1.0
+DEFAULT_TERMINAL_SOC_WEIGHT = 0.5
 
 # --- Charger limits ---
 DEFAULT_MIN_AMPS = 6

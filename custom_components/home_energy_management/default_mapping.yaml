@@ -155,18 +155,34 @@ outputs:
       max: 5000
       step: 100
 
-    # Export power limit (Sungrow register 13087/13088)
+    # Export power limit (Sungrow registers 13074 / 13087)
     # Set to 0 during negative prices to prevent paying to export.
-    # Remove or comment out if your inverter doesn't expose this register.
+    # Remove or comment out if your inverter doesn't expose these registers.
+    #
+    # IMPORTANT: The Sungrow firmware only honors the export limit
+    # while EMS mode is "Self-consumption" (raw=0). The integration
+    # already switches to self-consumption during MAXIMIZE_LOAD; do
+    # NOT use force_charge while you also need the export cap.
+    #
+    # Two write paths are supported:
+    #   1. `modbus`: direct register write — RECOMMENDED, reliable.
+    #   2. `service`/`entity_id` (input_number/input_select): UI sync.
     # set_export_limit:
     #   service: "input_number.set_value"
     #   entity_id: "input_number.CHANGE_ME_export_power_limit"
     #   min: 0
     #   max: 10000
-    #   negative_price_limit: 0      # W — block all export during negative prices
+    #   negative_price_limit: 90      # W — small headroom (avoid 0 W which can cause inverter to overshoot into grid import)
     #   mode_entity_id: "input_select.CHANGE_ME_export_power_limit_mode"
     #   mode_enabled: "Enabled"
     #   mode_disabled: "Disabled"
+    #   modbus:
+    #     hub: "CHANGE_ME_modbus_hub"     # e.g. "SungrowSHx"
+    #     slave: 1                         # CHANGE_ME — your modbus slave id
+    #     value_register: 13073            # 0-indexed addr (spec reg 13074)
+    #     mode_register: 13086             # 0-indexed addr (spec reg 13087)
+    #     mode_enable_value: 0xAA          # 170
+    #     mode_disable_value: 0x55         # 85
 
     # SoC limits
     set_min_soc:

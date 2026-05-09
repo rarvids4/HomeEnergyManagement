@@ -7,7 +7,7 @@
 
 # ⚡ Home Energy Management
 
-> A smart Home Assistant integration that **optimises charging and discharging** of your EV chargers and home battery based on **Nordpool energy prices** and **predicted consumption patterns** — saving you money automatically. The battery scheduler uses a **linear-programming (LP) solver** for mathematically optimal charge/discharge decisions.
+> A smart Home Assistant integration that **optimises charging and discharging** of your EV chargers and home battery based on **Nordpool energy prices** and **predicted consumption patterns** — saving you money automatically. The battery scheduler uses a built-in **linear-programming (LP) solver** (pure-Python Big-M simplex, no external dependencies) for mathematically optimal charge/discharge decisions.
 
 ---
 
@@ -40,7 +40,7 @@ The integration runs every 15 minutes (configurable) and:
 
 | Feature | Description |
 |---------|-------------|
-| 🧮 **LP-optimized battery** | Linear-programming solver (scipy) finds the mathematically optimal charge/discharge schedule across the full planning horizon |
+| 🧮 **LP-optimized battery** | Built-in pure-Python linear-programming solver (Big-M simplex, no external dependencies) finds the mathematically optimal charge/discharge schedule across the full planning horizon |
 | 🔌 **Price-aware scheduling** | Detects price peaks/valleys from Nordpool, plans charge/discharge windows |
 | 💸 **Grid tariff support** | Adds time-of-use network fees (peak/off-peak) to spot prices for accurate cost optimization |
 | 🧠 **Split consumption prediction** | Learns house base load and EV charging patterns separately (weekday/weekend, time-of-day) |
@@ -380,13 +380,13 @@ All tuning parameters live in the `parameters:` section. Every parameter has a b
 
 #### LP Battery Optimizer
 
-The battery schedule is computed by a **linear-programming (LP) solver** (scipy `linprog`, HiGHS method with revised-simplex fallback). It finds the mathematically optimal charge/discharge plan that **minimises total electricity cost** over the planning horizon, subject to:
+The battery schedule is computed by a **built-in pure-Python LP solver** (Big-M simplex method with Bland's rule for pivot selection — no scipy or other external dependency required). It finds the mathematically optimal charge/discharge plan that **minimises total electricity cost** over the planning horizon, subject to:
 
 | Constraint | Detail |
 |------------|--------|
-| **SoC bounds** | SoC stays between a hard floor of **6 %** and `max_soc` (default 100 %) at every hour |
+| **SoC bounds** | SoC stays between a hard floor of **8 %** and `max_soc` (default 100 %) at every hour |
 | **Power limits** | Charge/discharge power capped at `battery_max_charge_power_w` / `battery_max_discharge_power_w` (default 5 000 W each) |
-| **Round-trip efficiency** | **85 %** round-trip (√0.85 ≈ 0.922 applied to both charge and discharge) |
+| **Round-trip efficiency** | **81 %** round-trip (0.9 applied to both charge and discharge) |
 | **Grid neutrality** | When `self_consumption` is chosen, battery neither charges from nor discharges to grid |
 
 **Pricing model:**
@@ -397,14 +397,14 @@ The battery schedule is computed by a **linear-programming (LP) solver** (scipy 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `terminal_soc_weight` | float | `1.0` | How much the LP values energy left in the battery at the end of the planning horizon. `0` = fully deplete today (max savings now), `0.5` = balanced, `1.0` = conservative (holds energy overnight). See [Calibration Guidelines](#-calibration-guidelines) |
-| `sell_price_factor` | float | `1.0` | Multiplier applied to spot price when selling to grid (accounts for retailer margin) |
-| `battery_charge_efficiency` | float | `0.922` | One-way charge efficiency (grid → battery). Default = √0.85 |
-| `battery_discharge_efficiency` | float | `0.922` | One-way discharge efficiency (battery → house). Default = √0.85 |
+| `terminal_soc_weight` | float | `0.5` | How much the LP values energy left in the battery at the end of the planning horizon. `0` = fully deplete today (max savings now), `0.5` = balanced, `1.0` = conservative (holds energy overnight). See [Calibration Guidelines](#-calibration-guidelines) |
+| `sell_price_factor` | float | `0.5` | Multiplier applied to spot price when selling to grid (accounts for retailer margin) |
+| `battery_charge_efficiency` | float | `0.9` | One-way charge efficiency (grid → battery). Default ≈ 90 % |
+| `battery_discharge_efficiency` | float | `0.9` | One-way discharge efficiency (battery → house). Default ≈ 90 % |
 
 The LP solver replaces the earlier heuristic `grid_charge_max_soc` / `grid_charge_max_price` parameters, which have been removed. The solver automatically determines the optimal hours and SoC levels for grid charging based on price differentials and efficiency losses.
 
-> 💡 **Fallback:** If the LP solver fails, a simple heuristic classifier is used instead (charge at cheap hours, discharge at expensive hours, based on `min_price_spread`).
+> 💡 **Fallback:** If the LP solver fails to find an optimal solution, a simple heuristic classifier is used instead (charge at cheap hours, discharge at expensive hours, based on `min_price_spread`).
 
 #### Consumption Prediction
 
@@ -436,7 +436,7 @@ Time-of-use network fees added to spot prices to get the **effective cost** per 
 |-----------|------|---------|-------------|
 | `ev_default_target_soc` | int | `100` | Default target SoC (%) for vehicles without a per-vehicle setting |
 | `ev_default_min_departure_soc` | int | `100` | Default departure SoC (%) — charge to this by departure time |
-| `ev_default_min_charge_level` | int | `20` | Default SoC floor (%) — car never sits below this |
+| `ev_default_min_charge_level` | int | `50` | Default SoC floor (%) — car never sits below this |
 | `ev_default_departure_time` | string | `"07:00"` | Default departure time (HH:MM) for vehicles without a per-vehicle setting |
 | `ev_cheap_price_threshold` | float | `0.10` | Always charge EVs when price is below this (SEK/kWh) |
 | `ev_weekend_target_soc` | int | `80` | On Fridays, lower target SoC to this (car parked at home, solar fills later) |
@@ -474,7 +474,7 @@ When tomorrow's prices are available (typically after 13:00), the optimizer can 
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `ev_optimization_window` | int | `1` | `1` = today+remaining hours only; `2` = up to 48 hours ahead |
+| `ev_optimization_window` | int | `2` | `1` = today+remaining hours only; `2` = up to 48 hours ahead |
 | `optimization_days_entity` | entity_id | — | `input_number` helper — overrides `ev_optimization_window` from the HA UI |
 
 With `ev_optimization_window: 2`, the scheduler uses a **two-pass** strategy:
@@ -528,7 +528,7 @@ Beyond the hourly schedule, the action builder applies real-time overrides every
 |----------|---------|-----------|
 | **Negative price** | `current_price < 0` | All EVs charge at max current, ignore SoC limits — you get paid to consume |
 | **Solar surplus** | `grid_export ≥ solar_surplus_threshold_w` | EVs charge using surplus. Fast loop adjusts dynamic current every `fast_ev_update_interval` s. Grid-import dips are absorbed for `surplus_grid_import_grace_seconds` (charger held at min current) before stopping |
-| **Ramp-down** | `vehicle_soc ≥ min_departure_soc` | Charger stopped — vehicle has reached its target |
+| **Ramp-down** | `vehicle_soc ≥ target` | Charger stopped. For **grid-scheduled** charging the target is `min_departure_soc`; for **solar surplus** charging the target is `vehicle_target_soc` (100 %) so free solar fills the battery completely |
 | **Weekend target** | Friday (day 4) | SoC target reduced to `ev_weekend_target_soc` (car will top up from solar Saturday) |
 | **Expensive hour** | Battery is discharging | Charger stopped — selling to grid is more profitable |
 | **Manual override** | User turns off charger switch manually | Automation respects the choice for a cooldown period (2× optimization interval, minimum 30 min) |
@@ -578,15 +578,18 @@ HomeEnergyManagement/
 │       ├── config_flow.py       # UI configuration flow
 │       ├── coordinator.py       # Data update coordinator (sensor reads, action execution)
 │       ├── optimizer.py         # Orchestrator — delegates to sub-modules
+│       ├── lp_solver.py         # Pure-Python Big-M simplex LP solver (no external deps)
 │       ├── price_analysis.py    # Price horizon, grid tariff, statistics
 │       ├── battery_strategy.py  # LP-based hour classification, charge/discharge decisions
 │       ├── ev_scheduler.py      # Per-vehicle EV charging schedule
 │       ├── action_builder.py    # Translates decisions into HA service calls
 │       ├── predictor.py         # Split-stream consumption prediction
+│       ├── solar_predictor.py   # PV output prediction from weather forecast
 │       ├── sensor.py            # HA sensor entities
 │       ├── services.py          # HA service handlers
 │       ├── services.yaml        # Service definitions
 │       ├── logger.py            # Prediction & decision log with accuracy tracking
+│       ├── default_mapping.yaml # Bundled config template (CHANGE_ME_* placeholders)
 │       ├── strings.json         # UI strings
 │       └── translations/
 │           └── en.json
@@ -596,8 +599,10 @@ HomeEnergyManagement/
 ├── tests/
 │   ├── test_optimizer.py
 │   ├── test_predictor.py
+│   ├── test_solar_predictor.py
 │   ├── test_mapping.py
-│   └── test_logger.py
+│   ├── test_logger.py
+│   └── test_lp_debug.py
 ├── hacs.json
 ├── requirements.txt
 └── README.md

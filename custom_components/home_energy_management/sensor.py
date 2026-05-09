@@ -37,6 +37,7 @@ async def async_setup_entry(
         OptimizationStatusSensor(coordinator, entry),
         CurrentPriceSensor(coordinator, entry),
         NextActionSensor(coordinator, entry),
+        SurplusChargingSensor(coordinator, entry),
         PredictedConsumptionSensor(coordinator, entry),
         ActualConsumptionSensor(coordinator, entry),
         BatteryPlanSensor(coordinator, entry),
@@ -611,3 +612,73 @@ class PredictionAccuracySensor(EnergyManagementSensor):
     @property
     def icon(self) -> str:
         return "mdi:target"
+
+
+class SurplusChargingSensor(EnergyManagementSensor):
+    """Shows whether solar surplus charging is currently active."""
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "surplus_charging", "Surplus Charging")
+
+    @property
+    def native_value(self) -> str:
+        data = self.coordinator.data or {}
+        sensor_data = data.get("sensor_data", {})
+        grid_export_w = sensor_data.get("grid_export_power", 0.0)
+
+        action_builder = self.coordinator.optimizer._actions
+        active_charger = getattr(action_builder, "surplus_charger_name", None)
+
+        if active_charger:
+            return "active"
+
+        # Fallback: if the current plan hour explicitly schedules charging
+        # while export is above threshold, treat it as active in UI.
+        schedule = data.get("schedule", {})
+        ev_plan = schedule.get("ev_charge_schedule", {})
+        sched = ev_plan.get("schedule", [])
+        charging_now = bool(sched and sched[0].get("charging"))
+        threshold = getattr(action_builder, "solar_surplus_threshold", 0)
+        if charging_now and grid_export_w >= threshold > 0:
+            return "active"
+
+        return "inactive"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        data = self.coordinator.data or {}
+        sensor_data = data.get("sensor_data", {})
+        schedule = data.get("schedule", {})
+        ev_plan = schedule.get("ev_charge_schedule", {})
+        ev_sched = ev_plan.get("schedule", [])
+
+        action_builder = self.coordinator.optimizer._actions
+        active_charger = getattr(action_builder, "surplus_charger_name", None)
+        threshold = getattr(action_builder, "solar_surplus_threshold", 0)
+        min_surplus = getattr(action_builder, "min_surplus_power_w", 0)
+        margin = getattr(action_builder, "surplus_safety_margin_w", 0)
+
+        # Optional mirrored smart-meter switch (if configured in outputs)
+        switch_state = None
+        sm_out = self.coordinator.outputs.get("smart_meter", {})
+        sw_cfg = sm_out.get("surplus_charging", {}) if isinstance(sm_out, dict) else {}
+        switch_entity_id = sw_cfg.get("entity_id") if isinstance(sw_cfg, dict) else None
+        if switch_entity_id:
+            st = self.coordinator.hass.states.get(switch_entity_id)
+            switch_state = st.state if st else None
+
+        return {
+            "active_charger": active_charger,
+            "grid_export_w": round(sensor_data.get("grid_export_power", 0.0), 1),
+            "threshold_w": threshold,
+            "min_surplus_power_w": min_surplus,
+            "surplus_safety_margin_w": margin,
+            "ev_connected": sensor_data.get("ev_connected", False),
+            "charging_now": bool(ev_sched and ev_sched[0].get("charging")),
+            "smart_meter_switch_entity": switch_entity_id,
+            "smart_meter_switch_state": switch_state,
+        }
+
+    @property
+    def icon(self) -> str:
+        return "mdi:solar-power"

@@ -103,6 +103,16 @@ inputs:
 # ----------------------------------------------------------
 outputs:
 
+  # --- Optional smart-meter surplus switch mirror ---
+  # If configured, the integration toggles this switch ON when
+  # solar-surplus charging is actively selected for an EV and OFF
+  # otherwise. Useful for dashboards/automations.
+  # smart_meter:
+  #   surplus_charging:
+  #     entity_id: "switch.CHANGE_ME_surplus_charging"
+  #     service_on: "switch.turn_on"
+  #     service_off: "switch.turn_off"
+
   # --- EV Charger Control ---
   # Each charger uses switch.turn_on / switch.turn_off
   ev_chargers:

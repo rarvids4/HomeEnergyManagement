@@ -44,6 +44,7 @@ from .const import (
     DEFAULT_SURPLUS_SAFETY_MARGIN_W,
     OUTPUT_EV_CHARGERS,
     OUTPUT_EASEE,
+    OUTPUT_SMART_METER,
     OUTPUT_SUNGROW,
 )
 
@@ -101,6 +102,10 @@ class ActionBuilder:
             legacy = outputs.get(OUTPUT_EASEE, {})
             if legacy:
                 self.ev_chargers_cfg = [legacy]
+
+        # Optional smart-meter surplus mode switch (indicator/control)
+        sm_out = outputs.get(OUTPUT_SMART_METER, {})
+        self.surplus_switch = sm_out.get("surplus_charging", {})
 
     # ------------------------------------------------------------------
     # Public: build all immediate actions for the current hour
@@ -218,6 +223,14 @@ class ActionBuilder:
                             neg_price_ev_started = True
                             neg_price_ev_name = charger_cfg.get("name", "")
                             break
+
+        # Optional: mirror integration surplus state to a smart-meter switch.
+        # Active only when a charger is actually selected for solar-surplus
+        # tracking in this cycle.
+        self._set_surplus_switch(
+            actions,
+            active=solar_surplus and bool(self.surplus_charger_name),
+        )
 
         # ── Export-limit escalation (applied after EV decisions) ───
         return self._apply_export_limit(
@@ -835,6 +848,28 @@ class ActionBuilder:
             "device_id": device_id,
             "data": {"current": amps},
         }
+
+    def _set_surplus_switch(
+        self,
+        actions: list[dict[str, Any]],
+        *,
+        active: bool,
+    ) -> None:
+        """Append turn_on/turn_off for optional smart-meter surplus switch."""
+        cfg = self.surplus_switch if isinstance(self.surplus_switch, dict) else {}
+        entity_id = cfg.get("entity_id")
+        service_on = cfg.get("service_on", "switch.turn_on")
+        service_off = cfg.get("service_off", "switch.turn_off")
+        service = service_on if active else service_off
+
+        if not entity_id or not service:
+            return
+
+        actions.append({
+            "service": service,
+            "entity_id": entity_id,
+            "data": {},
+        })
 
     # ------------------------------------------------------------------
     # Fast surplus current update (called every ~30 s by coordinator)

@@ -88,15 +88,21 @@ DEFAULT_MAX_AMPS = 32
 # --- EV smart charging thresholds ---
 # Always charge EVs when price is below this (SEK/kWh), regardless of battery action
 DEFAULT_EV_CHEAP_PRICE_THRESHOLD = 0.10
-# Charge EVs when grid export exceeds this (W) — absorb solar surplus
+# Minimum grid export (W) to start AND keep solar surplus EV charging.
+# Acts as both the trigger threshold and the floor below which the
+# active surplus charger is stopped.  Must exceed
+# min_amps × voltage × phases for the smallest charger.
 DEFAULT_SOLAR_SURPLUS_THRESHOLD = 2000
-# Minimum surplus power (W) per EV — don't start a charger below this.
-# Prevents oscillation and ensures the charger draws meaningful power
-# without pulling from the grid.  Must exceed min_amps × voltage × phases.
-DEFAULT_MIN_SURPLUS_POWER_W = 2000
 # Safety margin (W) subtracted from available surplus when calculating
-# dynamic charger current, to avoid accidentally importing from grid.
+# dynamic charger current.  Doubles as the tolerated net grid-import
+# buffer: brief dips smaller than this margin won't arm the deficit
+# grace timer.
 DEFAULT_SURPLUS_SAFETY_MARGIN_W = 200
+# Grace period (seconds) — how long the surplus deficit must persist
+# before the active surplus charger is stopped.  During the grace
+# window the charger is clamped to its minimum current to limit grid
+# draw while waiting for solar to recover.  Recommended: 30–120 s.
+DEFAULT_SURPLUS_GRID_IMPORT_GRACE_S = 60
 
 # --- Negative-price escalation ---
 # When spot price < 0 and solar surplus exists, the integration tries

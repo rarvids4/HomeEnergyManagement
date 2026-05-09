@@ -655,8 +655,16 @@ class SurplusChargingSensor(EnergyManagementSensor):
         action_builder = self.coordinator.optimizer._actions
         active_charger = getattr(action_builder, "surplus_charger_name", None)
         threshold = getattr(action_builder, "solar_surplus_threshold", 0)
-        min_surplus = getattr(action_builder, "min_surplus_power_w", 0)
         margin = getattr(action_builder, "surplus_safety_margin_w", 0)
+        grace_seconds = getattr(
+            action_builder, "surplus_grid_import_grace_seconds", 0
+        )
+        deficit_since = getattr(action_builder, "_surplus_deficit_since", None)
+        in_grace = deficit_since is not None
+        deficit_elapsed_s: float | None = None
+        if in_grace:
+            import time as _time
+            deficit_elapsed_s = round(_time.monotonic() - deficit_since, 1)
 
         # Optional mirrored smart-meter switch (if configured in outputs)
         switch_state = None
@@ -671,8 +679,10 @@ class SurplusChargingSensor(EnergyManagementSensor):
             "active_charger": active_charger,
             "grid_export_w": round(sensor_data.get("grid_export_power", 0.0), 1),
             "threshold_w": threshold,
-            "min_surplus_power_w": min_surplus,
             "surplus_safety_margin_w": margin,
+            "grace_seconds": grace_seconds,
+            "in_grace_period": in_grace,
+            "deficit_elapsed_s": deficit_elapsed_s,
             "ev_connected": sensor_data.get("ev_connected", False),
             "charging_now": bool(ev_sched and ev_sched[0].get("charging")),
             "smart_meter_switch_entity": switch_entity_id,

@@ -25,6 +25,7 @@ battery before negative-price hours when we must absorb maximum solar.
 from __future__ import annotations
 
 import logging
+import time
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -38,9 +39,9 @@ from .const import (
     DEFAULT_EV_TARGET_SOC,
     DEFAULT_EV_WEEKEND_TARGET_SOC,
     DEFAULT_MIN_CHARGE_POWER_W,
-    DEFAULT_MIN_SURPLUS_POWER_W,
     DEFAULT_NEG_PRICE_EV_EXPORT_LIMIT_W,
     DEFAULT_SOLAR_SURPLUS_THRESHOLD,
+    DEFAULT_SURPLUS_GRID_IMPORT_GRACE_S,
     DEFAULT_SURPLUS_SAFETY_MARGIN_W,
     OUTPUT_EV_CHARGERS,
     OUTPUT_EASEE,
@@ -62,12 +63,16 @@ class ActionBuilder:
         self.solar_surplus_threshold = params.get(
             "solar_surplus_threshold_w", DEFAULT_SOLAR_SURPLUS_THRESHOLD
         )
-        self.min_surplus_power_w = params.get(
-            "min_surplus_power_w", DEFAULT_MIN_SURPLUS_POWER_W
-        )
         self.surplus_safety_margin_w = params.get(
             "surplus_safety_margin_w", DEFAULT_SURPLUS_SAFETY_MARGIN_W
         )
+        # Grace period (seconds) the deficit must persist before stopping
+        self.surplus_grid_import_grace_seconds = params.get(
+            "surplus_grid_import_grace_seconds",
+            DEFAULT_SURPLUS_GRID_IMPORT_GRACE_S,
+        )
+        # Monotonic timestamp of first deficit tick; None when healthy
+        self._surplus_deficit_since: float | None = None
         self.min_charge_power_w = params.get(
             "min_charge_power_w", DEFAULT_MIN_CHARGE_POWER_W
         )
@@ -188,6 +193,7 @@ class ActionBuilder:
         # charger runs on surplus at a time to avoid grid import.
         self.surplus_charger_name = None
         self.surplus_charger_cfg = None
+        self._surplus_deficit_since = None
 
         def _charger_sort_key(cfg: dict[str, Any]) -> float:
             """Sort key: vehicle SoC ascending (lowest first)."""
@@ -692,10 +698,24 @@ class ActionBuilder:
         # --- 2. RAMP-DOWN: stop if vehicle at/above effective target ---
         # Checked BEFORE solar surplus so we don’t start a fully-charged
         # car just because the sun is shining.
-        if vehicle and vehicle_soc > 0 and vehicle_soc >= effective_target:
+        #
+        # When surplus (free solar) is available we use vehicle_target_soc
+        # as the ceiling so the car can charge to its full target, not just
+        # the departure SoC.  For scheduled/grid charging we keep using
+        # min_departure_soc so we don't over-charge on paid power.
+        if solar_surplus and vehicle:
+            surplus_ceiling = vehicle.get(
+                "vehicle_target_soc", self.ev_default_target_soc
+            ) or self.ev_default_target_soc
+        else:
+            surplus_ceiling = effective_target
+
+        if vehicle and vehicle_soc > 0 and vehicle_soc >= surplus_ceiling:
             _LOGGER.info(
-                "EV %s: SoC %.0f%% >= target %.0f%% — stopping (ramp-down)",
-                charger_name, vehicle_soc, effective_target,
+                "EV %s: SoC %.0f%% >= %s target %.0f%% — stopping (ramp-down)",
+                charger_name, vehicle_soc,
+                "surplus" if solar_surplus else "departure",
+                surplus_ceiling,
             )
             actions = self._stop_charger(charger_cfg)
             limit_action = self._set_charger_dynamic_limit(
@@ -716,7 +736,7 @@ class ActionBuilder:
             phases = dyn_cfg.get("phases", 3)
             min_current = dyn_cfg.get("min_current", 6)
             charger_min_w = min_current * voltage * phases
-            min_viable_w = max(self.min_surplus_power_w, charger_min_w)
+            min_viable_w = max(self.solar_surplus_threshold, charger_min_w)
 
             if grid_export_w >= min_viable_w:
                 target_amps = self._calc_surplus_amps(
@@ -875,6 +895,102 @@ class ActionBuilder:
     # Fast surplus current update (called every ~30 s by coordinator)
     # ------------------------------------------------------------------
 
+    def try_arm_surplus(
+        self,
+        grid_export_w: float,
+        ev_vehicles: list[dict[str, Any]],
+        ev_connected: bool,
+    ) -> list[dict[str, Any]]:
+        """Try to start surplus charging from the fast loop.
+
+        Called by the coordinator's fast-update timer when no surplus
+        charger is currently active.  Arms the charger with the lowest
+        vehicle SoC that still needs charging (up to its full
+        ``vehicle_target_soc``, not just the departure SoC), then
+        returns the start + dynamic-limit actions.
+
+        Returns an empty list if conditions are not met.
+        """
+        if self.surplus_charger_name:
+            return []  # already armed
+        if grid_export_w < self.solar_surplus_threshold:
+            return []
+        if not self.enable_charger:
+            return []
+
+        ev_chargers = (
+            self.ev_chargers_cfg
+            if isinstance(self.ev_chargers_cfg, list)
+            else []
+        )
+        if not ev_chargers:
+            return []
+
+        vehicle_map = {v.get("name", ""): v for v in (ev_vehicles or [])}
+
+        def _sort_key(cfg: dict[str, Any]) -> float:
+            v = vehicle_map.get(cfg.get("name", ""))
+            if v:
+                soc = v.get("vehicle_soc", 0)
+                return soc if soc > 0 else 999.0
+            return 999.0
+
+        for charger_cfg in sorted(ev_chargers, key=_sort_key):
+            charger_name = charger_cfg.get("name", "")
+            vehicle = vehicle_map.get(charger_name)
+
+            charger_connected = ev_connected
+            if vehicle:
+                charger_connected = vehicle.get("connected", ev_connected)
+            if not charger_connected:
+                continue
+
+            vehicle_soc = vehicle.get("vehicle_soc", 0) if vehicle else 0
+            vehicle_target = (
+                vehicle.get("vehicle_target_soc", self.ev_default_target_soc)
+                if vehicle else self.ev_default_target_soc
+            ) or self.ev_default_target_soc
+
+            # Skip if already at or above full target
+            if vehicle_soc > 0 and vehicle_soc >= vehicle_target:
+                continue
+
+            dyn_cfg = charger_cfg.get("set_dynamic_limit", {})
+            voltage = dyn_cfg.get("voltage", 230)
+            phases = dyn_cfg.get("phases", 3)
+            min_current = dyn_cfg.get("min_current", 6)
+            charger_min_w = min_current * voltage * phases
+            min_viable_w = max(self.solar_surplus_threshold, charger_min_w)
+
+            if grid_export_w < min_viable_w:
+                continue
+
+            current_ev_power_w = vehicle.get("power_w", 0.0) if vehicle else 0.0
+            target_amps = self._calc_surplus_amps(
+                charger_cfg, grid_export_w, current_ev_power_w,
+            )
+            actions = self._start_charger(charger_cfg)
+            limit_action = self._set_charger_dynamic_limit(charger_cfg, target_amps)
+            if limit_action:
+                actions.append(limit_action)
+
+            self.surplus_charger_name = charger_name
+            self.surplus_charger_cfg = charger_cfg
+            self._surplus_deficit_since = None
+
+            _LOGGER.info(
+                "Fast EV: armed surplus charger %s "
+                "(export %.0f W, SoC %.0f%% < target %.0f%%)",
+                charger_name, grid_export_w, vehicle_soc, vehicle_target,
+            )
+
+            # Mirror surplus state to smart-meter switch
+            switch_actions: list[dict[str, Any]] = []
+            self._set_surplus_switch(switch_actions, active=True)
+            return actions + switch_actions
+
+        return []
+
     def build_surplus_current_update(
         self,
         grid_export_w: float,
@@ -900,24 +1016,58 @@ class ActionBuilder:
         phases = dyn_cfg.get("phases", 3)
         min_current = dyn_cfg.get("min_current", 6)
         charger_min_w = min_current * voltage * phases
-        min_viable_w = max(self.min_surplus_power_w, charger_min_w)
+        min_viable_w = max(self.solar_surplus_threshold, charger_min_w)
 
         # total_available = what's being exported + what the charger
         # is already drawing (it's *part of* the house load, so it
-        # doesn't show up in export).
+        # doesn't show up in export).  surplus_safety_margin_w has
+        # already been subtracted, so it doubles as the tolerated
+        # net grid-import buffer before the deficit timer arms.
         total_available_w = (
             grid_export_w + current_ev_power_w - self.surplus_safety_margin_w
         )
 
         if total_available_w < min_viable_w:
-            # Surplus collapsed — stop charger to avoid grid import
-            _LOGGER.info(
-                "Fast EV: surplus %.0f W < min %.0f W for %s — stopping",
-                total_available_w, min_viable_w, name,
+            now_mono = time.monotonic()
+            if self._surplus_deficit_since is None:
+                self._surplus_deficit_since = now_mono
+                _LOGGER.info(
+                    "Fast EV: surplus deficit started for %s "
+                    "(avail %.0f W < min %.0f W) — grace %ds",
+                    name, total_available_w, min_viable_w,
+                    self.surplus_grid_import_grace_seconds,
+                )
+
+            elapsed = now_mono - self._surplus_deficit_since
+            if elapsed >= self.surplus_grid_import_grace_seconds:
+                _LOGGER.info(
+                    "Fast EV: surplus deficit %.1fs >= grace %ds for %s — stopping",
+                    elapsed, self.surplus_grid_import_grace_seconds, name,
+                )
+                self.surplus_charger_name = None
+                self.surplus_charger_cfg = None
+                self._surplus_deficit_since = None
+                stop_actions = self._stop_charger(cfg)
+                self._set_surplus_switch(stop_actions, active=False)
+                return stop_actions
+
+            # Within grace window — clamp charger to minimum current to
+            # limit grid draw while we wait for solar to recover.
+            limit_action = self._set_charger_dynamic_limit(cfg, min_current)
+            _LOGGER.debug(
+                "Fast EV: %s in grace window (%.1fs/%ds) — holding at %dA",
+                name, elapsed, self.surplus_grid_import_grace_seconds,
+                min_current,
             )
-            self.surplus_charger_name = None
-            self.surplus_charger_cfg = None
-            return self._stop_charger(cfg)
+            return [limit_action] if limit_action else []
+
+        # Healthy surplus — clear any pending deficit timer
+        if self._surplus_deficit_since is not None:
+            _LOGGER.info(
+                "Fast EV: surplus recovered for %s (avail %.0f W) — grace cleared",
+                name, total_available_w,
+            )
+            self._surplus_deficit_since = None
 
         target_amps = self._calc_surplus_amps(
             cfg, grid_export_w, current_ev_power_w,

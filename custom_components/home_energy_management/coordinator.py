@@ -133,7 +133,43 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         """
         action_builder = self.optimizer._actions
         if not action_builder.surplus_charger_name:
-            return  # no surplus charger active — nothing to do
+            # No surplus charger active — try to arm one if solar is sufficient
+            sg = self.inputs.get(INPUT_SUNGROW, {})
+            grid_export_w = self._get_state_float(sg.get("grid_export_power"))
+
+            if grid_export_w >= action_builder.solar_surplus_threshold:
+                # Use latest vehicle data stored from the last full cycle
+                latest_data = self.data or {}
+                sensor_data = latest_data.get("sensor_data", {})
+                ev_vehicles = sensor_data.get("ev_chargers", [])
+                ev_connected = sensor_data.get("ev_connected", False)
+
+                arm_actions = action_builder.try_arm_surplus(
+                    grid_export_w, ev_vehicles, ev_connected,
+                )
+                if arm_actions:
+                    for action in arm_actions:
+                        service = action.get("service", "")
+                        entity_id = action.get("entity_id")
+                        device_id = action.get("device_id")
+                        service_data = action.get("data", {})
+                        if not service or "." not in service:
+                            continue
+                        domain, svc_name = service.split(".", 1)
+                        call_data = dict(service_data)
+                        if device_id and not entity_id:
+                            call_data["device_id"] = device_id
+                        elif entity_id:
+                            call_data["entity_id"] = entity_id
+                        try:
+                            await self.hass.services.async_call(
+                                domain, svc_name, call_data, blocking=True,
+                            )
+                        except Exception as exc:
+                            _LOGGER.error(
+                                "Fast EV arm: failed %s: %s", service, exc
+                            )
+            return
 
         # Read live grid export
         sg = self.inputs.get(INPUT_SUNGROW, {})

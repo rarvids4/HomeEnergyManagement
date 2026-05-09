@@ -440,7 +440,23 @@ Time-of-use network fees added to spot prices to get the **effective cost** per 
 | `ev_default_departure_time` | string | `"07:00"` | Default departure time (HH:MM) for vehicles without a per-vehicle setting |
 | `ev_cheap_price_threshold` | float | `0.10` | Always charge EVs when price is below this (SEK/kWh) |
 | `ev_weekend_target_soc` | int | `80` | On Fridays, lower target SoC to this (car parked at home, solar fills later) |
-| `solar_surplus_threshold_w` | int | `2000` | Minimum grid export (W) to trigger solar surplus EV charging |
+| `solar_surplus_threshold_w` | int | `2000` | Minimum grid export (W) to trigger solar surplus EV charging — see [Solar Surplus Charging](#solar-surplus-charging) for the full set of related tuning parameters |
+
+#### Solar Surplus Charging
+
+Real-time control of EV charging from PV surplus. Once the optimizer arms a surplus charger, a **fast loop** (running every `fast_ev_update_interval` seconds, independent of the hourly plan) continuously re-reads grid export and adjusts the charger's dynamic current limit to track available solar — without pulling from the grid.
+
+When clouds or a sudden load cause net grid import, a **grace period** holds the charger at its minimum current (instead of stopping immediately) to ride out short dips. If the deficit persists past the configured grace window, the charger is stopped.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `solar_surplus_threshold_w` | int | `2000` | Minimum grid export (W) to **start AND keep** surplus charging. Acts as both the trigger and the floor below which the active charger stops. Must exceed `min_amps × voltage × phases` for the smallest charger |
+| `surplus_safety_margin_w` | int | `200` | Headroom (W) subtracted from available surplus when computing the dynamic current limit. **Doubles as the tolerated net grid-import buffer** — brief dips smaller than this won't arm the deficit timer |
+| `surplus_grid_import_grace_seconds` | int | `60` | Seconds the grid-import deficit must persist before the active surplus charger is stopped. During the grace window the charger is **clamped to its minimum current** so it keeps trickling while waiting for solar to recover. Recommended: 30–120 s |
+| `fast_ev_update_interval` | int | `10` | Interval (s) for the fast surplus tracking loop. Lower = more responsive; higher = fewer HA service calls |
+| `neg_price_ev_export_limit_w` | int | `2100` | Inverter export cap (W) when an EV is absorbing surplus during negative spot prices. Provides headroom for charger ramp-up. Falls back to `0 W` if no EV is available |
+
+> **Live status:** the `sensor.home_energy_management_surplus_charging` entity exposes `active_charger`, `grid_export_w`, `in_grace_period`, `deficit_elapsed_s`, and the configured thresholds as attributes for dashboard monitoring.
 
 #### EV Night Preference
 
@@ -491,6 +507,10 @@ parameters:
   ev_night_preference_sek: 0.10
   ev_weekend_target_soc: 80
   solar_surplus_threshold_w: 2000
+  surplus_safety_margin_w: 200
+  surplus_grid_import_grace_seconds: 60
+  fast_ev_update_interval: 10
+  neg_price_ev_export_limit_w: 2100
 
   ev_optimization_window: 1
   optimization_days_entity: "input_number.ev_optimization_days"
@@ -507,7 +527,7 @@ Beyond the hourly schedule, the action builder applies real-time overrides every
 | Override | Trigger | Behaviour |
 |----------|---------|-----------|
 | **Negative price** | `current_price < 0` | All EVs charge at max current, ignore SoC limits — you get paid to consume |
-| **Solar surplus** | `grid_export ≥ solar_surplus_threshold_w` | EVs charge using surplus. Dynamic current limit matches available power (if configured). Charging up to vehicle's own target SoC |
+| **Solar surplus** | `grid_export ≥ solar_surplus_threshold_w` | EVs charge using surplus. Fast loop adjusts dynamic current every `fast_ev_update_interval` s. Grid-import dips are absorbed for `surplus_grid_import_grace_seconds` (charger held at min current) before stopping |
 | **Ramp-down** | `vehicle_soc ≥ min_departure_soc` | Charger stopped — vehicle has reached its target |
 | **Weekend target** | Friday (day 4) | SoC target reduced to `ev_weekend_target_soc` (car will top up from solar Saturday) |
 | **Expensive hour** | Battery is discharging | Charger stopped — selling to grid is more profitable |
@@ -532,6 +552,7 @@ The integration creates these sensor entities in Home Assistant:
 | `sensor.home_energy_management_estimated_daily_savings` | Estimated daily savings from optimisation (SEK) |
 | `sensor.home_energy_management_prediction_log` | Recent log entries with accuracy summary |
 | `sensor.home_energy_management_prediction_accuracy_mae` | Prediction accuracy: MAE, MAPE, per-stream breakdown (house/EV/total), last 24h and 7d |
+| `sensor.home_energy_management_surplus_charging` | Solar-surplus EV charging status (`active`/`inactive`) with attributes: `active_charger`, `grid_export_w`, `threshold_w`, `surplus_safety_margin_w`, `grace_seconds`, `in_grace_period`, `deficit_elapsed_s`, `smart_meter_switch_state` |
 
 ---
 

@@ -236,6 +236,21 @@ parameters:
   pv_cloud_opacity: 0.75
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"
+  # --- Solar surplus EV charging ---
+  # Minimum grid export (W) to start AND keep surplus charging.
+  # Acts as both the trigger threshold and the floor below which the
+  # active surplus charger is stopped.
+  solar_surplus_threshold_w: 2000
+  # Safety margin (W) subtracted from available surplus when computing
+  # dynamic charger current.  Doubles as the tolerated net grid-import
+  # buffer: brief dips smaller than this won't arm the deficit timer.
+  surplus_safety_margin_w: 200
+  # Seconds the grid-import deficit must persist before the active
+  # surplus charger is stopped.  During this window the charger is
+  # clamped to its minimum current to limit grid draw.
+  surplus_grid_import_grace_seconds: 60
+  # Fast EV current adjustment loop interval (seconds)
+  fast_ev_update_interval: 10
   # --- Negative-price escalation ---
   # Export limit (W) when an EV is absorbing surplus during negative
   # spot prices.  Allows headroom for charger ramp-up.  If no EV is

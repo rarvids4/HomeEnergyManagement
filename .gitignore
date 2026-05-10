@@ -58,6 +58,9 @@ CLAUDE.md
 .cursorrules
 .github/copilot-instructions.md
 
+# --- Personal / hardware-specific tests (local only) ---
+tests/test_solar_timeseries.py
+
 # --- Debug test files (personal, not part of the test suite) ---
 tests/test_lp_debug.py
 

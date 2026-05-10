@@ -27,12 +27,16 @@ Three behaviours are verified:
 from __future__ import annotations
 
 import random
+import time
 from datetime import datetime
 from typing import Any
 
 import pytest
 
 from custom_components.home_energy_management.action_builder import ActionBuilder
+from custom_components.home_energy_management.surplus_controller import (
+    SurplusController, SurplusState,
+)
 from custom_components.home_energy_management.const import (
     ACTION_MAXIMIZE_LOAD,
     ACTION_SELF_CONSUMPTION,
@@ -181,6 +185,21 @@ def _build_ab(generic_params, generic_outputs) -> ActionBuilder:
     return ActionBuilder(generic_params, generic_outputs)
 
 
+def _build_sc(generic_params, generic_outputs) -> SurplusController:
+    """Build a SurplusController and pre-warm it into the ACTIVE state."""
+    sc = SurplusController(
+        generic_params, generic_outputs.get("ev_chargers", []),
+    )
+    return sc
+
+
+def _make_active(sc: SurplusController, charger_names: list[str]) -> None:
+    """Force the controller into ACTIVE with the named chargers."""
+    sc.state = SurplusState.ACTIVE
+    sc._state_entered = time.monotonic()
+    sc._active_charger_names = list(charger_names)
+
+
 # ---------------------------------------------------------------------------
 # 1. Dynamic current
 # ---------------------------------------------------------------------------
@@ -190,16 +209,18 @@ class TestDynamicCurrent:
 
     def test_current_scales_with_export_sweep(self, generic_params, generic_outputs):
         """Amperage must increase as export power rises (deterministic sweep)."""
-        ab = _build_ab(generic_params, generic_outputs)
-        ab.surplus_charger_name = "ev_charger_1"
-        ab.surplus_charger_cfg = generic_outputs["ev_chargers"][0]
-        ab._surplus_deficit_since = None
-
+        sc = _build_sc(generic_params, generic_outputs)
+        _make_active(sc, ["ev_charger_1"])
         voltage, phases, margin = 230, 3, 200
+
         prev_amps = None
         for export_w in [3_000, 4_000, 5_000, 6_000, 7_000]:
-            actions = ab.build_surplus_current_update(
-                grid_export_w=export_w, current_ev_power_w=0.0
+            ev_vehicles = [{"name": "ev_charger_1", "power_w": 0.0,
+                            "vehicle_soc": 40, "vehicle_target_soc": 100,
+                            "connected": True}]
+            actions = sc.tick(
+                grid_export_w=export_w, grid_import_w=0.0,
+                ev_vehicles=ev_vehicles, ev_connected=True, current_price=0.50,
             )
             dyn = _dyn_limit_actions(actions)
             assert dyn, f"No dynamic limit action at {export_w} W export"
@@ -219,18 +240,21 @@ class TestDynamicCurrent:
     def test_current_tracks_noisy_timeseries(self, timeseries, generic_params, generic_outputs):
         """Fast-loop updates over the noisy series must always stay within bounds
         and never decrease when export power increases."""
-        ab = _build_ab(generic_params, generic_outputs)
-        ab.surplus_charger_name = "ev_charger_1"
-        ab.surplus_charger_cfg = generic_outputs["ev_chargers"][0]
-        ab._surplus_deficit_since = None
+        sc = _build_sc(generic_params, generic_outputs)
+        _make_active(sc, ["ev_charger_1"])
 
         surplus_ticks = [t for t in timeseries if t["grid_export_w"] >= _SURPLUS_THRESHOLD_W]
         assert len(surplus_ticks) >= 3
 
         prev_amps, prev_export = None, None
         for tick in surplus_ticks:
-            actions = ab.build_surplus_current_update(
-                grid_export_w=tick["grid_export_w"], current_ev_power_w=0.0
+            ev_vehicles = [{"name": "ev_charger_1", "power_w": 0.0,
+                            "vehicle_soc": 40, "vehicle_target_soc": 100,
+                            "connected": True}]
+            actions = sc.tick(
+                grid_export_w=tick["grid_export_w"], grid_import_w=0.0,
+                ev_vehicles=ev_vehicles, ev_connected=True,
+                current_price=tick["spot_price"],
             )
             dyn = _dyn_limit_actions(actions)
             assert dyn, f"Tick {tick['tick']}: no dynamic limit action"
@@ -254,89 +278,69 @@ class TestSurplusChargingActivation:
     """EV charger must start and dynamic current must be set when export is sufficient."""
 
     def test_charger_starts_above_threshold(self, generic_params, generic_outputs, ev_vehicles):
-        ab = _build_ab(generic_params, generic_outputs)
-        now = datetime(2025, 6, 15, 11, 0)
+        sc = _build_sc(generic_params, generic_outputs)
+        # Pre-warm the activation debounce so we transition straight to ACTIVE
+        sc.state = SurplusState.DEBOUNCING
+        sc._state_entered = time.monotonic() - (sc.activation_delay_s + 1)
 
-        actions = ab.build_immediate_actions(
-            action=ACTION_SELF_CONSUMPTION,
-            ev_connected=True,
-            current_price=0.50,
-            spot_price=0.50,
-            avg_price=0.50,
-            min_price=0.40,
-            price_spread=0.10,
-            grid_export_w=6_000.0,
-            ev_vehicles=ev_vehicles,
-            ev_charge_plan=None,
-            now=now,
-            predicted_consumption=_HOUSE_LOAD_KW,
-            predicted_solar=7.5,
+        actions = sc.tick(
+            grid_export_w=6_000.0, grid_import_w=0.0,
+            ev_vehicles=ev_vehicles, ev_connected=True, current_price=0.50,
         )
 
-        ev_on = [a for a in actions if a.get("service") == _CHARGER_ON_SERVICE]
+        ev_on = [a for a in actions if a.get("service") == _CHARGER_ON_SERVICE
+                 and a.get("entity_id") == _CHARGER_ON_ENTITY]
         assert ev_on, "EV charger must be turned on when export exceeds threshold"
-        assert ab.surplus_charger_name == "ev_charger_1"
+        assert "ev_charger_1" in sc.active_charger_names
+        assert sc.is_active
 
         dyn = _dyn_limit_actions(actions)
         assert dyn, "set_dynamic_limit action expected alongside charger start"
         assert 6 <= dyn[0]["data"]["current"] <= 32
 
     def test_charger_stays_off_below_threshold(self, generic_params, generic_outputs, ev_vehicles):
-        """Charger must NOT start when export is below the viable minimum."""
-        ab = _build_ab(generic_params, generic_outputs)
-        now = datetime(2025, 6, 15, 8, 0)
-
-        actions = ab.build_immediate_actions(
-            action=ACTION_SELF_CONSUMPTION,
-            ev_connected=True,
-            current_price=0.50,
-            spot_price=0.50,
-            avg_price=0.50,
-            min_price=0.40,
-            price_spread=0.10,
-            grid_export_w=1_500.0,   # below 2 kW threshold
-            ev_vehicles=ev_vehicles,
-            ev_charge_plan=None,
-            now=now,
-            predicted_consumption=_HOUSE_LOAD_KW,
-            predicted_solar=3.0,
+        """Charger must NOT start when export is below the surplus threshold."""
+        sc = _build_sc(generic_params, generic_outputs)
+        # No pre-warm — start from INACTIVE
+        actions = sc.tick(
+            grid_export_w=1_500.0, grid_import_w=0.0,
+            ev_vehicles=ev_vehicles, ev_connected=True, current_price=0.50,
         )
 
         ev_on = [a for a in actions if a.get("service") == _CHARGER_ON_SERVICE]
         assert not ev_on, "EV charger must NOT start below surplus threshold"
-        assert ab.surplus_charger_name is None
+        assert not sc.is_active
+        assert sc.active_charger_names == []
 
     def test_charger_activates_across_noisy_ticks(
         self, timeseries, generic_params, generic_outputs, ev_vehicles
     ):
-        """For every positive-price tick with enough export, charger must start."""
-        ab = _build_ab(generic_params, generic_outputs)
-        now = datetime(2025, 6, 15, 10, 0)
+        """For every positive-price tick with enough export, charger must be running."""
+        sc = _build_sc(generic_params, generic_outputs)
         min_viable_w = max(_SURPLUS_THRESHOLD_W, 6 * 230 * 3)  # 4140 W
 
         for tick in timeseries:
             if tick["spot_price"] < 0:
                 continue
-            actions = ab.build_immediate_actions(
-                action=ACTION_SELF_CONSUMPTION,
-                ev_connected=True,
+            # Pre-warm debounce so any above-threshold tick activates
+            if not sc.is_active:
+                sc.state = SurplusState.DEBOUNCING
+                sc._state_entered = time.monotonic() - (sc.activation_delay_s + 1)
+
+            actions = sc.tick(
+                grid_export_w=tick["grid_export_w"], grid_import_w=0.0,
+                ev_vehicles=ev_vehicles, ev_connected=True,
                 current_price=tick["spot_price"],
-                spot_price=tick["spot_price"],
-                avg_price=0.50,
-                min_price=0.40,
-                price_spread=0.10,
-                grid_export_w=tick["grid_export_w"],
-                ev_vehicles=ev_vehicles,
-                ev_charge_plan=None,
-                now=now,
-                predicted_consumption=_HOUSE_LOAD_KW,
-                predicted_solar=tick["solar_kw"],
             )
             if tick["grid_export_w"] >= min_viable_w:
-                ev_on = [a for a in actions if a.get("service") == _CHARGER_ON_SERVICE]
-                assert ev_on, (
+                # Either turning on now (turn_on) or already active (dyn limit emitted)
+                started_or_running = (
+                    any(a.get("service") == _CHARGER_ON_SERVICE for a in actions)
+                    or sc.is_active
+                )
+                assert started_or_running, (
                     f"Tick {tick['tick']}: export={tick['grid_export_w']:.0f} W "
-                    f">= viable={min_viable_w} W but charger not started"
+                    f">= viable={min_viable_w} W but charger not running"
                 )
 
 
@@ -409,6 +413,8 @@ class TestExportLimit:
         for tick in timeseries:
             spot = tick["spot_price"]
             action = ACTION_MAXIMIZE_LOAD if spot < 0 else ACTION_SELF_CONSUMPTION
+            # Simulate steady-state: pre-warm debounce before each tick
+            ab._surplus_export_since = time.monotonic() - 61
             actions = ab.build_immediate_actions(
                 action=action,
                 ev_connected=True,
@@ -450,6 +456,7 @@ class TestFullScenario:
         self, timeseries, generic_params, generic_outputs, ev_vehicles
     ):
         ab = _build_ab(generic_params, generic_outputs)
+        sc = _build_sc(generic_params, generic_outputs)
         now = datetime(2025, 6, 15, 10, 0)
 
         surplus_activations = 0
@@ -457,10 +464,27 @@ class TestFullScenario:
         enabled_ticks = 0
         disabled_ticks = 0
 
+        was_active = False
         for tick in timeseries:
             spot = tick["spot_price"]
             action = ACTION_MAXIMIZE_LOAD if spot < 0 else ACTION_SELF_CONSUMPTION
-            actions = ab.build_immediate_actions(
+
+            # --- Surplus path (state machine) ---
+            if not sc.is_active:
+                sc.state = SurplusState.DEBOUNCING
+                sc._state_entered = time.monotonic() - (sc.activation_delay_s + 1)
+
+            sc_actions = sc.tick(
+                grid_export_w=tick["grid_export_w"], grid_import_w=0.0,
+                ev_vehicles=ev_vehicles, ev_connected=True, current_price=spot,
+            )
+            if sc.is_active and not was_active:
+                surplus_activations += 1
+            was_active = sc.is_active
+            dynamic_limit_calls += len(_dyn_limit_actions(sc_actions))
+
+            # --- Export limit path (ActionBuilder) ---
+            ab_actions = ab.build_immediate_actions(
                 action=action,
                 ev_connected=True,
                 current_price=spot,
@@ -469,17 +493,14 @@ class TestFullScenario:
                 min_price=-0.10,
                 price_spread=0.60,
                 grid_export_w=tick["grid_export_w"],
+                surplus_active=sc.is_active,
                 ev_vehicles=ev_vehicles,
                 ev_charge_plan=None,
                 now=now,
                 predicted_consumption=_HOUSE_LOAD_KW,
                 predicted_solar=tick["solar_kw"],
             )
-
-            if ab.surplus_charger_name:
-                surplus_activations += 1
-            dynamic_limit_calls += len(_dyn_limit_actions(actions))
-            for m in _export_mode_actions(actions):
+            for m in _export_mode_actions(ab_actions):
                 if m["data"]["option"] == "Enabled":
                     enabled_ticks += 1
                 else:

@@ -1,5 +1,6 @@
 """Tests for the Optimizer — price-aware scheduling engine."""
 
+import time
 from datetime import datetime
 from unittest.mock import patch
 
@@ -329,29 +330,39 @@ class TestNegativePriceOptimization:
         assert plan[1]["action"] == ACTION_MAXIMIZE_LOAD
 
     def test_all_evs_enabled_during_negative_prices(self, default_params, default_outputs):
-        """During negative prices, ALL EV chargers should be turned on
-        regardless of ev_connected status."""
-        opt = Optimizer(default_params, default_outputs)
+        """During negative prices, the SurplusController immediately activates
+        and starts BOTH EV chargers (Rule 2: both cars start simultaneously)."""
+        from custom_components.home_energy_management.surplus_controller import (
+            SurplusController,
+        )
+        from custom_components.home_energy_management.const import OUTPUT_EV_CHARGERS
 
-        prices = {
-            "today": [-0.20] * 3 + [0.50] * 21,
-            "tomorrow": [],
-            "currency": "SEK",
-        }
-
-        result = opt.optimize(
-            prices=prices,
-            predicted_consumption=[1.0] * 24,
-            battery_soc=50,
-            ev_connected=False,  # Even when "not connected", we turn on chargers
+        sc = SurplusController(
+            default_params,
+            default_outputs.get(OUTPUT_EV_CHARGERS, []),
+            surplus_switch_cfg={},
         )
 
-        actions = result["immediate_actions"]
-        switch_on_actions = [a for a in actions if a["service"] == "switch.turn_on"]
-        # Both EX90 and Renault Zoe chargers should be turned on
+        ev_vehicles = [
+            {"name": "ex90", "power_w": 0, "vehicle_soc": 50,
+             "vehicle_target_soc": 90, "connected": True},
+            {"name": "renault_zoe", "power_w": 0, "vehicle_soc": 40,
+             "vehicle_target_soc": 90, "connected": True},
+        ]
+
+        actions = sc.tick(
+            grid_export_w=0.0,
+            grid_import_w=0.0,
+            ev_vehicles=ev_vehicles,
+            ev_connected=True,
+            current_price=-0.20,
+        )
+
+        switch_on_actions = [a for a in actions if a.get("service") == "switch.turn_on"]
         entity_ids = [a["entity_id"] for a in switch_on_actions]
         assert "switch.ex90_charger_enabled" in entity_ids
         assert "switch.renault_zoe_charger_enabled" in entity_ids
+        assert sc.is_active
 
     def test_battery_self_consumption_during_negative_prices(
         self, default_params, default_outputs
@@ -756,58 +767,69 @@ class TestSolarSurplusEVCharging:
     def test_evs_charge_on_solar_surplus_during_self_consumption(
         self, default_params, default_outputs
     ):
-        """When exporting heavily to grid during self_consumption,
-        EVs should charge to absorb the surplus."""
-        opt = Optimizer(default_params, default_outputs)
-
-        # Flat mid-range prices → self_consumption (spread < 0.30)
-        prices = {
-            "today": [0.50] * 24,
-            "tomorrow": [],
-            "currency": "SEK",
-        }
-
-        result = opt.optimize(
-            prices=prices,
-            predicted_consumption=[1.0] * 24,
-            battery_soc=50,
-            ev_connected=True,
-            grid_export_power=5000.0,  # 5 kW export = big surplus
+        """When exporting heavily, the SurplusController activates and
+        starts both EV chargers (the LP optimizer no longer owns this)."""
+        from custom_components.home_energy_management.surplus_controller import (
+            SurplusController, SurplusState,
         )
+        from custom_components.home_energy_management.const import OUTPUT_EV_CHARGERS
 
-        actions = result["immediate_actions"]
-        ev_on = [a for a in actions if a["service"] == "switch.turn_on"
+        sc = SurplusController(
+            default_params,
+            default_outputs.get(OUTPUT_EV_CHARGERS, []),
+        )
+        # Pre-warm the activation debounce so we go straight to ACTIVE
+        sc.state = SurplusState.DEBOUNCING
+        sc._state_entered = time.monotonic() - (sc.activation_delay_s + 1)
+
+        ev_vehicles = [
+            {"name": "ex90", "power_w": 0, "vehicle_soc": 50,
+             "vehicle_target_soc": 90, "connected": True},
+            {"name": "renault_zoe", "power_w": 0, "vehicle_soc": 40,
+             "vehicle_target_soc": 90, "connected": True},
+        ]
+        actions = sc.tick(
+            grid_export_w=5000.0,  # 5 kW export
+            grid_import_w=0.0,
+            ev_vehicles=ev_vehicles,
+            ev_connected=True,
+            current_price=0.50,
+        )
+        ev_on = [a for a in actions if a.get("service") == "switch.turn_on"
                  and "charger" in a.get("entity_id", "")]
         assert len(ev_on) >= 1, "EVs should charge when solar surplus is high"
 
     def test_evs_charge_on_surplus_during_expensive_hours(
         self, default_params, default_outputs
     ):
-        """With solar surplus, EVs should charge even during expensive hours
-        to minimise grid export — excess after EV charging is sold."""
-        opt = Optimizer(default_params, default_outputs)
-
-        # Very wide spread: cheap=0.10, expensive=2.00
-        prices = {
-            "today": [2.00] * 12 + [0.10] * 12,
-            "tomorrow": [],
-            "currency": "SEK",
-        }
-
-        result = opt.optimize(
-            prices=prices,
-            predicted_consumption=[1.0] * 24,
-            battery_soc=50,
-            ev_connected=True,
-            grid_export_power=5000.0,
+        """Surplus charging is independent of price — it's owned by
+        SurplusController based on grid export, not LP price classification."""
+        from custom_components.home_energy_management.surplus_controller import (
+            SurplusController, SurplusState,
         )
+        from custom_components.home_energy_management.const import OUTPUT_EV_CHARGERS
 
-        plan = result["hourly_plan"]
-        # LP labels expensive hours as self_consumption (no force-discharge)
-        assert plan[0]["action"] == ACTION_SELF_CONSUMPTION
+        sc = SurplusController(
+            default_params,
+            default_outputs.get(OUTPUT_EV_CHARGERS, []),
+        )
+        sc.state = SurplusState.DEBOUNCING
+        sc._state_entered = time.monotonic() - (sc.activation_delay_s + 1)
 
-        actions = result["immediate_actions"]
-        ev_on = [a for a in actions if a["service"] == "switch.turn_on"
+        ev_vehicles = [
+            {"name": "ex90", "power_w": 0, "vehicle_soc": 50,
+             "vehicle_target_soc": 90, "connected": True},
+            {"name": "renault_zoe", "power_w": 0, "vehicle_soc": 40,
+             "vehicle_target_soc": 90, "connected": True},
+        ]
+        actions = sc.tick(
+            grid_export_w=5000.0,
+            grid_import_w=0.0,
+            ev_vehicles=ev_vehicles,
+            ev_connected=True,
+            current_price=2.00,  # Expensive — but SurplusController doesn't care
+        )
+        ev_on = [a for a in actions if a.get("service") == "switch.turn_on"
                  and "charger" in a.get("entity_id", "")]
         assert len(ev_on) >= 1, "EVs should charge on solar surplus even at expensive prices"
 
@@ -1730,36 +1752,33 @@ class TestEVGridMinimization:
     def test_friday_negative_price_overrides_target(
         self, default_params, default_outputs, ev_vehicle_ex90_at_80
     ):
-        """On Friday, negative prices should override the lower target —
-        charge to full vehicle target (we get paid to consume)."""
-        fake_friday = datetime(2025, 1, 3, 0, 0, 0)  # Friday
-        with patch(
-            "custom_components.home_energy_management.optimizer.datetime"
-        ) as mock_dt:
-            mock_dt.now.return_value = fake_friday
-            mock_dt.side_effect = lambda *a, **kw: datetime(*a, **kw)
+        """Negative prices route through SurplusController, which starts
+        EVs immediately regardless of the weekday/target shaping."""
+        from custom_components.home_energy_management.surplus_controller import (
+            SurplusController,
+        )
+        from custom_components.home_energy_management.const import OUTPUT_EV_CHARGERS
 
-            opt = Optimizer(default_params, default_outputs)
-            prices = {
-                "today": [-0.20] * 3 + [0.50] * 21,
-                "tomorrow": [],
-                "currency": "SEK",
-            }
+        sc = SurplusController(
+            default_params,
+            default_outputs.get(OUTPUT_EV_CHARGERS, []),
+        )
 
-            result = opt.optimize(
-                prices=prices,
-                predicted_consumption=[1.0] * 24,
-                battery_soc=50,
-                ev_connected=True,
-                ev_vehicles=ev_vehicle_ex90_at_80,
-            )
+        ev_vehicles = [
+            {**v, "connected": True} for v in ev_vehicle_ex90_at_80
+        ]
 
-        actions = result["immediate_actions"]
-        # Negative price + SoC=80% < vehicle_target=100% → keep charging
-        ev_start = [a for a in actions if a["service"] == "switch.turn_on"
+        actions = sc.tick(
+            grid_export_w=0.0,
+            grid_import_w=0.0,
+            ev_vehicles=ev_vehicles,
+            ev_connected=True,
+            current_price=-0.20,
+        )
+        ev_start = [a for a in actions if a.get("service") == "switch.turn_on"
                     and "ex90" in a.get("entity_id", "")]
         assert len(ev_start) >= 1, (
-            "Negative price should override weekend target and charge to full"
+            "Negative price should activate surplus and start the EX90 charger"
         )
 
     def test_friday_reduces_scheduled_kwh(

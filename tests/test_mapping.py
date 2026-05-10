@@ -1,203 +1,103 @@
-"""Tests for the variable mapping file — validates structure and completeness."""
+"""Tests for the variable mapping file — structure and completeness."""
+
+from __future__ import annotations
 
 import os
-import pytest
 import yaml
+import pytest
 
 
 MAPPING_PATH = os.path.join(
     os.path.dirname(__file__), "..", "config", "variable_mapping.yaml"
 )
-
 LOCAL_MAPPING_PATH = os.path.join(
     os.path.dirname(__file__), "..", "config", "variable_mapping.local.yaml"
 )
 
 
-@pytest.fixture
-def mapping():
-    """Load the variable mapping YAML file."""
+@pytest.fixture(scope="module")
+def mapping() -> dict:
+    assert os.path.exists(MAPPING_PATH), "variable_mapping.yaml must exist"
     with open(MAPPING_PATH, "r", encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
-@pytest.fixture
-def local_mapping():
-    """Load the local variable mapping YAML file if it exists."""
+@pytest.fixture(scope="module")
+def local_mapping() -> dict:
     if not os.path.exists(LOCAL_MAPPING_PATH):
         pytest.skip("local mapping file not present")
     with open(LOCAL_MAPPING_PATH, "r", encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
-class TestMappingStructure:
-    """Validate the mapping file has the expected structure."""
+def test_top_level_structure(mapping):
+    """All top-level sections, input subsections, and parameter scalars present
+    with sane values."""
+    # Top-level
+    for key in ("inputs", "outputs", "parameters"):
+        assert key in mapping, f"Missing top-level section: {key}"
 
-    def test_file_exists(self):
-        assert os.path.exists(MAPPING_PATH), "variable_mapping.yaml must exist"
+    # Input subsections
+    for key in ("nordpool", "ev_chargers", "sungrow", "smart_meter"):
+        assert key in mapping["inputs"], f"Missing input section: {key}"
 
-    def test_has_inputs_section(self, mapping):
-        assert "inputs" in mapping, "Mapping must have an 'inputs' section"
+    # Nordpool fields + valid entries_per_hour
+    np = mapping["inputs"]["nordpool"]
+    for key in ("current_price", "today_prices_attribute",
+                "tomorrow_prices_attribute", "entries_per_hour"):
+        assert key in np, f"Missing nordpool field: {key}"
+    assert np["entries_per_hour"] in (1, 2, 4)
 
-    def test_has_outputs_section(self, mapping):
-        assert "outputs" in mapping, "Mapping must have an 'outputs' section"
+    # Sungrow input fields
+    sg_in = mapping["inputs"]["sungrow"]
+    for key in ("battery_soc", "battery_power", "pv_power", "house_load"):
+        assert key in sg_in, f"Missing sungrow input field: {key}"
 
-    def test_has_parameters_section(self, mapping):
-        assert "parameters" in mapping, "Mapping must have a 'parameters' section"
-
-    # --- Input sections ---
-
-    def test_inputs_has_nordpool(self, mapping):
-        assert "nordpool" in mapping["inputs"], "Inputs must include 'nordpool'"
-
-    def test_inputs_has_ev_chargers(self, mapping):
-        assert "ev_chargers" in mapping["inputs"], "Inputs must include 'ev_chargers'"
-
-    def test_inputs_has_sungrow(self, mapping):
-        assert "sungrow" in mapping["inputs"], "Inputs must include 'sungrow'"
-
-    def test_inputs_has_smart_meter(self, mapping):
-        assert "smart_meter" in mapping["inputs"], "Inputs must include 'smart_meter'"
-
-    # --- Nordpool required fields ---
-
-    def test_nordpool_has_current_price(self, mapping):
-        np = mapping["inputs"]["nordpool"]
-        assert "current_price" in np, "Nordpool must have 'current_price'"
-
-    def test_nordpool_has_today_attribute(self, mapping):
-        np = mapping["inputs"]["nordpool"]
-        assert "today_prices_attribute" in np
-
-    def test_nordpool_has_tomorrow_attribute(self, mapping):
-        np = mapping["inputs"]["nordpool"]
-        assert "tomorrow_prices_attribute" in np
-
-    def test_nordpool_has_entries_per_hour(self, mapping):
-        np = mapping["inputs"]["nordpool"]
-        assert "entries_per_hour" in np
-        assert np["entries_per_hour"] in (1, 2, 4)
-
-    # --- Sungrow required fields ---
-
-    def test_sungrow_has_battery_soc(self, mapping):
-        sg = mapping["inputs"]["sungrow"]
-        assert "battery_soc" in sg
-
-    def test_sungrow_has_battery_power(self, mapping):
-        sg = mapping["inputs"]["sungrow"]
-        assert "battery_power" in sg
-
-    def test_sungrow_has_pv_power(self, mapping):
-        sg = mapping["inputs"]["sungrow"]
-        assert "pv_power" in sg
-
-    def test_sungrow_has_house_load(self, mapping):
-        sg = mapping["inputs"]["sungrow"]
-        assert "house_load" in sg
-
-    # --- EV Chargers (list-based) ---
-
-    def test_ev_chargers_is_list(self, mapping):
-        ev = mapping["inputs"]["ev_chargers"]
-        assert isinstance(ev, list), "ev_chargers must be a list"
-        assert len(ev) >= 1, "Must have at least one EV charger"
-
-    def test_ev_charger_has_required_fields(self, mapping):
-        for charger in mapping["inputs"]["ev_chargers"]:
-            assert "name" in charger, "Each EV charger must have a 'name'"
-            assert "power" in charger, "Each EV charger must have a 'power' sensor"
-            assert "charger_switch" in charger, "Each EV charger must have a 'charger_switch'"
-
-    # --- Output sections ---
-
-    def test_outputs_has_ev_chargers(self, mapping):
-        assert "ev_chargers" in mapping["outputs"]
-
-    def test_outputs_has_sungrow(self, mapping):
-        assert "sungrow" in mapping["outputs"]
-
-    # --- Sungrow output modes ---
-
-    def test_sungrow_output_has_force_charge(self, mapping):
-        sg = mapping["outputs"]["sungrow"]
-        assert "force_charge" in sg
-
-    def test_sungrow_output_has_force_discharge(self, mapping):
-        sg = mapping["outputs"]["sungrow"]
-        assert "force_discharge" in sg
-
-    def test_sungrow_output_has_self_consumption(self, mapping):
-        sg = mapping["outputs"]["sungrow"]
-        assert "self_consumption" in sg
-
-    def test_sungrow_output_has_soc_limits(self, mapping):
-        sg = mapping["outputs"]["sungrow"]
-        assert "min_soc" in sg
-        assert "max_soc" in sg
-        assert sg["min_soc"] >= 0
-        assert sg["max_soc"] <= 100
-        assert sg["min_soc"] < sg["max_soc"]
-
-    def test_sungrow_output_has_capacity(self, mapping):
-        sg = mapping["outputs"]["sungrow"]
-        assert "capacity_kwh" in sg
-        assert sg["capacity_kwh"] > 0
-
-    # --- EV Charger output actions ---
-
-    def test_ev_charger_output_has_start_stop(self, mapping):
-        ev_list = mapping["outputs"]["ev_chargers"]
-        assert isinstance(ev_list, list), "ev_chargers outputs must be a list"
-        for charger in ev_list:
-            assert "start_charging" in charger, f"Charger {charger.get('name')} must have start_charging"
-            assert "stop_charging" in charger, f"Charger {charger.get('name')} must have stop_charging"
-            assert "service" in charger["start_charging"]
-            assert "service" in charger["stop_charging"]
-
-    # --- Parameters ---
-
-    def test_parameters_has_optimization_interval(self, mapping):
-        params = mapping["parameters"]
-        assert "optimization_interval_minutes" in params
-        assert params["optimization_interval_minutes"] > 0
-
-    def test_parameters_has_planning_horizon(self, mapping):
-        params = mapping["parameters"]
-        assert "planning_horizon_hours" in params
-        assert params["planning_horizon_hours"] > 0
-
-    def test_parameters_has_min_price_spread(self, mapping):
-        params = mapping["parameters"]
-        assert "min_price_spread" in params
-        assert params["min_price_spread"] >= 0
-
-    def test_parameters_has_prediction_settings(self, mapping):
-        params = mapping["parameters"]
-        assert "prediction_history_days" in params
-        assert "prediction_recency_weight" in params
-        assert 0 <= params["prediction_recency_weight"] <= 1
+    # Parameter scalars
+    params = mapping["parameters"]
+    for key in ("optimization_interval_minutes", "planning_horizon_hours",
+                "min_price_spread", "prediction_history_days",
+                "prediction_recency_weight"):
+        assert key in params, f"Missing parameter: {key}"
+    assert params["optimization_interval_minutes"] > 0
+    assert params["planning_horizon_hours"] > 0
+    assert params["min_price_spread"] >= 0
+    assert 0 <= params["prediction_recency_weight"] <= 1
 
 
-class TestLocalMapping:
-    """Validate the local mapping has no CHANGE_ME placeholders."""
+def test_outputs_sungrow(mapping):
+    """Sungrow output has all required modes + valid SoC/capacity bounds."""
+    sg = mapping["outputs"]["sungrow"]
+    for key in ("force_charge", "force_discharge", "self_consumption",
+                "min_soc", "max_soc", "capacity_kwh"):
+        assert key in sg, f"Missing sungrow output: {key}"
+    assert 0 <= sg["min_soc"] < sg["max_soc"] <= 100
+    assert sg["capacity_kwh"] > 0
 
-    def test_no_change_me_in_local(self, local_mapping):
-        """Ensure no CHANGE_ME placeholders remain in the local file."""
-        yaml_str = yaml.dump(local_mapping)
-        assert "CHANGE_ME" not in yaml_str, (
-            "Local mapping still contains CHANGE_ME placeholders"
-        )
 
-    def test_local_has_same_structure(self, local_mapping):
-        """Local mapping should have the same top-level sections."""
-        assert "inputs" in local_mapping
-        assert "outputs" in local_mapping
-        assert "parameters" in local_mapping
+def test_ev_chargers(mapping):
+    """EV chargers list — both input and output entries are well-formed."""
+    ev_in = mapping["inputs"]["ev_chargers"]
+    assert isinstance(ev_in, list) and len(ev_in) >= 1
+    for c in ev_in:
+        for key in ("name", "power", "charger_switch"):
+            assert key in c, f"Charger {c.get('name')} missing input field: {key}"
 
-    def test_local_ev_chargers_configured(self, local_mapping):
-        ev = local_mapping["inputs"]["ev_chargers"]
-        assert isinstance(ev, list)
-        assert len(ev) >= 1
-        for charger in ev:
-            assert "CHANGE_ME" not in str(charger)
+    ev_out = mapping["outputs"]["ev_chargers"]
+    assert isinstance(ev_out, list) and len(ev_out) >= 1
+    for c in ev_out:
+        for key in ("start_charging", "stop_charging"):
+            assert key in c, f"Charger {c.get('name')} missing output field: {key}"
+            assert "service" in c[key]
+
+
+def test_local_mapping_no_placeholders(local_mapping):
+    """Local mapping must have same structure and zero CHANGE_ME placeholders."""
+    for key in ("inputs", "outputs", "parameters"):
+        assert key in local_mapping, f"Local mapping missing section: {key}"
+    yaml_str = yaml.dump(local_mapping)
+    assert "CHANGE_ME" not in yaml_str, (
+        "Local mapping still contains CHANGE_ME placeholders"
+    )
+    ev = local_mapping["inputs"]["ev_chargers"]
+    assert isinstance(ev, list) and len(ev) >= 1

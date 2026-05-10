@@ -622,23 +622,20 @@ class SurplusChargingSensor(EnergyManagementSensor):
 
     @property
     def native_value(self) -> str:
-        data = self.coordinator.data or {}
-        sensor_data = data.get("sensor_data", {})
-        grid_export_w = sensor_data.get("grid_export_power", 0.0)
-
-        action_builder = self.coordinator.optimizer._actions
-        active_charger = getattr(action_builder, "surplus_charger_name", None)
-
-        if active_charger:
+        sc = getattr(self.coordinator, "surplus_controller", None)
+        if sc is not None and sc.is_active:
             return "active"
 
         # Fallback: if the current plan hour explicitly schedules charging
         # while export is above threshold, treat it as active in UI.
+        data = self.coordinator.data or {}
+        sensor_data = data.get("sensor_data", {})
+        grid_export_w = sensor_data.get("grid_export_power", 0.0)
         schedule = data.get("schedule", {})
         ev_plan = schedule.get("ev_charge_schedule", {})
         sched = ev_plan.get("schedule", [])
         charging_now = bool(sched and sched[0].get("charging"))
-        threshold = getattr(action_builder, "solar_surplus_threshold", 0)
+        threshold = sc.threshold_w if sc else 0
         if charging_now and grid_export_w >= threshold > 0:
             return "active"
 
@@ -652,19 +649,13 @@ class SurplusChargingSensor(EnergyManagementSensor):
         ev_plan = schedule.get("ev_charge_schedule", {})
         ev_sched = ev_plan.get("schedule", [])
 
-        action_builder = self.coordinator.optimizer._actions
-        active_charger = getattr(action_builder, "surplus_charger_name", None)
-        threshold = getattr(action_builder, "solar_surplus_threshold", 0)
-        margin = getattr(action_builder, "surplus_safety_margin_w", 0)
-        grace_seconds = getattr(
-            action_builder, "surplus_grid_import_grace_seconds", 0
-        )
-        deficit_since = getattr(action_builder, "_surplus_deficit_since", None)
-        in_grace = deficit_since is not None
-        deficit_elapsed_s: float | None = None
-        if in_grace:
-            import time as _time
-            deficit_elapsed_s = round(_time.monotonic() - deficit_since, 1)
+        sc = getattr(self.coordinator, "surplus_controller", None)
+        status = sc.status() if sc else {}
+        active_chargers = status.get("active_charger_names", [])
+        threshold = status.get("threshold_w", 0)
+        margin = status.get("safety_margin_w", 0)
+        activation_delay_s = status.get("activation_delay_s", 0)
+        deficit_timeout_s = status.get("deficit_timeout_s", 0)
 
         # Optional mirrored smart-meter switch (if configured in outputs)
         switch_state = None
@@ -676,13 +667,15 @@ class SurplusChargingSensor(EnergyManagementSensor):
             switch_state = st.state if st else None
 
         return {
-            "active_charger": active_charger,
+            "state": status.get("state"),
+            "state_elapsed_s": status.get("state_elapsed_s"),
+            "active_chargers": active_chargers,
+            "active_charger": active_chargers[0] if active_chargers else None,
             "grid_export_w": round(sensor_data.get("grid_export_power", 0.0), 1),
             "threshold_w": threshold,
             "surplus_safety_margin_w": margin,
-            "grace_seconds": grace_seconds,
-            "in_grace_period": in_grace,
-            "deficit_elapsed_s": deficit_elapsed_s,
+            "activation_delay_s": activation_delay_s,
+            "deficit_timeout_s": deficit_timeout_s,
             "ev_connected": sensor_data.get("ev_connected", False),
             "charging_now": bool(ev_sched and ev_sched[0].get("charging")),
             "smart_meter_switch_entity": switch_entity_id,

@@ -34,11 +34,14 @@ from .const import (
     MAPPING_INPUTS,
     MAPPING_OUTPUTS,
     MAPPING_PARAMETERS,
+    OUTPUT_EV_CHARGERS,
+    OUTPUT_SMART_METER,
 )
 from .logger import PredictionLogger
 from .optimizer import Optimizer
 from .predictor import ConsumptionPredictor, STREAM_EV, STREAM_HOUSE
 from .solar_predictor import SolarPredictor
+from .surplus_controller import SurplusController
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -76,6 +79,18 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         self.prediction_logger = PredictionLogger(
             max_entries=500,
             log_level=self.params.get("log_level", "info"),
+        )
+
+        # --- Surplus EV charging controller ---
+        # Standalone state machine that owns surplus EV charging end-to-end.
+        # See surplus_controller.py and docs/SURPLUS_ARCHITECTURE.md.
+        ev_chargers_cfg_for_surplus = self.outputs.get(OUTPUT_EV_CHARGERS, [])
+        sm_out = self.outputs.get(OUTPUT_SMART_METER, {}) or {}
+        surplus_switch_cfg = sm_out.get("surplus_charging", {}) if isinstance(sm_out, dict) else {}
+        self.surplus_controller = SurplusController(
+            self.params,
+            ev_chargers_cfg_for_surplus,
+            surplus_switch_cfg=surplus_switch_cfg,
         )
 
         # --- Solar predictor ---
@@ -125,84 +140,73 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
     # ------------------------------------------------------------------
 
     async def _fast_ev_current_update(self, now=None) -> None:
-        """Lightweight loop: adjust the surplus charger’s current.
+        """Lightweight loop: drive the SurplusController state machine.
 
-        Runs every ~30 s independently of the full optimisation cycle.
-        Reads only the grid-export sensor and the active charger’s
-        power, then recalculates the dynamic current limit.
+        Runs every ~10 s independently of the full optimisation cycle.
+        Reads grid export/import + per-EV power, then asks the
+        SurplusController to advance its state machine and produce any
+        HA service calls needed (start/stop chargers, set current limit,
+        flip the surplus indicator switch).
         """
-        action_builder = self.optimizer._actions
-        if not action_builder.surplus_charger_name:
-            # No surplus charger active — try to arm one if solar is sufficient
-            sg = self.inputs.get(INPUT_SUNGROW, {})
-            grid_export_w = self._get_state_float(sg.get("grid_export_power"))
-
-            if grid_export_w >= action_builder.solar_surplus_threshold:
-                # Use latest vehicle data stored from the last full cycle
-                latest_data = self.data or {}
-                sensor_data = latest_data.get("sensor_data", {})
-                ev_vehicles = sensor_data.get("ev_chargers", [])
-                ev_connected = sensor_data.get("ev_connected", False)
-
-                arm_actions = action_builder.try_arm_surplus(
-                    grid_export_w, ev_vehicles, ev_connected,
-                )
-                if arm_actions:
-                    for action in arm_actions:
-                        service = action.get("service", "")
-                        entity_id = action.get("entity_id")
-                        device_id = action.get("device_id")
-                        service_data = action.get("data", {})
-                        if not service or "." not in service:
-                            continue
-                        domain, svc_name = service.split(".", 1)
-                        call_data = dict(service_data)
-                        if device_id and not entity_id:
-                            call_data["device_id"] = device_id
-                        elif entity_id:
-                            call_data["entity_id"] = entity_id
-                        try:
-                            await self.hass.services.async_call(
-                                domain, svc_name, call_data, blocking=True,
-                            )
-                        except Exception as exc:
-                            _LOGGER.error(
-                                "Fast EV arm: failed %s: %s", service, exc
-                            )
-            return
-
-        # Read live grid export
+        # 1. Read grid sensors
         sg = self.inputs.get(INPUT_SUNGROW, {})
         grid_export_w = self._get_state_float(sg.get("grid_export_power"))
+        grid_import_w = self._get_state_float(sg.get("grid_import_power"))
 
-        # Read current charger power for the surplus charger
-        surplus_name = action_builder.surplus_charger_name
-        current_ev_power_w = 0.0
+        # 2. Build EV vehicle snapshots from live sensors so the
+        #    controller can read each charger's current power_w/SoC.
         ev_chargers_cfg = self.inputs.get(INPUT_EV_CHARGERS, [])
-        for charger in (ev_chargers_cfg if isinstance(ev_chargers_cfg, list) else []):
-            if charger.get("name") == surplus_name:
-                raw = self._get_state_float(charger.get("power"))
-                unit = charger.get("power_unit", "W")
-                current_ev_power_w = raw * 1000 if unit == "kW" else raw
-                break
+        if not isinstance(ev_chargers_cfg, list):
+            ev_chargers_cfg = []
 
-        # Ask the action builder to recalculate
-        actions = action_builder.build_surplus_current_update(
-            grid_export_w, current_ev_power_w,
+        ev_vehicles: list[dict[str, Any]] = []
+        any_connected = False
+        for charger in ev_chargers_cfg:
+            name = charger.get("name", "")
+            raw_power = self._get_state_float(charger.get("power"))
+            unit = charger.get("power_unit", "W")
+            power_w = raw_power * 1000 if unit == "kW" else raw_power
+            soc = self._get_state_float(charger.get("vehicle_soc"))
+            target = self._get_state_float(charger.get("vehicle_target_soc"))
+            connected_state = self._get_state_str(charger.get("connected"))
+            connected = connected_state in (
+                "on", "true", "True", "connected", "charging", "ready",
+            ) or power_w > 0
+            if connected:
+                any_connected = True
+            ev_vehicles.append({
+                "name": name,
+                "power_w": power_w,
+                "vehicle_soc": soc,
+                "vehicle_target_soc": target,
+                "connected": connected,
+            })
+
+        # 3. Current spot price (for logging)
+        latest_data = self.data or {}
+        current_price = (latest_data.get("prices") or {}).get("current", 0.0)
+
+        # 4. Tick the state machine
+        actions = self.surplus_controller.tick(
+            grid_export_w=grid_export_w,
+            grid_import_w=grid_import_w,
+            ev_vehicles=ev_vehicles,
+            ev_connected=any_connected,
+            current_price=current_price,
         )
         if not actions:
             return
 
-        # Execute the resulting service calls
+        # 5. Execute the resulting service calls
         for action in actions:
             service = action.get("service", "")
             entity_id = action.get("entity_id")
             device_id = action.get("device_id")
             service_data = action.get("data", {})
 
-            if not service:
+            if not service or "." not in service:
                 continue
-            domain, svc_name = service.split(".", 1) if "." in service else (service, "")
+            domain, svc_name = service.split(".", 1)
             if not svc_name:
                 continue
 
@@ -217,7 +221,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                     domain, svc_name, call_data, blocking=True,
                 )
             except Exception as exc:
-                _LOGGER.error("Fast EV update: failed %s: %s", service, exc)
+                _LOGGER.error("SurplusController: failed %s: %s", service, exc)
 
     # ------------------------------------------------------------------
     # Auto-replan helpers
@@ -320,6 +324,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 grid_export_power=sensor_data.get("grid_export_power", 0.0),
                 ev_vehicles=sensor_data.get("ev_chargers", []),
                 predicted_solar=predicted_solar,
+                surplus_active=self.surplus_controller.is_active,
             )
 
             # 7. Execute immediate actions

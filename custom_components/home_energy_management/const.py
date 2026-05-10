@@ -98,11 +98,14 @@ DEFAULT_SOLAR_SURPLUS_THRESHOLD = 2000
 # buffer: brief dips smaller than this margin won't arm the deficit
 # grace timer.
 DEFAULT_SURPLUS_SAFETY_MARGIN_W = 200
-# Grace period (seconds) — how long the surplus deficit must persist
-# before the active surplus charger is stopped.  During the grace
-# window the charger is clamped to its minimum current to limit grid
-# draw while waiting for solar to recover.  Recommended: 30–120 s.
+# Grace period (seconds) — kept for backward compatibility with existing
+# mappings that use surplus_grid_import_grace_seconds.
 DEFAULT_SURPLUS_GRID_IMPORT_GRACE_S = 60
+# Fine-grained surplus timing (preferred over the old grace param):
+#   Y — seconds the export must be sustained before activating
+#   Z — seconds the deficit must persist before deactivating
+DEFAULT_SURPLUS_ACTIVATION_DELAY_S = 60
+DEFAULT_SURPLUS_DEFICIT_TIMEOUT_S = 60
 
 # --- Negative-price escalation ---
 # When spot price < 0 and solar surplus exists, the integration tries

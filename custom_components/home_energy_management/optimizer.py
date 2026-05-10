@@ -82,6 +82,7 @@ class Optimizer:
         grid_export_power: float = 0.0,
         ev_vehicles: list[dict[str, Any]] | None = None,
         predicted_solar: list[float] | None = None,
+        surplus_active: bool = False,
     ) -> dict[str, Any]:
         """Produce an hour-by-hour schedule and immediate actions.
 
@@ -167,6 +168,7 @@ class Optimizer:
                 min_price=pw.min,
                 price_spread=pw.spread,
                 grid_export_w=grid_export_power,
+                surplus_active=surplus_active,
                 ev_vehicles=ev_vehicles or [],
                 ev_charge_plan=ev_charge_plan,
                 now=now,

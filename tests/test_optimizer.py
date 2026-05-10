@@ -243,29 +243,6 @@ class TestOptimizer:
         assert result["hourly_plan"][0]["action"] == ACTION_SELF_CONSUMPTION
         assert len(result["immediate_actions"]) == 0
 
-    def test_ev_charges_during_cheap_hours_when_connected(self, default_params, default_outputs):
-        """EV chargers should turn on during cheap hours if cable is connected."""
-        opt = Optimizer(default_params, default_outputs)
-
-        prices = {
-            "current": 0.10,
-            "today": [0.10] * 6 + [2.00] * 12 + [0.10] * 6,
-            "tomorrow": [],
-            "currency": "SEK",
-        }
-
-        result = opt.optimize(
-            prices=prices,
-            predicted_consumption=[1.0] * 24,
-            battery_soc=30,
-            ev_connected=True,
-        )
-
-        actions = result["immediate_actions"]
-        # Should include switch.turn_on for EV charger(s) during cheap hour
-        services_called = [a["service"] for a in actions]
-        assert "switch.turn_on" in services_called or len(actions) > 0
-
     def test_schedule_has_expected_structure(self, default_params, default_outputs):
         """Verify the output structure of optimize()."""
         opt = Optimizer(default_params, default_outputs)

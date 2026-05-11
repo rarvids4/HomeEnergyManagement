@@ -63,6 +63,10 @@ tests/test_solar_timeseries.py
 
 # --- Debug test files (personal, not part of the test suite) ---
 tests/test_lp_debug.py
+tests/TEST_INVENTORY.md
+
+# --- Battery / inverter diagnostic scripts (personal tooling) ---
+diagnose_battery.py
 
 # --- Terminal SoC analysis scripts (personal tooling) ---
 test_terminal_soc.py

@@ -56,6 +56,14 @@ class ActionBuilder:
     def __init__(self, params: dict[str, Any], outputs: dict[str, Any]) -> None:
         self.enable_battery = params.get("enable_battery_control", True)
         self.enable_charger = params.get("enable_charger_control", True)
+        # When True, every cycle that expects discharge re-writes the
+        # inverter's max-discharge cap to its configured maximum. This
+        # protects against external scripts leaving the cap low. Default
+        # OFF — user opted out; the integration will not nudge the
+        # discharge limit on its own.
+        self.enforce_discharge_max = params.get(
+            "enforce_battery_discharge_max", False
+        )
         self.outputs = outputs
         self.min_charge_power_w = params.get(
             "min_charge_power_w", DEFAULT_MIN_CHARGE_POWER_W
@@ -384,6 +392,10 @@ class ActionBuilder:
                 })
             actions.extend(self._stop_forced_cmd(sg_out))
             self._set_forced_power(sg_out, actions, 0)
+            # Optionally re-assert the battery max-discharge cap so a
+            # previously lowered value can't silently throttle the battery.
+            if self.enforce_discharge_max:
+                self._set_discharge_power_max(sg_out, actions)
 
         else:
             # Default: self-consumption
@@ -396,6 +408,8 @@ class ActionBuilder:
                 })
             actions.extend(self._stop_forced_cmd(sg_out))
             self._set_forced_power(sg_out, actions, 0)
+            if self.enforce_discharge_max:
+                self._set_discharge_power_max(sg_out, actions)
 
         return actions
 
@@ -413,6 +427,33 @@ class ActionBuilder:
                 "entity_id": pwr_cfg["entity_id"],
                 "data": {"value": value},
             })
+
+    @staticmethod
+    def _set_discharge_power_max(
+        sg_out: dict[str, Any],
+        actions: list[dict[str, Any]],
+    ) -> None:
+        """Crank battery max-discharge power to the configured maximum.
+
+        Self-consumption mode silently produces no battery output if the
+        inverter's max-discharge register has been left low (e.g. by a
+        previous "limited self-consumption" call or external script).
+        Calling this every cycle that expects discharge guarantees the
+        battery can supply the house load.
+        """
+        pwr_cfg = sg_out.get("set_discharge_power", {})
+        if pwr_cfg.get("service") and pwr_cfg.get("entity_id"):
+            value = pwr_cfg.get("max", 5000)
+            actions.append({
+                "service": pwr_cfg["service"],
+                "entity_id": pwr_cfg["entity_id"],
+                "data": {"value": value},
+            })
+            _LOGGER.info(
+                "battery: writing %s = %d W (max-discharge cap) to allow "
+                "full self-consumption discharge",
+                pwr_cfg["entity_id"], value,
+            )
 
     @staticmethod
     def _stop_forced_cmd(sg_out: dict[str, Any]) -> list[dict[str, Any]]:

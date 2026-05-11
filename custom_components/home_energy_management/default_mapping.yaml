@@ -58,9 +58,11 @@ inputs:
     battery_soc: "sensor.CHANGE_ME_battery_level"
     # Signed battery power: positive = charging, negative = discharging (W)
     battery_power: "sensor.CHANGE_ME_signed_battery_power"
-    # AC output power from the inverter (W). Use the inverter's AC active power
-    # output sensor, not the DC panel power — e.g. total_active_power for Sungrow.
-    pv_power: "sensor.CHANGE_ME_total_active_power"
+    # Total PV power (W). Use the inverter's gross DC PV sensor
+    # (e.g. Sungrow `total_dc_power`) so the optimiser sees true
+    # generation, not the AC output reduced by inverter losses or
+    # battery charging.
+    pv_power: "sensor.CHANGE_ME_total_dc_power"
     grid_import_power: "sensor.CHANGE_ME_import_power"
     grid_export_power: "sensor.CHANGE_ME_export_power"
     house_load: "sensor.CHANGE_ME_load_power"

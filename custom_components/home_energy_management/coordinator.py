@@ -168,10 +168,19 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             power_w = raw_power * 1000 if unit == "kW" else raw_power
             soc = self._get_state_float(charger.get("vehicle_soc"))
             target = self._get_state_float(charger.get("vehicle_target_soc"))
-            connected_state = self._get_state_str(charger.get("connected"))
-            connected = connected_state in (
-                "on", "true", "True", "connected", "charging", "ready",
-            ) or power_w > 0
+            # Mirror the slow-loop detection in _read_sensors: a vehicle is
+            # "connected" when the charger reports a plugged-in status OR
+            # the charger switch is on OR it's already drawing power.
+            # (The mapping has no "connected" key — earlier code read it
+            # blindly, so plugged-in-but-idle cars like the Zoe were
+            # treated as disconnected and never surplus-charged.)
+            status = self._get_state_str(charger.get("status"))
+            switch_state = self._get_state_str(charger.get("charger_switch"))
+            connected = (
+                status in ("charging", "awaiting_start", "connected", "ready")
+                or switch_state == "on"
+                or power_w > 0
+            )
             if connected:
                 any_connected = True
             ev_vehicles.append({

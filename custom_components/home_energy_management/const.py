@@ -1,7 +1,7 @@
 """Constants for Home Energy Management."""
 
 DOMAIN = "home_energy_management"
-PLATFORMS = ["sensor"]
+PLATFORMS = ["sensor", "switch"]
 
 # Config keys
 CONF_MAPPING_PATH = "mapping_path"

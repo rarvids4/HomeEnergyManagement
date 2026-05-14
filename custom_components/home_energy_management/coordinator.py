@@ -110,6 +110,13 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         # to the datetime of the manual override.
         self._manual_overrides: dict[str, Any] = {}
 
+        # --- HEM-owned per-charger override flags ---
+        # Toggled by switch entities created in switch.py. When True for
+        # a charger name, _execute_actions skips ANY service call that
+        # targets that charger's start/stop entity (HEM hands control to
+        # the user). Persisted across restarts via RestoreEntity.
+        self.charger_overrides: dict[str, bool] = {}
+
         # --- Auto-replan: re-run optimisation when UI settings change ---
         self._unsub_state_listeners: list = []
         watched = self._collect_watched_entities()
@@ -683,6 +690,28 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             domain, service_name = service.split(".", 1) if "." in service else (service, "")
             if not service_name:
                 continue
+
+            # --- HEM-owned per-charger override ---
+            # If the user has flipped the override switch for a charger,
+            # skip ANY action that targets its start/stop entity.
+            if entity_id and self.charger_overrides:
+                ev_chargers_out = self.outputs.get(OUTPUT_EV_CHARGERS, []) or []
+                overridden = False
+                for ch in ev_chargers_out:
+                    name = ch.get("name")
+                    if not name or not self.charger_overrides.get(name):
+                        continue
+                    start_eid = (ch.get("start_charging") or {}).get("entity_id")
+                    stop_eid = (ch.get("stop_charging") or {}).get("entity_id")
+                    if entity_id in (start_eid, stop_eid):
+                        _LOGGER.info(
+                            "Skipping %s on %s — HEM override active for %s",
+                            service, entity_id, name,
+                        )
+                        overridden = True
+                        break
+                if overridden:
+                    continue
 
             # --- Manual override detection ---
             # If this is a switch.turn_on and the switch is currently

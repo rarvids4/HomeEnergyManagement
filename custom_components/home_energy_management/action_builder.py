@@ -329,6 +329,7 @@ class ActionBuilder:
 
         elif action == ACTION_CHARGE_BATTERY:
             inverter_max = sg_out.get("set_forced_power", {}).get("max", 5000)
+            # Limit grid import for forced battery charging
             grid_limit = 4500
             # Clamp SoC to target_soc (do not overcharge)
             current_soc = sg_out.get("soc", 0)

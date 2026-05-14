@@ -69,12 +69,19 @@ class ChargerOverrideSwitch(CoordinatorEntity, SwitchEntity, RestoreEntity):
         super().__init__(coordinator)
         self._charger_name = charger_name
         self._attr_unique_id = f"{entry.entry_id}_override_{charger_name}"
-        self._attr_name = f"{friendly_name} Override"
+        # With has_entity_name=True the device name is prepended automatically,
+        # so just use "Override" as the entity name. Final entity friendly name
+        # becomes e.g. "Volvo EX90 Override".
+        self._attr_name = "Override"
+        # Per-charger sub-device, linked to the main HEM hub device via_device.
+        # This makes the HA UI render a separate card per car under the
+        # Home Energy Management integration page.
         self._attr_device_info = {
-            "identifiers": {(DOMAIN, entry.entry_id)},
-            "name": "Home Energy Management",
-            "manufacturer": "Custom",
-            "model": "Energy Optimizer",
+            "identifiers": {(DOMAIN, entry.entry_id, "charger", charger_name)},
+            "name": friendly_name,
+            "manufacturer": "Home Energy Management",
+            "model": "EV Charger",
+            "via_device": (DOMAIN, entry.entry_id),
         }
         # Default OFF until restored
         self.coordinator.charger_overrides.setdefault(charger_name, False)

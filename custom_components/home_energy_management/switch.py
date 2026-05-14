@@ -1,9 +1,11 @@
 """Switch platform for Home Energy Management.
 
 Exposes one HEM-owned override switch per configured EV charger.
-When ON, the coordinator skips ALL service calls (start/stop) that
-target that charger — control is handed to the user. Toggle OFF to
-release control back to HEM.
+When ON, the coordinator FORCE-CHARGES that charger every cycle:
+any stop_charging action is dropped, a start_charging action is
+injected, and the dynamic current limit (if configured) is raised
+to its maximum. The user-manual-off cooldown is also bypassed.
+Toggle OFF to return the charger to normal optimisation control.
 
 State is restored across HA restarts via RestoreEntity.
 """
@@ -52,7 +54,7 @@ async def async_setup_entry(
 class ChargerOverrideSwitch(CoordinatorEntity, SwitchEntity, RestoreEntity):
     """Per-charger HEM override.
 
-    ON  → HEM stops issuing start/stop for this charger.
+    ON  → HEM force-charges this charger every cycle (max current).
     OFF → HEM controls the charger as planned.
     """
 

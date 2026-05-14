@@ -112,9 +112,12 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
 
         # --- HEM-owned per-charger override flags ---
         # Toggled by switch entities created in switch.py. When True for
-        # a charger name, _execute_actions skips ANY service call that
-        # targets that charger's start/stop entity (HEM hands control to
-        # the user). Persisted across restarts via RestoreEntity.
+        # a charger name, _execute_actions FORCE-CHARGES that charger
+        # every cycle: any stop_charging action is dropped, a
+        # start_charging action is injected, the dynamic current limit is
+        # raised to max (if configured), and the user-manual-off cooldown
+        # is bypassed for that charger's start entity.
+        # Persisted across restarts via RestoreEntity.
         self.charger_overrides: dict[str, bool] = {}
 
         # --- Auto-replan: re-run optimisation when UI settings change ---
@@ -210,6 +213,14 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             ev_connected=any_connected,
             current_price=current_price,
         )
+
+        # 4b. Apply HEM force-charge override even when SurplusController
+        # produced no actions — we still want to keep overridden
+        # chargers ON every fast tick.
+        actions, _force_start_eids = self._apply_charger_overrides(
+            list(actions or [])
+        )
+
         if not actions:
             return
 
@@ -669,14 +680,93 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
     # Action execution
     # ------------------------------------------------------------------
 
+    def _apply_charger_overrides(
+        self, actions: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        """Force-charge transform applied to any action list.
+
+        For each charger whose override switch is ON:
+          - drop any stop_charging action
+          - inject start_charging (always — even if charger switch is
+            already off; HA will no-op a redundant turn_on)
+          - replace any dynamic-limit action with max_current
+
+        Returns the (possibly mutated) action list AND the set of
+        start entity_ids that the manual-user-off cooldown should
+        bypass.
+        """
+        force_start_eids: set[str] = set()
+        if not self.charger_overrides:
+            return actions, force_start_eids
+
+        ev_chargers_out = self.outputs.get(OUTPUT_EV_CHARGERS, []) or []
+        for ch in ev_chargers_out:
+            name = ch.get("name")
+            if not name or not self.charger_overrides.get(name):
+                continue
+            start_cfg = ch.get("start_charging") or {}
+            stop_cfg = ch.get("stop_charging") or {}
+            start_eid = start_cfg.get("entity_id")
+            stop_eid = stop_cfg.get("entity_id")
+
+            # Drop any stop_charging actions for this charger.
+            if stop_eid:
+                actions = [
+                    a for a in actions
+                    if a.get("entity_id") != stop_eid
+                ]
+
+            # Inject start_charging if not already present.
+            if start_cfg.get("service") and start_eid:
+                already = any(
+                    a.get("entity_id") == start_eid
+                    and a.get("service") == start_cfg["service"]
+                    for a in actions
+                )
+                if not already:
+                    actions.append({
+                        "service": start_cfg["service"],
+                        "entity_id": start_eid,
+                        "data": {},
+                    })
+                force_start_eids.add(start_eid)
+                _LOGGER.info(
+                    "HEM override ACTIVE for %s — force-charging "
+                    "(start=%s)", name, start_eid,
+                )
+
+            # Raise dynamic current limit to max if configured.
+            dyn_cfg = ch.get("set_dynamic_limit") or {}
+            dyn_service = dyn_cfg.get("service")
+            dyn_device = dyn_cfg.get("device_id")
+            if dyn_service and dyn_device:
+                max_current = dyn_cfg.get("max_current", 32)
+                actions = [
+                    a for a in actions
+                    if not (
+                        a.get("service") == dyn_service
+                        and a.get("device_id") == dyn_device
+                    )
+                ]
+                actions.append({
+                    "service": dyn_service,
+                    "device_id": dyn_device,
+                    "data": {"current": max_current},
+                })
+
+        return actions, force_start_eids
+
     async def _execute_actions(self, schedule: dict) -> None:
         """Execute the immediate actions from the optimizer schedule."""
         from datetime import datetime, timedelta
 
-        actions = schedule.get("immediate_actions", [])
+        actions = list(schedule.get("immediate_actions", []))
         cooldown = timedelta(minutes=max(
             self.params.get("optimization_interval_minutes", 15) * 2, 30
         ))
+
+        # Apply HEM-owned per-charger override (force-charge).
+        actions, force_start_eids = self._apply_charger_overrides(actions)
 
         for action in actions:
             service = action.get("service")
@@ -691,35 +781,20 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             if not service_name:
                 continue
 
-            # --- HEM-owned per-charger override ---
-            # If the user has flipped the override switch for a charger,
-            # skip ANY action that targets its start/stop entity.
-            if entity_id and self.charger_overrides:
-                ev_chargers_out = self.outputs.get(OUTPUT_EV_CHARGERS, []) or []
-                overridden = False
-                for ch in ev_chargers_out:
-                    name = ch.get("name")
-                    if not name or not self.charger_overrides.get(name):
-                        continue
-                    start_eid = (ch.get("start_charging") or {}).get("entity_id")
-                    stop_eid = (ch.get("stop_charging") or {}).get("entity_id")
-                    if entity_id in (start_eid, stop_eid):
-                        _LOGGER.info(
-                            "Skipping %s on %s — HEM override active for %s",
-                            service, entity_id, name,
-                        )
-                        overridden = True
-                        break
-                if overridden:
-                    continue
-
             # --- Manual override detection ---
             # If this is a switch.turn_on and the switch is currently
             # OFF because a *user* manually turned it off, respect
             # their choice for a cooldown period (2× optimisation
             # interval, minimum 30 min).
+            # NOTE: bypassed for chargers whose HEM override switch is ON
+            # (force-charge mode wins over the user-cooldown).
             is_switch_on = (domain == "switch" and service_name == "turn_on")
-            if is_switch_on and entity_id and entity_id.startswith("switch."):
+            if (
+                is_switch_on
+                and entity_id
+                and entity_id.startswith("switch.")
+                and entity_id not in force_start_eids
+            ):
                 state = self.hass.states.get(entity_id)
                 if state and state.state == "off":
                     ctx = state.context

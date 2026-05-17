@@ -317,7 +317,6 @@ class TestNegativePriceOptimization:
         sc = SurplusController(
             default_params,
             default_outputs.get(OUTPUT_EV_CHARGERS, []),
-            surplus_switch_cfg={},
         )
 
         ev_vehicles = [

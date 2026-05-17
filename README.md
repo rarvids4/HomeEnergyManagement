@@ -456,7 +456,7 @@ When clouds or a sudden load cause net grid import, a **grace period** holds the
 | `fast_ev_update_interval` | int | `10` | Interval (s) for the fast surplus tracking loop. Lower = more responsive; higher = fewer HA service calls |
 | `neg_price_ev_export_limit_w` | int | `2100` | Inverter export cap (W) when an EV is absorbing surplus during negative spot prices. Provides headroom for charger ramp-up. Falls back to `0 W` if no EV is available |
 
-> **Live status:** the `sensor.home_energy_management_surplus_charging` entity exposes `active_charger`, `grid_export_w`, `in_grace_period`, `deficit_elapsed_s`, and the configured thresholds as attributes for dashboard monitoring.
+> **Live status:** the `sensor.home_energy_management_surplus_charging` entity (display name **Surplus Mode**) is the single source of truth for solar-surplus EV charging. It reports `active` / `inactive` and exposes `state`, `active_chargers`, `grid_export_w`, `grid_import_w`, `state_elapsed_s`, `threshold_w`, `surplus_safety_margin_w`, `activation_delay_s`, `deficit_timeout_s`, and `ev_connected` as attributes for dashboard monitoring. The integration owns the EV current itself (re-issued every 10 s) and never delegates to any external smart-meter or Easee "surplus" switch.
 
 #### EV Night Preference
 

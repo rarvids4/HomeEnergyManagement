@@ -161,15 +161,10 @@ class NextActionSensor(EnergyManagementSensor):
             attrs["price"] = plan[0].get("price", 0)
             attrs["predicted_consumption"] = plan[0].get("predicted_consumption_kwh", 0)
 
-        # Negative-price surplus escalation status
-        try:
-            action_builder = self.coordinator.optimizer._actions
-            neg_status = getattr(action_builder, "neg_price_status", {})
-            if neg_status:
-                attrs["neg_price_surplus_status"] = neg_status
-        except (AttributeError, TypeError):
-            pass
-
+        # Note: surplus state is intentionally NOT mirrored here — the
+        # SurplusChargingSensor ("Surplus Mode") is the single source of
+        # truth for solar-surplus charging.  Any negative-price export-
+        # limit details live in the optimizer log.
         return attrs
 
     @property
@@ -615,56 +610,36 @@ class PredictionAccuracySensor(EnergyManagementSensor):
 
 
 class SurplusChargingSensor(EnergyManagementSensor):
-    """Shows whether solar surplus charging is currently active."""
+    """Single source of truth for solar-surplus EV charging state.
+
+    Reports the SurplusController state machine: ``active`` (or
+    ``stopping``) whenever the controller is actively driving the
+    chargers, ``inactive`` otherwise. The entity’s display name is
+    "Surplus Mode" — there is no other surplus indicator in the
+    integration.
+    """
 
     def __init__(self, coordinator, entry):
-        super().__init__(coordinator, entry, "surplus_charging", "Surplus Charging")
+        # Keep the ``surplus_charging`` key so existing dashboards that
+        # reference ``sensor.home_energy_management_surplus_charging``
+        # keep working; only the friendly name changes to "Surplus Mode".
+        super().__init__(coordinator, entry, "surplus_charging", "Surplus Mode")
 
     @property
     def native_value(self) -> str:
         sc = getattr(self.coordinator, "surplus_controller", None)
         if sc is not None and sc.is_active:
             return "active"
-
-        # Fallback: if the current plan hour explicitly schedules charging
-        # while export is above threshold, treat it as active in UI.
-        data = self.coordinator.data or {}
-        sensor_data = data.get("sensor_data", {})
-        grid_export_w = sensor_data.get("grid_export_power", 0.0)
-        schedule = data.get("schedule", {})
-        ev_plan = schedule.get("ev_charge_schedule", {})
-        sched = ev_plan.get("schedule", [])
-        charging_now = bool(sched and sched[0].get("charging"))
-        threshold = sc.threshold_w if sc else 0
-        if charging_now and grid_export_w >= threshold > 0:
-            return "active"
-
         return "inactive"
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
         data = self.coordinator.data or {}
         sensor_data = data.get("sensor_data", {})
-        schedule = data.get("schedule", {})
-        ev_plan = schedule.get("ev_charge_schedule", {})
-        ev_sched = ev_plan.get("schedule", [])
 
         sc = getattr(self.coordinator, "surplus_controller", None)
         status = sc.status() if sc else {}
         active_chargers = status.get("active_charger_names", [])
-        threshold = status.get("threshold_w", 0)
-        margin = status.get("safety_margin_w", 0)
-        activation_delay_s = status.get("activation_delay_s", 0)
-        deficit_timeout_s = status.get("deficit_timeout_s", 0)
-
-        # Optional mirrored smart-meter switch (if configured in outputs)
-        switch_state = None
-        sm_out = self.coordinator.outputs.get("smart_meter", {})
-        sw_cfg = sm_out.get("surplus_charging", {}) if isinstance(sm_out, dict) else {}
-        switch_entity_id = sw_cfg.get("entity_id") if isinstance(sw_cfg, dict) else None
-        if switch_entity_id:
-            st = self.coordinator.hass.states.get(switch_entity_id)
-            switch_state = st.state if st else None
 
         return {
             "state": status.get("state"),
@@ -672,14 +647,12 @@ class SurplusChargingSensor(EnergyManagementSensor):
             "active_chargers": active_chargers,
             "active_charger": active_chargers[0] if active_chargers else None,
             "grid_export_w": round(sensor_data.get("grid_export_power", 0.0), 1),
-            "threshold_w": threshold,
-            "surplus_safety_margin_w": margin,
-            "activation_delay_s": activation_delay_s,
-            "deficit_timeout_s": deficit_timeout_s,
+            "grid_import_w": round(sensor_data.get("grid_import_power", 0.0), 1),
+            "threshold_w": status.get("threshold_w", 0),
+            "surplus_safety_margin_w": status.get("safety_margin_w", 0),
+            "activation_delay_s": status.get("activation_delay_s", 0),
+            "deficit_timeout_s": status.get("deficit_timeout_s", 0),
             "ev_connected": sensor_data.get("ev_connected", False),
-            "charging_now": bool(ev_sched and ev_sched[0].get("charging")),
-            "smart_meter_switch_entity": switch_entity_id,
-            "smart_meter_switch_state": switch_state,
         }
 
     @property

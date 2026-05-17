@@ -35,7 +35,6 @@ from .const import (
     MAPPING_OUTPUTS,
     MAPPING_PARAMETERS,
     OUTPUT_EV_CHARGERS,
-    OUTPUT_SMART_METER,
 )
 from .logger import PredictionLogger
 from .optimizer import Optimizer
@@ -84,13 +83,14 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         # --- Surplus EV charging controller ---
         # Standalone state machine that owns surplus EV charging end-to-end.
         # See surplus_controller.py and docs/SURPLUS_ARCHITECTURE.md.
+        # The controller drives each charger's current setpoint itself via
+        # ``set_dynamic_limit`` on every fast-loop tick — it never delegates
+        # surplus control to the charger hardware (Easee "smart" / smart-meter
+        # surplus switches are intentionally left untouched).
         ev_chargers_cfg_for_surplus = self.outputs.get(OUTPUT_EV_CHARGERS, [])
-        sm_out = self.outputs.get(OUTPUT_SMART_METER, {}) or {}
-        surplus_switch_cfg = sm_out.get("surplus_charging", {}) if isinstance(sm_out, dict) else {}
         self.surplus_controller = SurplusController(
             self.params,
             ev_chargers_cfg_for_surplus,
-            surplus_switch_cfg=surplus_switch_cfg,
         )
 
         # --- Solar predictor ---
@@ -131,11 +131,21 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             self._unsub_state_listeners.append(unsub)
 
         # --- Fast EV surplus current adjustment loop ---
-        # Runs every ~30 s to re-read grid export and adjust the
-        # active surplus charger’s current.  Lightweight — no optimizer.
-        fast_interval_s = self.params.get(
+        # Runs every ``fast_ev_update_interval`` seconds (default & ceiling
+        # 10 s) to re-read grid export and re-apply each active charger's
+        # current setpoint.  Per the surplus architecture (Rule 3) the
+        # controller MUST re-issue the limit at least every 10 s so the
+        # cars never draw from the grid while we're tracking solar.
+        configured_interval = int(self.params.get(
             "fast_ev_update_interval", DEFAULT_FAST_EV_UPDATE_INTERVAL
-        )
+        ))
+        fast_interval_s = max(1, min(configured_interval, DEFAULT_FAST_EV_UPDATE_INTERVAL))
+        if configured_interval != fast_interval_s:
+            _LOGGER.warning(
+                "fast_ev_update_interval=%ds is above the 10s ceiling — "
+                "clamping so the surplus controller keeps the cars off the grid",
+                configured_interval,
+            )
         self._unsub_fast_ev = async_track_time_interval(
             hass,
             self._fast_ev_current_update,

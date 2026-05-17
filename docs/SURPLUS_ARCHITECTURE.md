@@ -83,7 +83,10 @@ INACTIVE                                  STOPPING
 
 Implementation:
 - `INACTIVE`: export ≥ `threshold_w` → enter `DEBOUNCING`, start timer.
-- `DEBOUNCING`: export drops → reset to `INACTIVE`. Timer reaches `Y` → enter `ACTIVE`.
+- `DEBOUNCING`: brief sub-threshold dips are **tolerated** so cloud-edge
+  flicker doesn’t restart the timer forever. The timer is only reset
+  (back to `INACTIVE`) when export drops **below** `threshold_w − safety_margin_w`
+  (hysteresis). Timer reaches `Y` → enter `ACTIVE`.
 - Negative spot price short-circuits the debounce and activates immediately.
 
 ### Rule 2 — CHARGING (OR condition)
@@ -107,8 +110,14 @@ amps_per_charger  = clamp(amps_per_charger, min_current, max_current)
 ```
 
 Solar is split equally among active chargers. Each is clamped to its hardware
-range. The controller fires every fast-loop tick, so as solar wobbles the
-limit follows in real time.
+range. **The controller fires every fast-loop tick (at most every 10 s,
+clamped in [coordinator.py](../custom_components/home_energy_management/coordinator.py)),
+so as solar wobbles the limit follows in real time — the cars never draw
+from the grid.**
+
+> The integration **never** delegates surplus control to the charger
+> hardware (Easee "smart" / "surplus" mode) or any smart-meter surplus
+> switch. It re-issues the current setpoint itself on every tick.
 
 ### Rule 4 — DEACTIVATION TRIGGER
 > If the power is still drawn from the grid even with very low charging power set to the cars, the surplus mode is deactivated after **Z seconds** (`deficit_timeout_s`).

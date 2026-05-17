@@ -201,6 +201,103 @@ def _make_active(sc: SurplusController, charger_names: list[str]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# 0. Surplus controller invariants (no external switch, hysteresis, cadence)
+# ---------------------------------------------------------------------------
+
+class TestSurplusControllerInvariants:
+    """Architectural invariants the surplus controller must always honour."""
+
+    def test_no_external_surplus_switch_action_ever_emitted(
+        self, generic_params, generic_outputs, ev_vehicles,
+    ):
+        """The controller must NEVER toggle a smart-meter / Easee surplus
+        switch — it owns charger current itself via set_dynamic_limit."""
+        sc = _build_sc(generic_params, generic_outputs)
+
+        # Activate
+        sc.state = SurplusState.DEBOUNCING
+        sc._state_entered = time.monotonic() - (sc.activation_delay_s + 1)
+        actions_on = sc.tick(
+            grid_export_w=6_000.0, grid_import_w=0.0,
+            ev_vehicles=ev_vehicles, ev_connected=True, current_price=0.50,
+        )
+
+        # Deactivate (deficit + Z elapsed)
+        sc.state = SurplusState.STOPPING
+        sc._state_entered = time.monotonic() - (sc.deficit_timeout_s + 1)
+        actions_off = sc.tick(
+            grid_export_w=0.0, grid_import_w=500.0,
+            ev_vehicles=ev_vehicles, ev_connected=True, current_price=0.50,
+        )
+
+        forbidden_entities = {
+            "switch.qplmlspv_surplus_charging",
+            "switch.surplus_charging",
+        }
+        for label, actions in (("activation", actions_on), ("deactivation", actions_off)):
+            for action in actions:
+                eid = action.get("entity_id", "")
+                assert eid not in forbidden_entities, (
+                    f"{label}: controller emitted forbidden external "
+                    f"surplus-switch action: {action}"
+                )
+                # And no charger action should be flipping a surplus-named switch
+                assert "surplus" not in eid, (
+                    f"{label}: controller emitted unexpected surplus-named entity {eid}"
+                )
+
+    def test_debounce_tolerates_brief_dips(
+        self, generic_params, generic_outputs, ev_vehicles,
+    ):
+        """A brief dip above (threshold − safety_margin) must NOT reset the debounce."""
+        sc = _build_sc(generic_params, generic_outputs)
+        threshold = sc.threshold_w
+        margin = sc.safety_margin_w
+
+        # Tick 1: above threshold → enter DEBOUNCING
+        sc.tick(
+            grid_export_w=threshold + 500, grid_import_w=0.0,
+            ev_vehicles=ev_vehicles, ev_connected=True, current_price=0.50,
+        )
+        assert sc.state is SurplusState.DEBOUNCING
+        entered_at = sc._state_entered
+
+        # Tick 2: brief dip — still ABOVE (threshold - safety_margin)
+        sc.tick(
+            grid_export_w=threshold - margin / 2, grid_import_w=0.0,
+            ev_vehicles=ev_vehicles, ev_connected=True, current_price=0.50,
+        )
+        assert sc.state is SurplusState.DEBOUNCING, (
+            "Brief dip above hysteresis floor must NOT reset debounce"
+        )
+        assert sc._state_entered == entered_at, "Timer was reset by hysteresis-tolerated dip"
+
+        # Tick 3: hard drop — below hysteresis floor → reset
+        sc.tick(
+            grid_export_w=max(0.0, threshold - margin - 100), grid_import_w=0.0,
+            ev_vehicles=ev_vehicles, ev_connected=True, current_price=0.50,
+        )
+        assert sc.state is SurplusState.INACTIVE, (
+            "Drop below (threshold - safety_margin) must reset debounce"
+        )
+
+    def test_current_setpoint_reissued_every_active_tick(
+        self, generic_params, generic_outputs, ev_vehicles,
+    ):
+        """Rule 3: every fast-loop tick while ACTIVE must emit a dynamic-limit action."""
+        sc = _build_sc(generic_params, generic_outputs)
+        _make_active(sc, ["ev_charger_1"])
+
+        for _ in range(5):
+            actions = sc.tick(
+                grid_export_w=5_000.0, grid_import_w=0.0,
+                ev_vehicles=ev_vehicles, ev_connected=True, current_price=0.50,
+            )
+            dyn = _dyn_limit_actions(actions)
+            assert dyn, "Each ACTIVE tick must re-issue the dynamic current limit"
+
+
+# ---------------------------------------------------------------------------
 # 1. Dynamic current
 # ---------------------------------------------------------------------------
 

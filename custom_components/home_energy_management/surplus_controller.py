@@ -29,8 +29,11 @@ Architecture rules  (canonical reference — duplicated in docs/SURPLUS_ARCHITEC
 --------------------------------------------------------------------------------------
 Rule 1 — ACTIVATION
     When net grid export (export_w - import_w) ≥ ``threshold_w`` for at least
-    ``activation_delay_s`` seconds continuously, transition INACTIVE → ACTIVE.
-    When the spot price is negative, skip the debounce and activate immediately.
+    ``activation_delay_s`` seconds, transition INACTIVE → ACTIVE.  During the
+    debounce window brief sub-threshold dips are tolerated: the timer only
+    resets when export falls below ``threshold_w − safety_margin_w``
+    (hysteresis).  When the spot price is negative the debounce is skipped
+    and activation is immediate.
 
 Rule 2 — CHARGING  (OR condition)
     On every activation, ALL connected EVs that are below their target SoC
@@ -105,7 +108,12 @@ class SurplusController:
         self,
         params: dict[str, Any],
         ev_chargers_cfg: list[dict[str, Any]],
-        surplus_switch_cfg: dict[str, Any] | None = None,
+        # ``surplus_switch_cfg`` is accepted for backward compatibility with
+        # older callers and tests but is intentionally ignored — the
+        # controller no longer toggles any external smart-meter / Easee
+        # surplus switch.  It owns charger current itself via the
+        # ``set_dynamic_limit`` service every fast-loop tick.
+        surplus_switch_cfg: dict[str, Any] | None = None,  # noqa: ARG002
     ) -> None:
         from .const import (
             DEFAULT_SOLAR_SURPLUS_THRESHOLD,
@@ -128,7 +136,6 @@ class SurplusController:
         )
 
         self.ev_chargers_cfg: list[dict[str, Any]] = ev_chargers_cfg
-        self._surplus_switch_cfg: dict[str, Any] = surplus_switch_cfg or {}
 
         # State machine
         self.state: SurplusState = SurplusState.INACTIVE
@@ -238,11 +245,15 @@ class SurplusController:
             _LOGGER.info("SurplusController: negative price during debounce → activating immediately")
             return self._enter_active(ev_vehicles, ev_connected, grid_export_w, grid_import_w)
 
-        # Export dropped — reset timer (Rule 1: must be sustained)
-        if net_surplus_w < self.threshold_w:
+        # Export dropped — reset timer ONLY when net export falls below the
+        # hysteresis floor (threshold − safety_margin).  Brief dips above
+        # this floor are tolerated so cloud-edge flicker doesn't keep
+        # restarting the debounce window forever.
+        reset_floor = max(0.0, self.threshold_w - self.safety_margin_w)
+        if net_surplus_w < reset_floor:
             _LOGGER.debug(
-                "SurplusController: export dropped (%.0f W < %.0f W) → debounce reset",
-                net_surplus_w, self.threshold_w,
+                "SurplusController: export dropped (%.0f W < %.0f W reset floor) → debounce reset",
+                net_surplus_w, reset_floor,
             )
             self.state = SurplusState.INACTIVE
             self._state_entered = None
@@ -388,10 +399,7 @@ class SurplusController:
             active_cfgs, grid_export_w, grid_import_w, vehicle_map_ctrl,
         )
 
-        switch_actions: list[dict[str, Any]] = []
-        _set_surplus_switch(self._surplus_switch_cfg, switch_actions, active=True)
-
-        return actions + current_actions + switch_actions
+        return actions + current_actions
 
     def _enter_inactive(
         self,
@@ -407,10 +415,7 @@ class SurplusController:
         self._state_entered = None
         self._active_charger_names = []
 
-        switch_actions: list[dict[str, Any]] = []
-        _set_surplus_switch(self._surplus_switch_cfg, switch_actions, active=False)
-
-        return actions + switch_actions
+        return actions
 
     # ------------------------------------------------------------------
     # Rule 3: Current controller
@@ -561,18 +566,3 @@ def _stop_charger(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     if stop.get("service"):
         return [{"service": stop["service"], "entity_id": stop["entity_id"], "data": {}}]
     return []
-
-
-def _set_surplus_switch(
-    cfg: dict[str, Any],
-    actions: list[dict[str, Any]],
-    *,
-    active: bool,
-) -> None:
-    """Append turn_on / turn_off for an optional smart-meter surplus switch."""
-    entity_id = cfg.get("entity_id")
-    service_on = cfg.get("service_on", "switch.turn_on")
-    service_off = cfg.get("service_off", "switch.turn_off")
-    service = service_on if active else service_off
-    if entity_id and service:
-        actions.append({"service": service, "entity_id": entity_id, "data": {}})

@@ -106,8 +106,9 @@ inputs:
     total_export: "sensor.CHANGE_ME_total_grid_export"
     import_power: "sensor.CHANGE_ME_grid_import_power"
     export_power: "sensor.CHANGE_ME_grid_export_power"
-    # Optional: surplus charging switch
-    # surplus_charging: "switch.CHANGE_ME_surplus_charging"
+    # NOTE: HEM owns surplus EV charging itself — it never delegates
+    # to a smart-meter / Easee-side "surplus" switch.  Do NOT add a
+    # surplus_charging entity here.
 
   # --- Weather (optional, improves PV prediction) ---
   weather:
@@ -121,15 +122,10 @@ inputs:
 # ----------------------------------------------------------
 outputs:
 
-  # --- Optional smart-meter surplus switch mirror ---
-  # If configured, the integration toggles this switch ON when
-  # solar-surplus charging is actively selected for an EV and OFF
-  # otherwise. Useful for dashboards/automations.
-  # smart_meter:
-  #   surplus_charging:
-  #     entity_id: "switch.CHANGE_ME_surplus_charging"
-  #     service_on: "switch.turn_on"
-  #     service_off: "switch.turn_off"
+  # NOTE: There is no smart-meter / external surplus switch output.
+  # HEM controls EV charging current directly via the charger's
+  # ``set_dynamic_limit`` service every 10 s; it must never hand
+  # surplus control off to the charger hardware or the smart meter.
 
   # --- EV Charger Control ---
   # Each charger uses switch.turn_on / switch.turn_off

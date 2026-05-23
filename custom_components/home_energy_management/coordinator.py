@@ -172,6 +172,17 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         sg = self.inputs.get(INPUT_SUNGROW, {})
         grid_export_w = self._get_state_float(sg.get("grid_export_power"))
         grid_import_w = self._get_state_float(sg.get("grid_import_power"))
+        # PV production and total house load (post-inverter, includes EVs).
+        # Used by SurplusController to compute a battery-independent
+        # solar surplus — so the cars never drain battery energy that
+        # the LP wants to use for house offset during expensive hours.
+        pv_power_w = self._get_state_float(sg.get("pv_power"))
+        house_load_w = self._get_state_float(sg.get("house_load"))
+        # Slave inverter (if present) contributes additional PV / load.
+        sg2 = self.inputs.get("sungrow_2", {}) or {}
+        if sg2:
+            pv_power_w += self._get_state_float(sg2.get("pv_power"))
+            house_load_w += self._get_state_float(sg2.get("house_load"))
 
         # 2. Build EV vehicle snapshots from live sensors so the
         #    controller can read each charger's current power_w/SoC.
@@ -222,6 +233,8 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             ev_vehicles=ev_vehicles,
             ev_connected=any_connected,
             current_price=current_price,
+            pv_power_w=pv_power_w if pv_power_w > 0 or house_load_w > 0 else None,
+            house_load_w=house_load_w if pv_power_w > 0 or house_load_w > 0 else None,
         )
 
         # 4b. Apply HEM force-charge override even when SurplusController

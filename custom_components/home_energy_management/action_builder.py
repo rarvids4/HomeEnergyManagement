@@ -28,8 +28,20 @@ battery before negative-price hours when we must absorb maximum solar.
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Any
+
+# Battery charge-cap controller — minimum cap (W) to allow trickle
+# charge that compensates for the inverter's standby/self-discharge
+# draw. Below this the inverter would still draw a tiny amount that
+# slowly depletes the battery during long idle periods.
+_BATT_CHARGE_CAP_MIN_W = 100
+
+# Step granularity (W) for rounding the charge cap. Writing every
+# cycle (~30–60 s) with this step keeps the inverter from chasing
+# noisy 1 W adjustments while still tracking the LP's SoC trajectory.
+_BATT_CHARGE_CAP_STEP_W = 1000
 
 from .const import (
     ACTION_CHARGE_BATTERY,
@@ -46,6 +58,7 @@ from .const import (
     OUTPUT_EASEE,
     OUTPUT_SUNGROW,
 )
+from .write_arbiter import WriteArbiter
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -85,6 +98,12 @@ class ActionBuilder:
         # Updated every cycle for dashboard monitoring.
         self.neg_price_status: dict[str, Any] = {}
 
+        # --- Write arbiters for contested inverter control values ---
+        # Multiple HEM components may want to cap the same setpoint;
+        # each propose()s their desired value and the arbiter writes the
+        # min. See write_arbiter.py.
+        self.charge_cap_arbiter = WriteArbiter("battery_max_charge_power_w")
+
         # EV charger config from outputs
         self.ev_chargers_cfg = outputs.get(OUTPUT_EV_CHARGERS, [])
         if not self.ev_chargers_cfg:
@@ -113,6 +132,7 @@ class ActionBuilder:
         predicted_consumption: float = 0.0,
         predicted_solar: float = 0.0,
         target_soc: float = 100.0,
+        current_soc: float = 0.0,
     ) -> list[dict[str, Any]]:
         """Convert the current hour's plan into HA service calls.
 
@@ -130,6 +150,7 @@ class ActionBuilder:
             actions.extend(self._battery_actions(
                 sg_out, action, predicted_consumption, predicted_solar,
                 target_soc, spot_price=spot_price,
+                current_soc=current_soc,
             ))
 
         # --- EV charger actions ---
@@ -259,9 +280,28 @@ class ActionBuilder:
         target_soc: float = 100.0,
         *,
         spot_price: float = 0.0,
+        current_soc: float = 0.0,
     ) -> list[dict[str, Any]]:
         """Build battery-control service calls for the inverter."""
         actions: list[dict[str, Any]] = []
+
+        # ── Dynamic charge-power cap ──────────────────────────────
+        # Mirrors the EV charger control: every cycle we re-derive the
+        # charge cap from the SoC delta the LP wants us to reach this
+        # hour. This makes the controller closed-loop — forecast errors
+        # and external SoC drift are absorbed automatically.
+        #
+        #   delta_pct  = target_soc - current_soc  (clamped ≥ 0)
+        #   required_w = delta_pct / 100 × capacity_kwh × 1000  (W for 1 h)
+        #   cap_w      = round_up(required_w, step=1 kW),
+        #                clamped to [_BATT_CHARGE_CAP_MIN_W, set_charge_power.max]
+        #
+        # Special cases:
+        #   MAXIMIZE_LOAD → max (absorb all surplus during neg prices)
+        #   PRE_DISCHARGE → min (battery is being drained)
+        charge_cap_w = self._compute_charge_cap(
+            sg_out, action, current_soc, target_soc,
+        )
 
         if action == ACTION_MAXIMIZE_LOAD:
             # Negative price — block grid export at the inverter level.
@@ -292,22 +332,16 @@ class ActionBuilder:
             actions.extend(self._stop_forced_cmd(sg_out))
             self._set_forced_power(sg_out, actions, 0)
 
-            # Crank battery max-charge so it absorbs all available
-            # surplus while in self-consumption mode.
-            chg_cfg = sg_out.get("set_charge_power", {})
-            if chg_cfg.get("service") and chg_cfg.get("entity_id"):
-                max_chg = chg_cfg.get("max", 5000)
-                actions.append({
-                    "service": chg_cfg["service"],
-                    "entity_id": chg_cfg["entity_id"],
-                    "data": {"value": max_chg},
-                })
+            # Charge cap is set unconditionally at the end of this
+            # method; for MAXIMIZE_LOAD it resolves to the inverter
+            # maximum so the battery absorbs all surplus while the
+            # export limit (set in _apply_export_limit) blocks the grid.
 
             _LOGGER.info(
                 "Negative price MAXIMIZE_LOAD: self-consumption + "
                 "battery max charge (SoC %.0f%%, predicted solar %.2f kWh, "
                 "load %.2f kWh) — export blocked at inverter via reg 13087",
-                sg_out.get("soc", 0), predicted_solar, predicted_consumption,
+                current_soc, predicted_solar, predicted_consumption,
             )
 
         elif action == ACTION_PRE_DISCHARGE:
@@ -332,7 +366,6 @@ class ActionBuilder:
             # Limit grid import for forced battery charging
             grid_limit = 4500
             # Clamp SoC to target_soc (do not overcharge)
-            current_soc = sg_out.get("soc", 0)
             soc_to_charge = max(0, target_soc - current_soc)
             # Convert SoC % to kWh (if battery_capacity available)
             battery_capacity = sg_out.get("capacity_kwh", 10)
@@ -412,7 +445,139 @@ class ActionBuilder:
             if self.enforce_discharge_max:
                 self._set_discharge_power_max(sg_out, actions)
 
+        # ── Unified charge-cap write (every cycle) ────────────────
+        # Tracks the LP's SoC trajectory closed-loop. See
+        # _compute_charge_cap docstring for the math.
+        #
+        # We publish the LP's desired cap to the WriteArbiter; any
+        # other internal component (e.g. surplus controller) can also
+        # propose a value, and the min is written. This is the in-HEM
+        # arbitration the user spec'd. The coordinator's cycle is the
+        # cadence (= the fastest writer drives the rate).
+        self.charge_cap_arbiter.propose(
+            "lp", float(charge_cap_w), max_age_s=120.0,
+        )
+        arbitrated_w = self.charge_cap_arbiter.arbitrate()
+        if arbitrated_w is None:
+            arbitrated_w = float(charge_cap_w)
+        self._set_charge_power(sg_out, actions, int(arbitrated_w))
+
         return actions
+
+    # ------------------------------------------------------------------
+    # Charge-cap controller
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _compute_charge_cap(
+        sg_out: dict[str, Any],
+        action: str,
+        current_soc: float,
+        target_soc: float,
+    ) -> int:
+        """Compute the battery max-charge-power cap (W) for this cycle.
+
+        The cap follows the LP's SoC trajectory in closed loop:
+
+          delta_pct  = max(0, target_soc - current_soc)
+          required_w = delta_pct / 100 × capacity_kwh × 1000   (per 1 h)
+          cap_w      = ceil(required_w / step) × step,
+                       clamped to [min_w, set_charge_power.max]
+
+        Where ``step = 1 kW`` (avoids cycle-to-cycle jitter) and
+        ``min_w = _BATT_CHARGE_CAP_MIN_W`` (compensates for inverter
+        standby / battery self-discharge).
+
+        Special cases:
+          * MAXIMIZE_LOAD → max (absorb everything during neg prices)
+          * PRE_DISCHARGE → min (battery is being actively drained)
+        """
+        chg_cfg = sg_out.get("set_charge_power", {})
+        cap_max = int(chg_cfg.get("max", 5000))
+        cap_min = _BATT_CHARGE_CAP_MIN_W
+
+        if action == ACTION_MAXIMIZE_LOAD:
+            return cap_max
+        if action == ACTION_PRE_DISCHARGE:
+            return cap_min
+
+        capacity_kwh = float(sg_out.get("capacity_kwh", 10))
+        delta_pct = max(0.0, float(target_soc) - float(current_soc))
+        required_w = delta_pct / 100.0 * capacity_kwh * 1000.0
+
+        # Round UP to nearest step so the battery can comfortably
+        # reach target within the hour even with mild forecast error.
+        stepped_w = math.ceil(required_w / _BATT_CHARGE_CAP_STEP_W) * _BATT_CHARGE_CAP_STEP_W
+        return max(cap_min, min(cap_max, int(stepped_w)))
+
+    @staticmethod
+    def _set_charge_power(
+        sg_out: dict[str, Any],
+        actions: list[dict[str, Any]],
+        value_w: int,
+    ) -> None:
+        """Append battery max-charge-power writes.
+
+        Emits up to **two** writes per call:
+
+        1. **Direct modbus write** (preferred — bypasses the helper /
+           reverse-sync automation loop). Configured under
+           ``set_charge_power.modbus`` in the mapping with ``hub``,
+           ``slave``, ``address`` and ``scale`` (register value = W /
+           scale; Sungrow reg 33046 uses scale=10).
+
+        2. **Input-helper write** (for UI sync). Writes the watts
+           value into ``input_number.set_sg_battery_max_charge_power``.
+           Without the direct modbus path, this is unreliable because
+           the YAML reverse-sync automation
+           (``sungrow_inverter_update_battery_max_charge_power_input_slider_update``)
+           writes the register reading back into the helper any time
+           the register changes — fighting our intent if the inverter
+           doesn't accept the helper-derived write.
+        """
+        chg_cfg = sg_out.get("set_charge_power", {})
+        if not chg_cfg:
+            return
+
+        # Respect the input_number's configured bounds so the helper
+        # service call doesn't get rejected.
+        lo = int(chg_cfg.get("min", 0))
+        hi = int(chg_cfg.get("max", 5000))
+        v = max(lo, min(hi, int(value_w)))
+
+        # ── 1) Direct modbus write (preferred path) ──
+        modbus_cfg = chg_cfg.get("modbus")
+        if modbus_cfg:
+            hub = modbus_cfg.get("hub")
+            slave = modbus_cfg.get("slave")
+            address = modbus_cfg.get("address")
+            scale = float(modbus_cfg.get("scale", 1))
+            if hub is not None and slave is not None and address is not None:
+                reg_value = int(round(v / scale))
+                _LOGGER.info(
+                    "Modbus write: battery max charge reg %s = %d W "
+                    "(reg val=%d, scale=%g, hub=%s slave=%s)",
+                    address, v, reg_value, scale, hub, slave,
+                )
+                actions.append({
+                    "service": "modbus.write_register",
+                    "data": {
+                        "hub": hub,
+                        "slave": slave,
+                        "address": address,
+                        "value": reg_value,
+                    },
+                })
+
+        # ── 2) Input-helper write (UI sync) ──
+        service = chg_cfg.get("service")
+        entity_id = chg_cfg.get("entity_id")
+        if service and entity_id:
+            actions.append({
+                "service": service,
+                "entity_id": entity_id,
+                "data": {"value": v},
+            })
 
     @staticmethod
     def _set_forced_power(

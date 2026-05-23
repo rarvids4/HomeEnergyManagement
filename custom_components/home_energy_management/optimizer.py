@@ -175,6 +175,7 @@ class Optimizer:
                 predicted_consumption=pred_consumption_0,
                 predicted_solar=pred_solar_0,
                 target_soc=target_soc,
+                current_soc=battery_soc,
             )
 
         # ── Summary ────────────────────────────────────────────────

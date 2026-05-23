@@ -28,10 +28,12 @@ State machine
 Architecture rules  (canonical reference — duplicated in docs/SURPLUS_ARCHITECTURE.md)
 --------------------------------------------------------------------------------------
 Rule 1 — ACTIVATION
-    When net grid export (export_w - import_w) ≥ ``threshold_w`` for at least
-    ``activation_delay_s`` seconds, transition INACTIVE → ACTIVE.  During the
+    When the *battery-independent* solar surplus ≥ ``threshold_w`` for at
+    least ``activation_delay_s`` seconds, transition INACTIVE → ACTIVE.
+    The surplus is computed as PV feed-forward (see Rule 3) so the
+    controller never mistakes battery discharge for sunshine.  During the
     debounce window brief sub-threshold dips are tolerated: the timer only
-    resets when export falls below ``threshold_w − safety_margin_w``
+    resets when surplus falls below ``threshold_w − safety_margin_w``
     (hysteresis).  When the spot price is negative the debounce is skipped
     and activation is immediate.
 
@@ -41,14 +43,20 @@ Rule 2 — CHARGING  (OR condition)
     which one has the lower SoC.  Any EV that connects while the controller
     is ACTIVE is added to the active set automatically.
 
-Rule 3 — CURRENT CONTROL
-    On every fast-loop tick while ACTIVE, each charger's dynamic current limit
-    is set so that total EV draw ≈ available solar, keeping net grid ≈ 0:
+Rule 3 — CURRENT CONTROL  (PV feed-forward, battery-independent)
+    On every fast-loop tick while ACTIVE, each charger's dynamic current
+    limit is set so that total EV draw matches the *true* solar headroom,
+    leaving the battery free to follow whatever the LP plans for it:
 
-        available_w = export_w - import_w + Σ(ev_power_w) - safety_margin_w
+        non_ev_load     = max(0, house_load_w - Σ(ev_power_w))
+        solar_surplus_w = pv_power_w - non_ev_load
+        available_w     = solar_surplus_w - safety_margin_w
         amps_per_charger = floor(available_w / n_chargers / (voltage × phases))
 
-    Each charger is clamped to [min_current, max_current].
+    When PV / house-load sensors aren't supplied, falls back to the legacy
+    grid-balance formula (``export - import + Σ ev_power``) which is
+    contaminated by battery flow but better than nothing.  Each charger is
+    clamped to [min_current, max_current].
 
 Rule 4 — DEACTIVATION TRIGGER
     When ``available_w < min_viable_w`` all chargers are clamped to
@@ -165,37 +173,86 @@ class SurplusController:
         ev_vehicles: list[dict[str, Any]],
         ev_connected: bool,
         current_price: float = 0.0,
+        pv_power_w: float | None = None,
+        house_load_w: float | None = None,
     ) -> list[dict[str, Any]]:
         """Advance the state machine one tick. Returns HA service calls.
 
         Called by the coordinator fast loop (every ~10 s).
         The caller is responsible for executing the returned actions.
+
+        Battery-aware surplus
+        ---------------------
+        When ``pv_power_w`` and ``house_load_w`` are supplied, the
+        controller uses **PV feed-forward**::
+
+            non_ev_load = max(0, house_load_w - Σ ev_power_w)
+            solar_surplus_w = pv_power_w - non_ev_load
+
+        This is the true solar headroom available to the cars, *independent
+        of what the battery is doing*.  Required because the legacy
+        grid-balance formula (``export - import``) silently treats battery
+        discharge as "solar" — so when the LP intentionally discharges the
+        battery to offset house load on an expensive hour, the cars would
+        cheerfully drain the battery thinking it was sunshine.
+
+        When the new sensors aren't supplied (older callers / tests),
+        falls back to the legacy formula::
+
+            solar_surplus_w = grid_export_w - grid_import_w
         """
         price_is_negative = current_price < 0
-        # Positive = exporting (net solar surplus)
-        net_surplus_w = grid_export_w - grid_import_w
+
+        # Compute the battery-independent solar surplus.
+        solar_surplus_w = self._compute_solar_surplus_w(
+            grid_export_w, grid_import_w,
+            pv_power_w, house_load_w, ev_vehicles,
+        )
 
         if self.state is SurplusState.INACTIVE:
             return self._handle_inactive(
-                net_surplus_w, price_is_negative,
+                solar_surplus_w, price_is_negative,
                 ev_vehicles, ev_connected, grid_export_w, grid_import_w,
             )
         if self.state is SurplusState.DEBOUNCING:
             return self._handle_debouncing(
-                net_surplus_w, price_is_negative,
+                solar_surplus_w, price_is_negative,
                 ev_vehicles, ev_connected, grid_export_w, grid_import_w,
             )
         if self.state is SurplusState.ACTIVE:
             return self._handle_active(
-                net_surplus_w, price_is_negative,
+                solar_surplus_w, price_is_negative,
                 ev_vehicles, ev_connected, grid_export_w, grid_import_w,
             )
         if self.state is SurplusState.STOPPING:
             return self._handle_stopping(
-                net_surplus_w, price_is_negative,
+                solar_surplus_w, price_is_negative,
                 ev_vehicles, ev_connected, grid_export_w, grid_import_w,
             )
         return []
+
+    @staticmethod
+    def _compute_solar_surplus_w(
+        grid_export_w: float,
+        grid_import_w: float,
+        pv_power_w: float | None,
+        house_load_w: float | None,
+        ev_vehicles: list[dict[str, Any]] | None,
+    ) -> float:
+        """Return the battery-independent solar headroom in watts.
+
+        See :meth:`tick` for the rationale. Falls back to the legacy
+        grid-balance formula when PV/house-load sensors are unavailable.
+        """
+        if pv_power_w is None or house_load_w is None:
+            return grid_export_w - grid_import_w
+        total_ev_w = sum(
+            (v.get("power_w", 0.0) or 0.0)
+            for v in (ev_vehicles or [])
+        )
+        non_ev_load = max(0.0, house_load_w - total_ev_w)
+        # Solar minus everything-except-the-cars.
+        return pv_power_w - non_ev_load
 
     def status(self) -> dict[str, Any]:
         """Return controller status for sensor / diagnostic display."""
@@ -279,13 +336,11 @@ class SurplusController:
         vehicle_map = {v.get("name", ""): v for v in (ev_vehicles or [])}
         active_cfgs = self._active_charger_configs()
 
-        total_ev_power_w = sum(
-            vehicle_map.get(c.get("name", ""), {}).get("power_w", 0.0)
-            for c in active_cfgs
-        )
-        total_available_w = (
-            grid_export_w - grid_import_w + total_ev_power_w - self.safety_margin_w
-        )
+        # ``net_surplus_w`` here is now the battery-independent solar
+        # surplus (see :meth:`tick`/:meth:`_compute_solar_surplus_w`).
+        # That's exactly what the cars can pull without touching the
+        # battery or the grid — no need to add back EV power.
+        total_available_w = net_surplus_w - self.safety_margin_w
         min_viable_w = self._min_viable_w()
 
         # Rule 2: arm any newly connected EVs
@@ -305,7 +360,7 @@ class SurplusController:
         # Rule 3: current controller
         active_cfgs = self._active_charger_configs()
         return new_ev_actions + self._run_current_controller(
-            active_cfgs, grid_export_w, grid_import_w, vehicle_map,
+            active_cfgs, total_available_w, grid_export_w, grid_import_w, vehicle_map,
         )
 
     def _handle_stopping(
@@ -315,13 +370,8 @@ class SurplusController:
         vehicle_map = {v.get("name", ""): v for v in (ev_vehicles or [])}
         active_cfgs = self._active_charger_configs()
 
-        total_ev_power_w = sum(
-            vehicle_map.get(c.get("name", ""), {}).get("power_w", 0.0)
-            for c in active_cfgs
-        )
-        total_available_w = (
-            grid_export_w - grid_import_w + total_ev_power_w - self.safety_margin_w
-        )
+        # Same battery-independent surplus used in _handle_active.
+        total_available_w = net_surplus_w - self.safety_margin_w
         min_viable_w = self._min_viable_w()
 
         # Rule 4: surplus recovered → back to ACTIVE
@@ -332,7 +382,9 @@ class SurplusController:
             )
             self.state = SurplusState.ACTIVE
             self._state_entered = time.monotonic()
-            return self._run_current_controller(active_cfgs, grid_export_w, grid_import_w, vehicle_map)
+            return self._run_current_controller(
+                active_cfgs, total_available_w, grid_export_w, grid_import_w, vehicle_map,
+            )
 
         elapsed = time.monotonic() - (self._state_entered or time.monotonic())
 
@@ -392,11 +444,22 @@ class SurplusController:
                 name, soc, target,
             )
 
-        # Rule 3: set initial current limits
+        # Rule 3: set initial current limits.  At first activation we
+        # don't have access to PV / house-load here (legacy signature);
+        # use the grid-balance fallback — the very next 10 s fast tick
+        # will switch to PV feed-forward anyway.
         active_cfgs = self._active_charger_configs()
         vehicle_map_ctrl = {v.get("name", ""): v for v in (ev_vehicles or [])}
+        total_ev_power_w = sum(
+            vehicle_map_ctrl.get(c.get("name", ""), {}).get("power_w", 0.0)
+            for c in active_cfgs
+        )
+        bootstrap_available_w = (
+            grid_export_w - grid_import_w + total_ev_power_w - self.safety_margin_w
+        )
         current_actions = self._run_current_controller(
-            active_cfgs, grid_export_w, grid_import_w, vehicle_map_ctrl,
+            active_cfgs, bootstrap_available_w,
+            grid_export_w, grid_import_w, vehicle_map_ctrl,
         )
 
         return actions + current_actions
@@ -424,26 +487,21 @@ class SurplusController:
     def _run_current_controller(
         self,
         active_cfgs: list[dict[str, Any]],
+        total_available_w: float,
         grid_export_w: float,
         grid_import_w: float,
         vehicle_map: dict[str, dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Adjust each charger's current to keep net grid power ≈ 0.
 
-        Available solar is split equally among active chargers:
-            available_w = export - import + Σ(ev_power) - safety_margin
-            amps_each   = floor(available_w / n_chargers / (voltage × phases))
+        ``total_available_w`` is the *battery-independent* solar headroom
+        (already net of safety_margin) computed by the caller, so the
+        cars never tap battery energy that the LP wants to use elsewhere.
+        See :meth:`tick` for the derivation.
         """
         if not active_cfgs:
             return []
 
-        total_ev_power_w = sum(
-            vehicle_map.get(c.get("name", ""), {}).get("power_w", 0.0)
-            for c in active_cfgs
-        )
-        total_available_w = (
-            grid_export_w - grid_import_w + total_ev_power_w - self.safety_margin_w
-        )
         n = len(active_cfgs)
         per_charger_w = total_available_w / n
 

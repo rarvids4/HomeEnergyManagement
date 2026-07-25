@@ -100,20 +100,58 @@ Implementation:
 ### Rule 3 — CURRENT CONTROLLER
 > When cars are charging due to surplus (OR condition), a special current controller is live, ensuring that the power from and to the grid is almost zero.
 
-Implementation:
+Implementation — **PV feed-forward setpoint plus a closed-loop grid trim**:
 
 ```text
-total_available_w = export_w − import_w + Σ(ev_power_w) − safety_margin_w
+non_ev_load_w     = max(0, house_load_w − Σ(ev_power_w))
+solar_surplus_w   = pv_power_w − non_ev_load_w          # feed-forward
+total_available_w = solar_surplus_w − safety_margin_w − grid_trim_w
 per_charger_w     = total_available_w / n_active_chargers
 amps_per_charger  = floor(per_charger_w / (voltage × phases))
 amps_per_charger  = clamp(amps_per_charger, min_current, max_current)
 ```
+
+The **feed-forward** term is battery-independent on purpose: computing the
+surplus from PV minus non-EV load (rather than from grid balance) stops
+battery *discharge* from masquerading as sunshine, which would let the cars
+drain the battery the LP is saving for an expensive hour.
+
+The **trim** is the other half, and the reason the cars can't sit on the grid:
+
+```text
+error_w  = grid_import_w − grid_export_w                # >0 = importing
+trim_w   = clamp(trim_w + gain × error_w, 0, solar_surplus_w)
+```
+
+Feed-forward alone is open-loop — it is only as accurate as its constants
+(`voltage × phases`, gross-DC vs AC PV, inverter loss) and its sensors, and
+it cannot see anything else competing for the same solar (e.g. the battery
+charging). Every such error lands on the grid, and no amount of feed-forward
+notices. Measured net grid import *is* the error signal, so it is integrated
+back out of the setpoint. Guards:
+
+- Accumulates only while chargers are actually under control, so ordinary
+  house import can't wind it up against the next activation.
+- Anti-windup: frozen once every active charger sits at `min_current`, where
+  the remaining import is irreducible (a 3-phase charger's 6 A floor is
+  ~4.1 kW) — Rule 4/5 resolve that case instead. It still decays on export.
+- Bypassed while the spot price is negative, where import is deliberate.
+- Cleared on deactivation, so each activation starts from clean feed-forward.
 
 Solar is split equally among active chargers. Each is clamped to its hardware
 range. **The controller fires every fast-loop tick (at most every 10 s,
 clamped in [coordinator.py](../custom_components/home_energy_management/coordinator.py)),
 so as solar wobbles the limit follows in real time — the cars never draw
 from the grid.**
+
+> ⚠️ `voltage × phases` is the **watts-per-amp** scaling that converts
+> available power into a current setpoint — 230 × 3 = 690 W/A, 230 × 1 =
+> 230 W/A. Get it wrong and every watt of surplus becomes N watts of
+> charging, with the difference imported. Verify it against what the
+> charger *actually does* while charging (for Easee: the status sensor's
+> `state_outputPhase` / `config_phaseMode` attributes), never from the
+> model name. Incident 24 Jul 2026: a 3-phase Easee configured as
+> `phases: 1` drew 12.8 kW on ~4.4 kW of surplus for ten minutes.
 
 > The integration **never** delegates surplus control to the charger
 > hardware (Easee "smart" / "surplus" mode) or any smart-meter surplus
@@ -156,6 +194,8 @@ All values live in the parameters block of `variable_mapping.local.yaml`
 | `surplus_activation_delay_seconds` | `60`   | 1 | Y — debounce window before activation |
 | `surplus_deficit_timeout_seconds`  | `60`   | 4 | Z — grace before cleanup |
 | `surplus_safety_margin_w`          | `200`  | 3 | Headroom kept toward export |
+| `surplus_grid_trim_gain`           | `0.5`  | 3 | Fraction of measured net grid import corrected per tick (`1.0` = one tick, may overshoot with sensor lag) |
+| `surplus_grid_trim_deadband_w`     | `100`  | 3 | Net grid flow ignored by the trim so meter noise doesn't jitter the current |
 | `surplus_grid_import_grace_seconds`| `60`   | 1+4 | Backward-compat default for both Y and Z if not explicitly set |
 
 ---

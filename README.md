@@ -281,7 +281,7 @@ outputs:
 | `set_dynamic_limit.service` | string | — | Service to set charger current limit (e.g. `easee.set_charger_dynamic_limit`) |
 | `set_dynamic_limit.device_id` | string | — | HA device ID for the charger |
 | `set_dynamic_limit.voltage` | int | `230` | Grid voltage in volts |
-| `set_dynamic_limit.phases` | int | `3` | Number of charger phases |
+| `set_dynamic_limit.phases` | int | `3` | Number of charger phases. **`voltage × phases` is the watts-per-amp scaling** used to turn available surplus into a current setpoint (230 × 3 = 690 W/A). Verify it against what the charger actually draws while charging — for Easee, the status sensor's `state_outputPhase` / `config_phaseMode` attributes. A wrong value multiplies every watt of surplus and imports the difference from the grid |
 | `set_dynamic_limit.min_current` | int | `6` | Minimum charging current (A) |
 | `set_dynamic_limit.max_current` | int | `32` | Maximum charging current (A) |
 
@@ -453,10 +453,12 @@ When clouds or a sudden load cause net grid import, a **grace period** holds the
 | `solar_surplus_threshold_w` | int | `2000` | Minimum grid export (W) to **start AND keep** surplus charging. Acts as both the trigger and the floor below which the active charger stops. Must exceed `min_amps × voltage × phases` for the smallest charger |
 | `surplus_safety_margin_w` | int | `200` | Headroom (W) subtracted from available surplus when computing the dynamic current limit. **Doubles as the tolerated net grid-import buffer** — brief dips smaller than this won't arm the deficit timer |
 | `surplus_grid_import_grace_seconds` | int | `60` | Seconds the grid-import deficit must persist before the active surplus charger is stopped. During the grace window the charger is **clamped to its minimum current** so it keeps trickling while waiting for solar to recover. Recommended: 30–120 s |
+| `surplus_grid_trim_gain` | float | `0.5` | Closed-loop correction: fraction of the **measured** net grid import subtracted from the feed-forward setpoint each tick. This is what stops a wrong `voltage × phases`, gross-DC PV, or a competing consumer (battery charging off the same solar) from importing indefinitely. `1.0` corrects in a single tick but may overshoot with sensor lag; `0` disables the trim (open-loop) |
+| `surplus_grid_trim_deadband_w` | int | `100` | Net grid flow (W) the trim ignores, so meter noise doesn't jitter the charger current |
 | `fast_ev_update_interval` | int | `10` | Interval (s) for the fast surplus tracking loop. Lower = more responsive; higher = fewer HA service calls |
 | `neg_price_ev_export_limit_w` | int | `2100` | Inverter export cap (W) when an EV is absorbing surplus during negative spot prices. Provides headroom for charger ramp-up. Falls back to `0 W` if no EV is available |
 
-> **Live status:** the `sensor.home_energy_management_surplus_charging` entity (display name **Surplus Mode**) is the single source of truth for solar-surplus EV charging. It reports `active` / `inactive` and exposes `state`, `active_chargers`, `grid_export_w`, `grid_import_w`, `state_elapsed_s`, `threshold_w`, `surplus_safety_margin_w`, `activation_delay_s`, `deficit_timeout_s`, and `ev_connected` as attributes for dashboard monitoring. The integration owns the EV current itself (re-issued every 10 s) and never delegates to any external smart-meter or Easee "surplus" switch.
+> **Live status:** the `sensor.home_energy_management_surplus_charging` entity (display name **Surplus Mode**) is the single source of truth for solar-surplus EV charging. It reports `active` / `inactive` and exposes `state`, `active_chargers`, `grid_export_w`, `grid_import_w`, `state_elapsed_s`, `threshold_w`, `surplus_safety_margin_w`, `activation_delay_s`, `deficit_timeout_s`, `grid_trim_w`, and `ev_connected` as attributes for dashboard monitoring. A persistently non-zero `grid_trim_w` means the feed-forward setpoint is systematically over-estimating the available surplus — check the charger's `voltage × phases` and the house-load sensor. The integration owns the EV current itself (re-issued every 10 s) and never delegates to any external smart-meter or Easee "surplus" switch.
 
 #### EV Night Preference
 

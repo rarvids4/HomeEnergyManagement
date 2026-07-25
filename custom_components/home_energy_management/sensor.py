@@ -652,6 +652,10 @@ class SurplusChargingSensor(EnergyManagementSensor):
             "surplus_safety_margin_w": status.get("safety_margin_w", 0),
             "activation_delay_s": status.get("activation_delay_s", 0),
             "deficit_timeout_s": status.get("deficit_timeout_s", 0),
+            # Closed-loop correction currently held against the
+            # feed-forward setpoint (Rule 3).  A non-zero value means the
+            # meter saw grid import the feed-forward didn't predict.
+            "grid_trim_w": status.get("grid_trim_w", 0),
             "ev_connected": sensor_data.get("ev_connected", False),
         }
 

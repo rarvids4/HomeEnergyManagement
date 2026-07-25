@@ -43,15 +43,27 @@ Rule 2 — CHARGING  (OR condition)
     which one has the lower SoC.  Any EV that connects while the controller
     is ACTIVE is added to the active set automatically.
 
-Rule 3 — CURRENT CONTROL  (PV feed-forward, battery-independent)
+Rule 3 — CURRENT CONTROL  (PV feed-forward + closed-loop grid trim)
     On every fast-loop tick while ACTIVE, each charger's dynamic current
     limit is set so that total EV draw matches the *true* solar headroom,
     leaving the battery free to follow whatever the LP plans for it:
 
         non_ev_load     = max(0, house_load_w - Σ(ev_power_w))
         solar_surplus_w = pv_power_w - non_ev_load
-        available_w     = solar_surplus_w - safety_margin_w
+        available_w     = solar_surplus_w - safety_margin_w - grid_trim_w
         amps_per_charger = floor(available_w / n_chargers / (voltage × phases))
+
+    ``grid_trim_w`` is the closed-loop half of the controller and the
+    reason the cars can't sit on the grid: the feed-forward term is only
+    as good as its constants (``voltage × phases``, gross-DC vs AC PV,
+    inverter loss) and its sensors, so any error — plus anything else
+    competing for the same solar, e.g. the battery charging — shows up as
+    *measured* net grid import.  The trim integrates that observed import
+    back out of the setpoint (see :meth:`_update_grid_trim`), so a wrong
+    constant costs one or two ticks of overdraw instead of importing
+    indefinitely.  It decays to zero as soon as the site exports again,
+    and is bypassed while the spot price is negative (grid import is
+    wanted then).
 
     When PV / house-load sensors aren't supplied, falls back to the legacy
     grid-balance formula (``export - import + Σ ev_power``) which is
@@ -128,6 +140,8 @@ class SurplusController:
             DEFAULT_SURPLUS_SAFETY_MARGIN_W,
             DEFAULT_SURPLUS_ACTIVATION_DELAY_S,
             DEFAULT_SURPLUS_DEFICIT_TIMEOUT_S,
+            DEFAULT_SURPLUS_GRID_TRIM_GAIN,
+            DEFAULT_SURPLUS_GRID_TRIM_DEADBAND_W,
         )
 
         # Parameters
@@ -142,12 +156,28 @@ class SurplusController:
         self.safety_margin_w: float = params.get(
             "surplus_safety_margin_w", DEFAULT_SURPLUS_SAFETY_MARGIN_W
         )
+        # Rule 3 closed-loop trim tuning
+        self.grid_trim_gain: float = params.get(
+            "surplus_grid_trim_gain", DEFAULT_SURPLUS_GRID_TRIM_GAIN
+        )
+        self.grid_trim_deadband_w: float = params.get(
+            "surplus_grid_trim_deadband_w", DEFAULT_SURPLUS_GRID_TRIM_DEADBAND_W
+        )
 
         self.ev_chargers_cfg: list[dict[str, Any]] = ev_chargers_cfg
 
         # State machine
         self.state: SurplusState = SurplusState.INACTIVE
         self._state_entered: float | None = None
+
+        # Accumulated closed-loop correction (W) subtracted from the
+        # feed-forward setpoint.  Always ≥ 0 — it only ever removes
+        # power from the cars, never grants extra.
+        self._grid_trim_w: float = 0.0
+        # True when the last tick already had every active charger at its
+        # minimum current, i.e. the actuator is saturated and no further
+        # trim can reduce the draw (anti-windup — see _update_grid_trim).
+        self._at_min_current: bool = False
 
         # Names of EVs currently being managed (started) by this controller
         self._active_charger_names: list[str] = []
@@ -209,6 +239,12 @@ class SurplusController:
             pv_power_w, house_load_w, ev_vehicles,
         )
 
+        # Close the loop on what the meter actually sees before the
+        # handlers turn ``solar_surplus_w`` into charger amps.
+        self._update_grid_trim(
+            solar_surplus_w, grid_export_w, grid_import_w, price_is_negative,
+        )
+
         if self.state is SurplusState.INACTIVE:
             return self._handle_inactive(
                 solar_surplus_w, price_is_negative,
@@ -254,6 +290,73 @@ class SurplusController:
         # Solar minus everything-except-the-cars.
         return pv_power_w - non_ev_load
 
+    def _update_grid_trim(
+        self,
+        solar_surplus_w: float,
+        grid_export_w: float,
+        grid_import_w: float,
+        price_is_negative: bool,
+    ) -> None:
+        """Integrate measured net grid import into :attr:`_grid_trim_w`.
+
+        The feed-forward setpoint (Rule 3) is open-loop: a wrong
+        ``phases``/``voltage`` constant, gross-DC PV that is partly going
+        into the battery, or a miscalibrated house-load sensor all make
+        the cars draw more than the site actually has spare — and nothing
+        in the feed-forward path can see it.  Net grid import *is* the
+        error signal, so it is fed back here:
+
+            error_w = grid_import_w - grid_export_w        # >0 = importing
+            trim_w  = clamp(trim_w + gain × error_w, 0, solar_surplus_w)
+
+        Notes
+        -----
+        * Only accumulates while chargers are actually under control —
+          otherwise ordinary house import (night, cooking) would wind the
+          trim up against the next activation.
+        * Clamped at ``solar_surplus_w`` so ``available_w`` bottoms out at
+          zero: the chargers fall to ``min_current`` and Rule 4 escalates
+          to STOPPING rather than the trim growing without bound.
+        * Anti-windup: once every active charger sits at ``min_current``
+          the remaining import is irreducible (a 3-phase charger's floor
+          is ~4.1 kW), so the trim stops growing and Rule 5's deficit
+          timer takes over.  It still *decays* when the site exports, so
+          recovery to ACTIVE isn't delayed by a wound-up correction.
+        * Negative price → no trim: importing is deliberate then, and
+          Rule 4 is likewise short-circuited.
+        """
+        if not self.is_active or not self._active_charger_names:
+            self._grid_trim_w = 0.0
+            self._at_min_current = False
+            return
+        if price_is_negative:
+            self._grid_trim_w = 0.0
+            return
+
+        error_w = grid_import_w - grid_export_w
+        if abs(error_w) <= self.grid_trim_deadband_w:
+            return
+        if error_w > 0 and self._at_min_current:
+            _LOGGER.debug(
+                "SurplusController: importing %.0f W but all chargers "
+                "already at min current — holding trim at %.0f W",
+                error_w, self._grid_trim_w,
+            )
+            return
+
+        ceiling_w = max(0.0, solar_surplus_w)
+        previous_w = self._grid_trim_w
+        self._grid_trim_w = min(
+            ceiling_w,
+            max(0.0, previous_w + self.grid_trim_gain * error_w),
+        )
+        if self._grid_trim_w != previous_w:
+            _LOGGER.debug(
+                "SurplusController: grid trim %.0f W → %.0f W "
+                "(net import %.0f W, surplus %.0f W)",
+                previous_w, self._grid_trim_w, error_w, solar_surplus_w,
+            )
+
     def status(self) -> dict[str, Any]:
         """Return controller status for sensor / diagnostic display."""
         elapsed: float | None = None
@@ -267,6 +370,7 @@ class SurplusController:
             "activation_delay_s": self.activation_delay_s,
             "deficit_timeout_s": self.deficit_timeout_s,
             "safety_margin_w": self.safety_margin_w,
+            "grid_trim_w": round(self._grid_trim_w, 1),
             "state_elapsed_s": elapsed,
         }
 
@@ -339,8 +443,10 @@ class SurplusController:
         # ``net_surplus_w`` here is now the battery-independent solar
         # surplus (see :meth:`tick`/:meth:`_compute_solar_surplus_w`).
         # That's exactly what the cars can pull without touching the
-        # battery or the grid — no need to add back EV power.
-        total_available_w = net_surplus_w - self.safety_margin_w
+        # battery or the grid — no need to add back EV power.  The trim
+        # removes whatever the meter says we got wrong (see
+        # :meth:`_update_grid_trim`).
+        total_available_w = net_surplus_w - self.safety_margin_w - self._grid_trim_w
         min_viable_w = self._min_viable_w()
 
         # Rule 2: arm any newly connected EVs
@@ -370,8 +476,8 @@ class SurplusController:
         vehicle_map = {v.get("name", ""): v for v in (ev_vehicles or [])}
         active_cfgs = self._active_charger_configs()
 
-        # Same battery-independent surplus used in _handle_active.
-        total_available_w = net_surplus_w - self.safety_margin_w
+        # Same battery-independent surplus (and trim) as _handle_active.
+        total_available_w = net_surplus_w - self.safety_margin_w - self._grid_trim_w
         min_viable_w = self._min_viable_w()
 
         # Rule 4: surplus recovered → back to ACTIVE
@@ -477,6 +583,10 @@ class SurplusController:
         self.state = SurplusState.INACTIVE
         self._state_entered = None
         self._active_charger_names = []
+        # Nothing under control any more — start the next activation from
+        # a clean feed-forward setpoint.
+        self._grid_trim_w = 0.0
+        self._at_min_current = False
 
         return actions
 
@@ -500,11 +610,13 @@ class SurplusController:
         See :meth:`tick` for the derivation.
         """
         if not active_cfgs:
+            self._at_min_current = False
             return []
 
         n = len(active_cfgs)
         per_charger_w = total_available_w / n
 
+        all_at_min = True
         actions: list[dict[str, Any]] = []
         for cfg in active_cfgs:
             dyn_cfg = cfg.get("set_dynamic_limit", {})
@@ -520,24 +632,30 @@ class SurplusController:
 
             target_amps = int(per_charger_w / (voltage * phases))
             target_amps = max(min_current, min(max_current, target_amps))
+            if target_amps > min_current:
+                all_at_min = False
 
             _LOGGER.debug(
-                "SurplusController: %s → %dA "
-                "(avail/charger %.0f W, export %.0f W, import %.0f W)",
-                cfg.get("name"), target_amps, per_charger_w,
-                grid_export_w, grid_import_w,
+                "SurplusController: %s → %dA (%.0f W at %d×%d V) "
+                "(avail/charger %.0f W, export %.0f W, import %.0f W, "
+                "trim %.0f W)",
+                cfg.get("name"), target_amps, target_amps * voltage * phases,
+                phases, voltage, per_charger_w,
+                grid_export_w, grid_import_w, self._grid_trim_w,
             )
             actions.append({
                 "service": service,
                 "device_id": device_id,
                 "data": {"current": target_amps},
             })
+        self._at_min_current = bool(actions) and all_at_min
         return actions
 
     def _set_all_to_min_current(
         self, active_cfgs: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
         """Clamp all active chargers to minimum current (STOPPING state)."""
+        self._at_min_current = True
         actions: list[dict[str, Any]] = []
         for cfg in active_cfgs:
             dyn_cfg = cfg.get("set_dynamic_limit", {})

@@ -249,6 +249,12 @@ parameters:
   # surplus charger is stopped.  During this window the charger is
   # clamped to its minimum current to limit grid draw.
   surplus_grid_import_grace_seconds: 60
+  # Closed-loop grid trim (Rule 3): fraction of the measured net grid
+  # import subtracted from the feed-forward setpoint each tick, so a
+  # wrong watts-per-amp constant or a competing consumer can't import
+  # indefinitely.  Deadband ignores meter noise.
+  surplus_grid_trim_gain: 0.5
+  surplus_grid_trim_deadband_w: 100
   # Fast EV current adjustment loop interval (seconds)
   fast_ev_update_interval: 10
   # --- Negative-price escalation ---

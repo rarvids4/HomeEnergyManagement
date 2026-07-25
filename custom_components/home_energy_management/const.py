@@ -106,6 +106,18 @@ DEFAULT_SURPLUS_GRID_IMPORT_GRACE_S = 60
 #   Z — seconds the deficit must persist before deactivating
 DEFAULT_SURPLUS_ACTIVATION_DELAY_S = 60
 DEFAULT_SURPLUS_DEFICIT_TIMEOUT_S = 60
+# Closed-loop grid trim (Rule 3).  The PV feed-forward setpoint is only
+# as good as its constants (voltage × phases, DC-vs-AC, inverter loss)
+# and its sensors.  Any error shows up as measured grid import, so the
+# trim subtracts the observed net import from the feed-forward on the
+# next tick until the grid is balanced again.
+#   gain     — fraction of the observed net import corrected per tick.
+#              1.0 = one-tick correction (risks overshoot with sensor
+#              lag), 0.5 converges in ~3 ticks / 30 s at a 10 s loop.
+#   deadband — net grid flow (W) ignored so meter noise doesn't jitter
+#              the charger current.
+DEFAULT_SURPLUS_GRID_TRIM_GAIN = 0.5
+DEFAULT_SURPLUS_GRID_TRIM_DEADBAND_W = 100
 
 # --- Negative-price escalation ---
 # When spot price < 0 and solar surplus exists, the integration tries

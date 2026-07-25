@@ -137,6 +137,21 @@ outputs:
       stop_charging:
         service: "switch.turn_off"
         entity_id: "switch.CHANGE_ME_ev_charger_enabled"
+      # Optional — omit for switch-only chargers with no current control.
+      # ``voltage × phases`` is the watts-per-amp scaling the surplus
+      # controller uses to turn available power into a current setpoint
+      # (230 × 3 = 690 W/A, 230 × 1 = 230 W/A).  Get this WRONG and every
+      # watt of surplus becomes N watts of charging, with the difference
+      # imported from the grid — check what the charger actually does
+      # while charging rather than assuming (for Easee, the status
+      # sensor's ``state_outputPhase``/``config_phaseMode`` attributes).
+      # set_dynamic_limit:
+      #   service: "CHANGE_ME_charger.set_dynamic_limit"
+      #   device_id: "CHANGE_ME_charger_device_id"
+      #   voltage: 230
+      #   phases: 3
+      #   min_current: 6
+      #   max_current: 32
 
   # --- Sungrow Battery Control ---
   sungrow:
@@ -295,6 +310,15 @@ parameters:
   # clamped to its minimum current to limit grid draw while waiting
   # for solar to recover.  Recommended: 30–120 s.
   surplus_grid_import_grace_seconds: 60
+  # Closed-loop grid trim (Rule 3).  Fraction of the measured net grid
+  # import subtracted from the feed-forward setpoint each tick, so a
+  # wrong watts-per-amp constant or a competing consumer (battery
+  # charging) is corrected instead of imported indefinitely.
+  # 1.0 = correct in one tick (may overshoot with sensor lag).
+  surplus_grid_trim_gain: 0.5
+  # Net grid flow (W) ignored by the trim so meter noise doesn't jitter
+  # the charger current.
+  surplus_grid_trim_deadband_w: 100
   # Fast EV current adjustment loop interval (seconds).  Lower = more
   # responsive surplus tracking; higher = less HA service-call traffic.
   fast_ev_update_interval: 10

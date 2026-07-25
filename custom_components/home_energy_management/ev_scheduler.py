@@ -238,6 +238,10 @@ class EVScheduler:
         """Schedule a single vehicle and return its plan summary."""
         name = ev.get("name", "ev")
         soc = ev.get("vehicle_soc", 0)
+        # A genuine 0% SoC still needs charging; only skip when the reading
+        # is truly unavailable. Fall back to the legacy ``soc > 0`` rule when
+        # the coordinator did not supply an availability flag.
+        soc_available = ev.get("vehicle_soc_available", soc > 0)
         capacity = ev.get("vehicle_capacity_kwh", 0)
         charging_w = ev.get("vehicle_charging_power_w", 0)
         connected = ev.get("connected", False)
@@ -266,7 +270,7 @@ class EVScheduler:
         if charging_kw <= 0:
             charging_kw = 7.0
 
-        needs_charge = soc > 0 and capacity > 0 and soc < target
+        needs_charge = soc_available and capacity > 0 and soc < target
 
         if not needs_charge:
             return self._make_vehicle_plan(

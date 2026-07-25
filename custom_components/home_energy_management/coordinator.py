@@ -533,7 +533,12 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 is_connected = True
 
             # Vehicle battery sensors (optional — from Volvo Cars API etc.)
-            vehicle_soc = self._get_state_float(charger.get("vehicle_soc"))
+            # Distinguish a genuine 0% reading from an unavailable/unknown
+            # sensor: a car really at 0% must still be scheduled to charge,
+            # but a sleeping car whose API reports unknown must not be.
+            vehicle_soc, vehicle_soc_available = self._get_state_float_available(
+                charger.get("vehicle_soc")
+            )
             vehicle_capacity = self._get_state_float(charger.get("vehicle_capacity_kwh"))
             vehicle_target_soc = self._get_state_float(charger.get("vehicle_target_soc"))
             vehicle_charging_power = self._get_state_float(charger.get("vehicle_charging_power"))
@@ -576,6 +581,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 "status": status,
                 "connected": is_connected,
                 "vehicle_soc": vehicle_soc,
+                "vehicle_soc_available": vehicle_soc_available,
                 "vehicle_capacity_kwh": vehicle_capacity,
                 "vehicle_target_soc": vehicle_target_soc if vehicle_target_soc > 0 else 100.0,
                 "vehicle_charging_power_w": vehicle_charging_power,
@@ -880,6 +886,32 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             return ""
         state = self.hass.states.get(entity_id)
         return state.state if state else ""
+
+    def _get_state_float_available(
+        self, entity_id: str | None
+    ) -> tuple[float, bool]:
+        """Return (value, available) for a numeric entity.
+
+        ``available`` is False when the entity is missing, reports
+        ``unknown``/``unavailable``, or is non-numeric — which is distinct
+        from a genuine ``0.0`` reading (available=True). Callers use the
+        flag to avoid conflating "no data" with "really at zero".
+        """
+        if not entity_id:
+            return 0.0, False
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in (
+            "unknown",
+            "unavailable",
+            "none",
+            "None",
+            "",
+        ):
+            return 0.0, False
+        try:
+            return float(state.state), True
+        except (ValueError, TypeError):
+            return 0.0, False
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:

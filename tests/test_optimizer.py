@@ -1339,6 +1339,76 @@ class TestLPArbitrage:
         charging_hours = [h for h in plan["schedule"] if h["charging"]]
         assert len(charging_hours) == 0
 
+    def test_ev_genuine_zero_soc_charges(self, default_params, default_outputs):
+        """A car really at 0% (SoC available) must be scheduled to charge.
+
+        Regression: the old ``soc > 0`` guard suppressed charging for a
+        vehicle genuinely at 0%, reporting 0 kWh needed.
+        """
+        ev_zero = [{
+            "name": "ex90",
+            "power_w": 0,
+            "status": "awaiting_start",
+            "connected": True,
+            "vehicle_soc": 0.0,
+            "vehicle_soc_available": True,   # a real 0% reading, not "unknown"
+            "vehicle_capacity_kwh": 18.8,
+            "vehicle_target_soc": 84,
+            "vehicle_charging_power_w": 0,
+        }]
+        opt = Optimizer(default_params, default_outputs)
+        prices = {"today": [0.50] * 24, "tomorrow": [], "currency": "SEK"}
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_zero,
+        )
+
+        plan = result["ev_charge_schedule"]
+        # (84 - 0) / 100 * 18.8 = 15.79 kWh
+        assert plan["total_kwh_needed"] > 15.0, (
+            f"Car at genuine 0% should need charging, got "
+            f"{plan['total_kwh_needed']} kWh"
+        )
+
+    def test_ev_unavailable_soc_does_not_charge(
+        self, default_params, default_outputs
+    ):
+        """A car whose SoC sensor is unavailable (reads 0) must NOT charge.
+
+        This is the case the ``soc > 0`` guard was protecting; the
+        availability flag preserves it while still allowing a genuine 0%.
+        """
+        ev_unknown = [{
+            "name": "ex90",
+            "power_w": 0,
+            "status": "awaiting_start",
+            "connected": True,
+            "vehicle_soc": 0.0,
+            "vehicle_soc_available": False,  # sensor unknown/unavailable → 0
+            "vehicle_capacity_kwh": 18.8,
+            "vehicle_target_soc": 84,
+            "vehicle_charging_power_w": 0,
+        }]
+        opt = Optimizer(default_params, default_outputs)
+        prices = {"today": [0.50] * 24, "tomorrow": [], "currency": "SEK"}
+
+        result = opt.optimize(
+            prices=prices,
+            predicted_consumption=[1.0] * 24,
+            battery_soc=50,
+            ev_connected=True,
+            ev_vehicles=ev_unknown,
+        )
+
+        plan = result["ev_charge_schedule"]
+        assert plan["total_kwh_needed"] == 0, (
+            "Unavailable SoC must not schedule phantom charging"
+        )
+
     def test_ev_avoids_discharge_hours(
         self, default_params, default_outputs, ev_vehicle_ex90
     ):

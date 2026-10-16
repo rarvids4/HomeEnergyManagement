@@ -221,7 +221,7 @@ class Optimizer:
                 # Only take over the inverter's min SoC when the reserve
                 # feature is in use.
                 min_soc_setpoint=(
-                    self._battery.active_min_soc
+                    self._battery.inverter_min_soc
                     if self._battery.reserve_soc > 0 else None
                 ),
             )

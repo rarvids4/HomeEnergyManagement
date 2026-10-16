@@ -281,3 +281,18 @@ def test_optimizer_sets_reserve_on_expensive_day_and_restores_after(midnight):
 
     normal = _optimize({**params, "battery_reserve_spot_threshold_sek": 2.0})
     assert [a["data"]["value"] for a in normal] == [10]
+
+
+def test_normal_day_restores_configured_min_soc_below_hard_floor(midnight):
+    """Inverter at 4 % stays at 4 % on normal days; planning still uses 8 %."""
+    outputs = {"sungrow": {**OUTPUTS["sungrow"], "min_soc": 4}}
+    params = {**CONTRACT_PARAMS, "battery_reserve_soc": 20,
+              "battery_reserve_spot_threshold_sek": 3.0}   # SPOT peaks at 1.40
+    opt = Optimizer(params, outputs)
+    result = opt.optimize(
+        prices={"today": SPOT, "currency": "SEK"},
+        predicted_consumption=[1.5] * 24, battery_soc=60.0, ev_connected=False,
+    )
+    assert [a["data"]["value"] for a in _min_soc_writes(result["immediate_actions"])] == [4]
+    assert opt._battery.active_min_soc == 8
+

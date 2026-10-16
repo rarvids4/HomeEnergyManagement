@@ -459,7 +459,7 @@ With a floor or a monthly-average contract, negative spot hours no longer pay yo
 | `battery_reserve_soc` | int | `0` | SoC (%) the battery is not discharged below while the reserve is active. Never forces a grid charge. `0` = disabled |
 | `battery_reserve_spot_threshold_sek` | float | `0.0` | The reserve is active when the highest hourly spot price in the planning horizon is at or above this. `0` = every day |
 
-When `battery_reserve_soc` > 0 the integration writes the active floor (the reserve, or `min_soc` on normal days) to `outputs.sungrow.set_min_soc` every cycle, because self-consumption mode otherwise discharges down to the inverter's own min SoC.
+When `battery_reserve_soc` > 0 the integration writes the active floor (the reserve, or your configured `min_soc` unchanged on normal days) to `outputs.sungrow.set_min_soc` every cycle, because self-consumption mode otherwise discharges down to the inverter's own min SoC.
 
 #### EV Charging Strategy
 

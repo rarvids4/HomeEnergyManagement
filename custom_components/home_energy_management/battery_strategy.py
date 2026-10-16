@@ -187,6 +187,7 @@ class BatteryStrategy:
         sg_out = outputs.get(OUTPUT_SUNGROW, {})
         # Enforce the hard SoC floor — never below BATTERY_SOC_HARD_FLOOR
         configured_min_soc = sg_out.get("min_soc", DEFAULT_MIN_SOC)
+        self.configured_min_soc: float = configured_min_soc
         self.min_soc: float = max(configured_min_soc, BATTERY_SOC_HARD_FLOOR)
         self.max_soc: float = sg_out.get("max_soc", DEFAULT_MAX_SOC)
         self.battery_capacity: float = sg_out.get(
@@ -239,9 +240,12 @@ class BatteryStrategy:
             DEFAULT_BATTERY_RESERVE_SPOT_THRESHOLD_SEK,
         )
         # SoC floor used by the latest plan — min_soc, or the reserve
-        # while it is active.  Read by the optimizer to set the
-        # inverter's min SoC.
+        # while it is active.
         self.active_min_soc: float = self.min_soc
+        # Inverter min SoC to write while the reserve feature is enabled:
+        # the reserve floor while active, otherwise the configured min_soc
+        # unchanged (the hard floor only applies to planning).
+        self.inverter_min_soc: float = configured_min_soc
 
     def _soc_floor(self, pw: PriceWindow, battery_soc: float) -> float:
         """SoC floor for this plan: the reserve on expensive days, else min_soc.
@@ -290,6 +294,10 @@ class BatteryStrategy:
             Hourly plan entries with action, reason, price, etc.
         """
         self.active_min_soc = self._soc_floor(pw, battery_soc)
+        self.inverter_min_soc = (
+            self.active_min_soc if self.active_min_soc > self.min_soc
+            else self.configured_min_soc
+        )
 
         if not self.enable_battery or pw.is_empty:
             return self._passive_plan(pw, predicted_consumption)

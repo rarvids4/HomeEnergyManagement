@@ -133,6 +133,7 @@ class ActionBuilder:
         predicted_solar: float = 0.0,
         target_soc: float = 100.0,
         current_soc: float = 0.0,
+        min_soc_setpoint: float | None = None,
     ) -> list[dict[str, Any]]:
         """Convert the current hour's plan into HA service calls.
 
@@ -152,6 +153,8 @@ class ActionBuilder:
                 target_soc, spot_price=spot_price,
                 current_soc=current_soc,
             ))
+            if min_soc_setpoint is not None:
+                self._set_min_soc(sg_out, actions, min_soc_setpoint)
 
         # --- EV charger actions ---
         ev_chargers = (
@@ -620,6 +623,27 @@ class ActionBuilder:
                 "full self-consumption discharge",
                 pwr_cfg["entity_id"], value,
             )
+
+    @staticmethod
+    def _set_min_soc(
+        sg_out: dict[str, Any],
+        actions: list[dict[str, Any]],
+        value_pct: float,
+    ) -> None:
+        """Write the inverter's min SoC so it stops discharging there.
+
+        Self-consumption mode discharges down to the inverter's own min
+        SoC regardless of the LP plan, so the expensive-day reserve only
+        holds if the inverter is told about it.  Rounded down so the
+        setpoint never sits above the SoC the plan was built on.
+        """
+        cfg = sg_out.get("set_min_soc", {})
+        if cfg.get("service") and cfg.get("entity_id"):
+            actions.append({
+                "service": cfg["service"],
+                "entity_id": cfg["entity_id"],
+                "data": {"value": math.floor(value_pct)},
+            })
 
     @staticmethod
     def _stop_forced_cmd(sg_out: dict[str, Any]) -> list[dict[str, Any]]:

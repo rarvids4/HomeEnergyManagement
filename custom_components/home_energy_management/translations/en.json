@@ -16,13 +16,16 @@
   "options": {
     "step": {
       "init": {
-        "title": "Grid Tariffs",
-        "description": "Set your grid operator's transfer tariffs (SEK/kWh incl. VAT). These are added to the Nordpool spot price when the optimizer decides when to charge.",
+        "title": "Tariffs",
+        "description": "Grid transfer tariffs are added on top of the energy price (SEK/kWh incl. VAT). Tariff mode sets the energy price: 'spot' = hourly Nordpool spot; 'monthly_average' = one flat price for every hour, the rolling average spot from the 1st of the month (or the fixed monthly average below when > 0). The price floor (0 = none) is the lowest energy price your contract charges. Export is always paid at hourly spot.",
         "data": {
           "grid_tariff_peak_sek": "Peak tariff (SEK/kWh)",
           "grid_tariff_offpeak_sek": "Off-peak tariff (SEK/kWh)",
           "grid_tariff_peak_start": "Peak hours start (0-23)",
-          "grid_tariff_peak_end": "Peak hours end (0-23)"
+          "grid_tariff_peak_end": "Peak hours end (0-23)",
+          "buy_price_mode": "Tariff mode (spot / monthly_average)",
+          "buy_price_floor_sek": "Energy price floor (SEK/kWh, 0 = none)",
+          "buy_price_monthly_avg_sek": "Fixed monthly average (SEK/kWh, 0 = rolling average from the 1st)"
         }
       }
     }

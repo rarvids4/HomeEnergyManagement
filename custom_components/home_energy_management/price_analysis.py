@@ -14,6 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .const import (
+    BUY_PRICE_MODE_MONTHLY_AVERAGE,
+    DEFAULT_BUY_PRICE_FLOOR_SEK,
+    DEFAULT_BUY_PRICE_MODE,
+    DEFAULT_BUY_PRICE_MONTHLY_AVG_SEK,
     DEFAULT_GRID_TARIFF_OFFPEAK_SEK,
     DEFAULT_GRID_TARIFF_PEAK_END,
     DEFAULT_GRID_TARIFF_PEAK_SEK,
@@ -23,6 +27,30 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 
+def grid_charge_break_even(
+    peak_tariff: float,
+    offpeak_tariff: float,
+    round_trip_efficiency: float,
+) -> float | None:
+    """Flat energy price below which off-peak → peak battery cycling pays off.
+
+    With a flat energy price *P* (monthly-average contract) the only
+    hourly difference is the grid tariff.  Buying 1 kWh off-peak and
+    using it at peak saves money when
+
+        P + offpeak  <  rt × (P + peak)
+        ⇔  P  <  (rt × peak − offpeak) / (1 − rt)
+
+    Returns None when the round trip is lossless (no break-even).
+    """
+    if round_trip_efficiency >= 1.0:
+        return None
+    return (
+        (round_trip_efficiency * peak_tariff - offpeak_tariff)
+        / (1.0 - round_trip_efficiency)
+    )
+
+
 @dataclass
 class PriceWindow:
     """Immutable snapshot of price data for the planning horizon.
@@ -30,7 +58,7 @@ class PriceWindow:
     Attributes
     ----------
     effective : list[float]
-        Spot + grid tariff per hour (what you really pay).
+        Buy energy price + grid tariff per hour (what you really pay).
     spot : list[float]
         Raw spot prices per hour (no tariff).
     current_hour : int
@@ -81,6 +109,49 @@ class PriceAnalyzer:
             "grid_tariff_peak_end", DEFAULT_GRID_TARIFF_PEAK_END
         )
 
+        # Buy-price contract (energy part, before the grid tariff)
+        self.buy_price_mode = params.get("buy_price_mode", DEFAULT_BUY_PRICE_MODE)
+        self.buy_price_floor = params.get(
+            "buy_price_floor_sek", DEFAULT_BUY_PRICE_FLOOR_SEK
+        )
+        self.buy_price_monthly_avg = params.get(
+            "buy_price_monthly_avg_sek", DEFAULT_BUY_PRICE_MONTHLY_AVG_SEK
+        )
+        # Rolling month-to-date average spot — set by the coordinator
+        # from MonthlyPriceTracker.  None = no history yet.
+        self.buy_price_rolling_avg: float | None = None
+
+    def monthly_average(self, known_spot: list[float]) -> float | None:
+        """Monthly average spot used in ``monthly_average`` mode.
+
+        A fixed ``buy_price_monthly_avg_sek`` wins; otherwise the rolling
+        month-to-date average; before any history exists, the mean of
+        *known_spot* (the Nordpool prices currently available).
+        """
+        if self.buy_price_monthly_avg > 0:
+            return self.buy_price_monthly_avg
+        if self.buy_price_rolling_avg is not None:
+            return self.buy_price_rolling_avg
+        if known_spot:
+            return sum(known_spot) / len(known_spot)
+        return None
+
+    def buy_energy_price(self, spot_price: float, known_spot: list[float]) -> float:
+        """Energy price paid per kWh for *spot_price*, before the grid tariff.
+
+        In ``monthly_average`` mode every hour costs the same monthly
+        average (see :meth:`monthly_average`).  The contract floor, when
+        set (> 0), is applied last.
+        """
+        price = spot_price
+        if self.buy_price_mode == BUY_PRICE_MODE_MONTHLY_AVERAGE:
+            avg = self.monthly_average(known_spot)
+            if avg is not None:
+                price = avg
+        if self.buy_price_floor > 0:
+            price = max(price, self.buy_price_floor)
+        return price
+
     def get_grid_tariff(self, hour: int) -> float:
         """Return the grid transfer tariff (SEK/kWh) for *hour* of day.
 
@@ -118,9 +189,10 @@ class PriceAnalyzer:
         if not horizon_spot:
             horizon_spot = all_prices[current_hour:]
 
-        # Apply grid tariffs → effective prices
+        # Apply buy-price contract + grid tariffs → effective prices
         horizon_effective = [
-            price + self.get_grid_tariff((current_hour + i) % 24)
+            self.buy_energy_price(price, all_prices)
+            + self.get_grid_tariff((current_hour + i) % 24)
             for i, price in enumerate(horizon_spot)
         ]
 
@@ -165,7 +237,7 @@ class PriceAnalyzer:
         for i in range(base_plan_length, len(extended_prices)):
             hour = (current_hour + i) % 24
             spot = extended_prices[i]
-            eff = spot + self.get_grid_tariff(hour)
+            eff = self.buy_energy_price(spot, all_prices) + self.get_grid_tariff(hour)
             entries.append({
                 "hour": hour,
                 "action": ACTION_SELF_CONSUMPTION,

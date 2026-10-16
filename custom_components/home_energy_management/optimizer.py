@@ -68,10 +68,53 @@ class Optimizer:
         # Grid tariff values — writable by coordinator (options flow)
         self.grid_tariff_peak = self._prices.grid_tariff_peak
         self.grid_tariff_offpeak = self._prices.grid_tariff_offpeak
+        self.grid_tariff_peak_start = self._prices.grid_tariff_peak_start
+        self.grid_tariff_peak_end = self._prices.grid_tariff_peak_end
+        # Buy-price contract (tariff mode) — writable by coordinator
+        # (options flow / input helper)
+        self.buy_price_mode = self._prices.buy_price_mode
+        self.buy_price_floor = self._prices.buy_price_floor
+        self.buy_price_monthly_avg = self._prices.buy_price_monthly_avg
+        # Rolling month-to-date average spot — set by the coordinator
+        self.buy_price_rolling_avg: float | None = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def buy_energy_price(self, spot_price: float, prices: dict[str, Any]) -> float:
+        """Energy price paid per kWh right now, before the grid tariff.
+
+        Equals *spot_price* on an hourly-spot contract.  With a price
+        floor or a monthly-average contract it stays positive during
+        negative spot hours — importing is then never paid.
+        """
+        self._sync_prices()
+        known_spot = list(prices.get("today", [])) + list(prices.get("tomorrow", []))
+        return self._prices.buy_energy_price(spot_price, known_spot)
+
+    def monthly_average(self, prices: dict[str, Any]) -> float | None:
+        """Monthly average spot the ``monthly_average`` mode bills at."""
+        self._sync_prices()
+        known_spot = list(prices.get("today", [])) + list(prices.get("tomorrow", []))
+        return self._prices.monthly_average(known_spot)
+
+    @property
+    def round_trip_efficiency(self) -> float:
+        """Battery charge × discharge efficiency used by the LP."""
+        return self._battery.charge_efficiency * self._battery.discharge_efficiency
+
+    def _sync_prices(self) -> None:
+        """Push the writable tariff / contract values to the price analyzer."""
+        p = self._prices
+        p.grid_tariff_peak = self.grid_tariff_peak
+        p.grid_tariff_offpeak = self.grid_tariff_offpeak
+        p.grid_tariff_peak_start = self.grid_tariff_peak_start
+        p.grid_tariff_peak_end = self.grid_tariff_peak_end
+        p.buy_price_mode = self.buy_price_mode
+        p.buy_price_floor = self.buy_price_floor
+        p.buy_price_monthly_avg = self.buy_price_monthly_avg
+        p.buy_price_rolling_avg = self.buy_price_rolling_avg
 
     def optimize(
         self,
@@ -100,9 +143,8 @@ class Optimizer:
         now = datetime.now()
         current_hour = now.hour
 
-        # Sync writable tariff values to price analyzer
-        self._prices.grid_tariff_peak = self.grid_tariff_peak
-        self._prices.grid_tariff_offpeak = self.grid_tariff_offpeak
+        # Sync writable tariff / contract values to price analyzer
+        self._sync_prices()
 
         # ── Step 1: Price analysis ──────────────────────────────────
         pw = self._prices.build_price_window(prices, current_hour)
@@ -176,6 +218,12 @@ class Optimizer:
                 predicted_solar=pred_solar_0,
                 target_soc=target_soc,
                 current_soc=battery_soc,
+                # Only take over the inverter's min SoC when the reserve
+                # feature is in use.
+                min_soc_setpoint=(
+                    self._battery.active_min_soc
+                    if self._battery.reserve_soc > 0 else None
+                ),
             )
 
         # ── Summary ────────────────────────────────────────────────

@@ -430,6 +430,37 @@ Time-of-use network fees added to spot prices to get the **effective cost** per 
 
 > **Example:** Vattenfall SE3 (incl. 25% VAT): peak 1.40 SEK/kWh, off-peak 0.831 SEK/kWh
 
+#### Buy-Price Contract (Tariff Mode)
+
+By default the energy part of the buy price is the hourly Nordpool spot. If your contract differs, describe it here — the grid tariffs above are still added on top, and the sell price always follows hourly spot. These can also be set in the integration's options (**Settings → Devices & services → Home Energy Management → Configure**), which take precedence over the mapping.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `buy_price_mode` | string | `spot` | `spot` = hourly spot. `monthly_average` = one flat price for every hour: the rolling average spot from the 1st of the month |
+| `buy_price_floor_sek` | float | `0.0` | Lowest energy price the contract ever charges (SEK/kWh, incl. VAT). `0` = no floor |
+| `buy_price_monthly_avg_sek` | float | `0.0` | Fixed monthly average for `monthly_average` mode. `0` = rolling month-to-date average |
+| `buy_price_monthly_avg_entity` | entity_id | — | `input_number` helper — overrides `buy_price_monthly_avg_sek` at runtime (when > 0) |
+
+The rolling average is the mean of every hourly spot price from the 1st of the month through today. Nordpool only exposes today and tomorrow, so the integration stores each day's average in HA storage (`.storage/home_energy_management.monthly_prices`). After a fresh install it back-fills the missing days of the month from the recorder's history of the Nordpool price sensor, as far back as the recorder keeps it (10 days by default). Until any history exists it falls back to the mean of today + tomorrow. Two sensors track it over time (both keep long-term statistics, so they graph in history and statistics cards):
+
+| Sensor | State | Key attributes |
+|--------|-------|----------------|
+| `sensor.home_energy_management_monthly_average_price` | Monthly average in use (SEK/kWh) | `price_in_use` (after the floor), `days_counted`, `missing_days`, `daily_averages` |
+| `sensor.home_energy_management_grid_charge_break_even` | Monthly average below which off-peak → peak battery cycling pays off, from the live tariffs and round-trip efficiency | `grid_charging_profitable`, `margin_per_kwh`, `grid_tariff_peak`, `grid_tariff_offpeak` |
+
+Both are unknown in `spot` mode.
+
+With a floor or a monthly-average contract, negative spot hours no longer pay you to import: the export block still applies, but surplus EV charging stops importing on purpose.
+
+#### Battery Reserve on Expensive Days
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `battery_reserve_soc` | int | `0` | SoC (%) the battery is not discharged below while the reserve is active. Never forces a grid charge. `0` = disabled |
+| `battery_reserve_spot_threshold_sek` | float | `0.0` | The reserve is active when the highest hourly spot price in the planning horizon is at or above this. `0` = every day |
+
+When `battery_reserve_soc` > 0 the integration writes the active floor (the reserve, or `min_soc` on normal days) to `outputs.sungrow.set_min_soc` every cycle, because self-consumption mode otherwise discharges down to the inverter's own min SoC.
+
 #### EV Charging Strategy
 
 | Parameter | Type | Default | Description |

@@ -7,7 +7,8 @@ and exposes the results to HA sensor entities.
 from __future__ import annotations
 
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
+from functools import partial
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -16,9 +17,11 @@ from homeassistant.helpers.event import (
     async_track_state_change_event,
     async_track_time_interval,
 )
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 
 from .const import (
+    BUY_PRICE_MODE_MONTHLY_AVERAGE,
     DEFAULT_CLOUD_OPACITY,
     DEFAULT_ENTRIES_PER_HOUR,
     DEFAULT_FAST_EV_UPDATE_INTERVAL,
@@ -34,9 +37,12 @@ from .const import (
     MAPPING_INPUTS,
     MAPPING_OUTPUTS,
     MAPPING_PARAMETERS,
+    MONTHLY_PRICE_STORE_KEY,
+    MONTHLY_PRICE_STORE_VERSION,
     OUTPUT_EV_CHARGERS,
 )
 from .logger import PredictionLogger
+from .monthly_price import MonthlyPriceTracker, daily_averages_from_history
 from .optimizer import Optimizer
 from .predictor import ConsumptionPredictor, STREAM_EV, STREAM_HOUSE
 from .solar_predictor import SolarPredictor
@@ -75,6 +81,15 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             recency_weight=self.params.get("prediction_recency_weight", 0.7),
         )
         self.optimizer = Optimizer(self.params, self.outputs)
+
+        # Rolling month-to-date spot average for the monthly-average
+        # tariff mode (loaded / back-filled lazily on first use).
+        self.monthly_prices = MonthlyPriceTracker()
+        self._monthly_store: Store | None = None
+        # Rolling-average status for the Monthly Average Price and
+        # Grid Charge Break-even sensors ({} outside monthly-average mode)
+        self.monthly_price_status: dict[str, Any] = {}
+
         self.prediction_logger = PredictionLogger(
             max_entries=500,
             log_level=self.params.get("log_level", "info"),
@@ -222,9 +237,15 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 "connected": connected,
             })
 
-        # 3. Current spot price (for logging)
+        # 3. Current buy price — negative only when importing is paid.
+        # With a price floor / monthly-average contract it stays positive
+        # during negative spot hours, so surplus charging never imports
+        # on purpose.
         latest_data = self.data or {}
-        current_price = (latest_data.get("prices") or {}).get("current", 0.0)
+        latest_prices = latest_data.get("prices") or {}
+        current_price = self.optimizer.buy_energy_price(
+            latest_prices.get("current", 0.0), latest_prices,
+        )
 
         # 4. Tick the state machine
         actions = self.surplus_controller.tick(
@@ -286,8 +307,12 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         if opt_days_entity:
             entities.append(opt_days_entity)
 
-        # Grid tariff input helpers
-        for key in ("grid_tariff_peak_entity", "grid_tariff_offpeak_entity"):
+        # Grid tariff / buy price input helpers
+        for key in (
+            "grid_tariff_peak_entity",
+            "grid_tariff_offpeak_entity",
+            "buy_price_monthly_avg_entity",
+        ):
             entity = self.params.get(key)
             if entity:
                 entities.append(entity)
@@ -361,6 +386,19 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 val = self._get_state_float(tariff_offpeak_entity)
                 if val > 0:
                     self.optimizer.grid_tariff_offpeak = val
+
+            # Monthly-average buy price override (input_number helper)
+            monthly_avg_entity = self.params.get("buy_price_monthly_avg_entity")
+            if monthly_avg_entity:
+                val = self._get_state_float(monthly_avg_entity)
+                if val > 0:
+                    self.optimizer.buy_price_monthly_avg = val
+
+            # 5a. Rolling month-to-date average (monthly-average tariff mode)
+            if self.optimizer.buy_price_mode == BUY_PRICE_MODE_MONTHLY_AVERAGE:
+                await self._update_monthly_prices(prices)
+            else:
+                self.monthly_price_status = {}
 
             # 5b. Predict solar production from weather forecast
             predicted_solar = await self._predict_solar(horizon)
@@ -617,6 +655,95 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             data["temperature"] = 0.0
 
         return data
+
+    async def _update_monthly_prices(self, prices: dict[str, Any]) -> None:
+        """Record today's spot average and refresh the month-to-date average.
+
+        On first use the stored per-day averages are loaded and any
+        missing days this month are back-filled from the recorder's
+        history of the Nordpool price state (limited by the recorder's
+        retention, 10 days by default).
+        """
+        today = datetime.now().date()
+        tracker = self.monthly_prices
+        changed = False
+
+        if self._monthly_store is None:
+            self._monthly_store = Store(
+                self.hass, MONTHLY_PRICE_STORE_VERSION, MONTHLY_PRICE_STORE_KEY,
+            )
+            stored = await self._monthly_store.async_load() or {}
+            tracker.days.update(stored.get("days", {}))
+            changed = await self._backfill_monthly_prices(today)
+
+        changed |= tracker.prune(today)
+        changed |= tracker.record_day(today, prices.get("today", []))
+        if changed:
+            self._monthly_store.async_delay_save(
+                lambda: {"days": dict(tracker.days)}, 60,
+            )
+
+        self.optimizer.buy_price_rolling_avg = tracker.month_average(today)
+        self.monthly_price_status = {
+            "average": self.optimizer.monthly_average(prices),
+            "rolling_average": self.optimizer.buy_price_rolling_avg,
+            "price_in_use": self.optimizer.buy_energy_price(
+                prices.get("current", 0.0), prices,
+            ),
+            "days": tracker.days_recorded(today),
+            "missing_days": [d.isoformat() for d in tracker.missing_days(today)],
+            "daily_averages": tracker.month_days(today),
+        }
+
+    async def _backfill_monthly_prices(self, today) -> bool:
+        """Fill missing days this month from recorded Nordpool price states.
+
+        Returns True when any day was recovered.
+        """
+        missing = self.monthly_prices.missing_days(today)
+        entity_id = self.inputs.get(INPUT_NORDPOOL, {}).get("current_price")
+        if not missing or not entity_id:
+            return False
+
+        start = datetime.combine(missing[0], datetime.min.time())
+        end = datetime.combine(today, datetime.min.time())
+        try:
+            from homeassistant.components.recorder import get_instance, history
+
+            states = await get_instance(self.hass).async_add_executor_job(
+                partial(
+                    history.state_changes_during_period,
+                    self.hass,
+                    start.astimezone(),
+                    end.astimezone(),
+                    entity_id=entity_id,
+                    no_attributes=True,
+                    include_start_time_state=True,
+                )
+            )
+        except Exception as exc:  # recorder missing / API change
+            _LOGGER.warning("Monthly price back-fill skipped: %s", exc)
+            return False
+
+        points = []
+        for state in states.get(entity_id, []):
+            try:
+                price = float(state.state)
+            except (TypeError, ValueError):
+                continue  # unavailable / unknown
+            local = state.last_changed.astimezone().replace(tzinfo=None)
+            points.append((max(local, start), price))
+
+        filled = 0
+        for day, avg in daily_averages_from_history(points, end).items():
+            if day in missing:
+                self.monthly_prices.record_day(day, [avg], hours=24)
+                filled += 1
+        _LOGGER.info(
+            "Monthly price back-fill: %d of %d missing days recovered from history",
+            filled, len(missing),
+        )
+        return filled > 0
 
     def _read_prices(self) -> dict[str, Any]:
         """Read Nordpool price data from HA.

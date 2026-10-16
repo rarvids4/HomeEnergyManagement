@@ -9,7 +9,30 @@ import yaml
 from homeassistant import config_entries
 from homeassistant.core import HomeAssistant
 
-from .const import CONF_MAPPING_PATH, DEFAULT_MAPPING_PATH, DOMAIN
+from .const import (
+    BUY_PRICE_MODES,
+    CONF_MAPPING_PATH,
+    DEFAULT_BUY_PRICE_FLOOR_SEK,
+    DEFAULT_BUY_PRICE_MODE,
+    DEFAULT_BUY_PRICE_MONTHLY_AVG_SEK,
+    DEFAULT_GRID_TARIFF_OFFPEAK_SEK,
+    DEFAULT_GRID_TARIFF_PEAK_END,
+    DEFAULT_GRID_TARIFF_PEAK_SEK,
+    DEFAULT_GRID_TARIFF_PEAK_START,
+    DEFAULT_MAPPING_PATH,
+    DOMAIN,
+)
+
+# Options key → (optimizer attribute, fallback default)
+_OPTION_ATTRS = {
+    "grid_tariff_peak_sek": ("grid_tariff_peak", DEFAULT_GRID_TARIFF_PEAK_SEK),
+    "grid_tariff_offpeak_sek": ("grid_tariff_offpeak", DEFAULT_GRID_TARIFF_OFFPEAK_SEK),
+    "grid_tariff_peak_start": ("grid_tariff_peak_start", DEFAULT_GRID_TARIFF_PEAK_START),
+    "grid_tariff_peak_end": ("grid_tariff_peak_end", DEFAULT_GRID_TARIFF_PEAK_END),
+    "buy_price_mode": ("buy_price_mode", DEFAULT_BUY_PRICE_MODE),
+    "buy_price_floor_sek": ("buy_price_floor", DEFAULT_BUY_PRICE_FLOOR_SEK),
+    "buy_price_monthly_avg_sek": ("buy_price_monthly_avg", DEFAULT_BUY_PRICE_MONTHLY_AVG_SEK),
+}
 
 
 async def _validate_mapping(hass: HomeAssistant, path: str) -> dict | None:
@@ -75,22 +98,38 @@ class HomeEnergyManagementConfigFlow(
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
         """Return the options flow handler."""
-        return HomeEnergyManagementOptionsFlow(config_entry)
+        return HomeEnergyManagementOptionsFlow()
 
 
 class HomeEnergyManagementOptionsFlow(config_entries.OptionsFlow):
-    """Handle options for Home Energy Management (tariffs, etc.)."""
+    """Handle options for Home Energy Management (tariffs, etc.).
 
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """Initialise options flow."""
-        self.config_entry = config_entry
+    ``self.config_entry`` is provided by Home Assistant — it can no
+    longer be assigned in ``__init__`` (HA 2025.12+).
+    """
+
+    def _current(self) -> dict:
+        """Values the form starts from: saved options, else what's running.
+
+        Falling back to the running optimizer (mapping / input helpers)
+        means opening and saving the form never resets a tariff to 0.
+        """
+        data = self.hass.data.get(DOMAIN, {}).get(self.config_entry.entry_id, {})
+        opt = getattr(data.get("coordinator"), "optimizer", None)
+        current = {}
+        for key, (attr, fallback) in _OPTION_ATTRS.items():
+            if key in self.config_entry.options:
+                current[key] = self.config_entry.options[key]
+            else:
+                current[key] = getattr(opt, attr, fallback)
+        return current
 
     async def async_step_init(self, user_input=None):
-        """Main options step — grid tariffs."""
+        """Main options step — grid tariffs and buy-price contract."""
         if user_input is not None:
             return self.async_create_entry(title="", data=user_input)
 
-        current = self.config_entry.options
+        current = self._current()
 
         return self.async_show_form(
             step_id="init",
@@ -98,20 +137,32 @@ class HomeEnergyManagementOptionsFlow(config_entries.OptionsFlow):
                 {
                     vol.Optional(
                         "grid_tariff_peak_sek",
-                        default=current.get("grid_tariff_peak_sek", 0.0),
+                        default=current["grid_tariff_peak_sek"],
                     ): vol.Coerce(float),
                     vol.Optional(
                         "grid_tariff_offpeak_sek",
-                        default=current.get("grid_tariff_offpeak_sek", 0.0),
+                        default=current["grid_tariff_offpeak_sek"],
                     ): vol.Coerce(float),
                     vol.Optional(
                         "grid_tariff_peak_start",
-                        default=current.get("grid_tariff_peak_start", 6),
+                        default=current["grid_tariff_peak_start"],
                     ): vol.All(vol.Coerce(int), vol.Range(min=0, max=23)),
                     vol.Optional(
                         "grid_tariff_peak_end",
-                        default=current.get("grid_tariff_peak_end", 22),
+                        default=current["grid_tariff_peak_end"],
                     ): vol.All(vol.Coerce(int), vol.Range(min=0, max=23)),
+                    vol.Optional(
+                        "buy_price_mode",
+                        default=current["buy_price_mode"],
+                    ): vol.In(BUY_PRICE_MODES),
+                    vol.Optional(
+                        "buy_price_floor_sek",
+                        default=current["buy_price_floor_sek"],
+                    ): vol.All(vol.Coerce(float), vol.Range(min=0)),
+                    vol.Optional(
+                        "buy_price_monthly_avg_sek",
+                        default=current["buy_price_monthly_avg_sek"],
+                    ): vol.All(vol.Coerce(float), vol.Range(min=0)),
                 }
             ),
         )

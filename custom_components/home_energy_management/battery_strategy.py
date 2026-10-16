@@ -13,6 +13,9 @@ All prices used by the LP include the full cost to the consumer:
   buy_price[h]  = Nordpool spot (incl. VAT)
                 + grid transfer tariff (incl. VAT)
                 = pw.effective[h]
+                  (the spot part follows the buy-price contract:
+                  ``buy_price_mode`` / ``buy_price_floor_sek``, see
+                  ``PriceAnalyzer.buy_energy_price``)
 
   sell_price[h] = Nordpool spot (incl. VAT) × sell_factor
                   (no tariff earned back when selling)
@@ -67,6 +70,9 @@ C2  SoC lower bound  (inequality, one per hour)
     of the user's configuration.
     soc₀ + Σ_{i≤h}(η_c·charge[i] − discharge[i]/η_d)/cap×100
       ≥ max(min_soc, 6)
+    On expensive days (peak spot in the horizon ≥
+    battery_reserve_spot_threshold_sek) the floor is raised to
+    battery_reserve_soc — see ``BatteryStrategy._soc_floor``.
 
 C3  SoC upper bound  (inequality, one per hour)
     The battery must never exceed *max_soc*.
@@ -127,6 +133,8 @@ from .const import (
     ACTION_SELF_CONSUMPTION,
     BATTERY_SOC_HARD_FLOOR,
     DEFAULT_BATTERY_CAPACITY,
+    DEFAULT_BATTERY_RESERVE_SOC,
+    DEFAULT_BATTERY_RESERVE_SPOT_THRESHOLD_SEK,
     DEFAULT_BATTERY_CHARGE_EFFICIENCY,
     DEFAULT_BATTERY_DISCHARGE_EFFICIENCY,
     DEFAULT_BATTERY_MAX_CHARGE_POWER_W,
@@ -222,6 +230,33 @@ class BatteryStrategy:
             "terminal_soc_weight", DEFAULT_TERMINAL_SOC_WEIGHT
         )
 
+        # Reserve SoC held back on expensive days (0 = disabled)
+        self.reserve_soc: float = params.get(
+            "battery_reserve_soc", DEFAULT_BATTERY_RESERVE_SOC
+        )
+        self.reserve_spot_threshold: float = params.get(
+            "battery_reserve_spot_threshold_sek",
+            DEFAULT_BATTERY_RESERVE_SPOT_THRESHOLD_SEK,
+        )
+        # SoC floor used by the latest plan — min_soc, or the reserve
+        # while it is active.  Read by the optimizer to set the
+        # inverter's min SoC.
+        self.active_min_soc: float = self.min_soc
+
+    def _soc_floor(self, pw: PriceWindow, battery_soc: float) -> float:
+        """SoC floor for this plan: the reserve on expensive days, else min_soc.
+
+        The reserve only stops discharge — it never forces a grid
+        charge.  While the battery is below the reserve the floor is the
+        current SoC, so the LP stays feasible and the floor ratchets up
+        as solar (or profitable grid charging) fills the battery.
+        """
+        if self.reserve_soc <= self.min_soc or pw.is_empty:
+            return self.min_soc
+        if max(pw.spot) < self.reserve_spot_threshold:
+            return self.min_soc
+        return max(self.min_soc, min(self.reserve_soc, battery_soc))
+
     # ==================================================================
     # Public API
     # ==================================================================
@@ -254,6 +289,8 @@ class BatteryStrategy:
         list[dict]
             Hourly plan entries with action, reason, price, etc.
         """
+        self.active_min_soc = self._soc_floor(pw, battery_soc)
+
         if not self.enable_battery or pw.is_empty:
             return self._passive_plan(pw, predicted_consumption)
 
@@ -470,7 +507,7 @@ class BatteryStrategy:
             for i in range(h + 1):
                 A_ub[h][i] = -eta_c             # −η_c × charge[i]
                 A_ub[h][H + i] = 1.0 / eta_d    # +discharge[i]/η_d
-            b_ub[h] = (initial_soc - self.min_soc) / 100.0 * cap
+            b_ub[h] = (initial_soc - self.active_min_soc) / 100.0 * cap
 
             # C3 — upper bound:  +cumulative ≤ (max_soc − soc₀)/100 × cap
             row = H + h

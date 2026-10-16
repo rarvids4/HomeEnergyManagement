@@ -32,6 +32,7 @@ _HA_MODULES = [
     "homeassistant.helpers",
     "homeassistant.helpers.entity_platform",
     "homeassistant.helpers.event",
+    "homeassistant.helpers.storage",
     "homeassistant.helpers.update_coordinator",
 ]
 
@@ -51,6 +52,9 @@ sys.modules["homeassistant.core"].Event = MagicMock()
 # homeassistant.helpers.event.async_track_state_change_event
 sys.modules["homeassistant.helpers.event"].async_track_state_change_event = MagicMock()
 sys.modules["homeassistant.helpers.event"].async_track_time_interval = MagicMock()
+
+# homeassistant.helpers.storage.Store
+sys.modules["homeassistant.helpers.storage"].Store = MagicMock()
 
 # homeassistant.helpers.update_coordinator.DataUpdateCoordinator / CoordinatorEntity
 sys.modules["homeassistant.helpers.update_coordinator"].DataUpdateCoordinator = type(

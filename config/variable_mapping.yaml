@@ -285,6 +285,31 @@ parameters:
   # (takes precedence over the static values above when > 0)
   grid_tariff_peak_entity: "input_number.CHANGE_ME_grid_tariff_peak"
   grid_tariff_offpeak_entity: "input_number.CHANGE_ME_grid_tariff_offpeak"
+  # --- Buy-price contract (tariff mode) ---
+  # How the energy part of your buy price (before the grid tariff
+  # above) is set.  The sell price always follows hourly spot.
+  # Also editable in the integration's options (UI), which win.
+  #   "spot"            — hourly Nordpool spot (default)
+  #   "monthly_average" — one flat price for every hour: the rolling
+  #                       average spot from the 1st of the month
+  buy_price_mode: "spot"
+  # Lowest energy price your contract ever charges (SEK/kWh, incl. VAT).
+  # 0 = no floor.
+  buy_price_floor_sek: 0.0
+  # Fixed monthly average (SEK/kWh, incl. VAT) for "monthly_average".
+  # 0 = rolling month-to-date average of the Nordpool spot.
+  buy_price_monthly_avg_sek: 0.0
+  # Optional HA input helper to override buy_price_monthly_avg_sek
+  # from the UI (when > 0)
+  buy_price_monthly_avg_entity: "input_number.CHANGE_ME_monthly_avg_price"
+  # --- Battery reserve on expensive days ---
+  # SoC (%) the battery is not discharged below while the reserve is
+  # active.  It never forces a grid charge.  0 = disabled.  When > 0
+  # the integration writes the active floor to outputs.sungrow.set_min_soc.
+  battery_reserve_soc: 0
+  # The reserve is active when the highest hourly spot price in the
+  # planning horizon is at or above this (SEK/kWh).  0 = every day.
+  battery_reserve_spot_threshold_sek: 0.0
   # --- Solar prediction ---
   # PV peak power in kW. Set to your system's effective peak output.
   # 0 = no PV system (solar prediction disabled).

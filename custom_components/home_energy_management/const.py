@@ -183,6 +183,36 @@ DEFAULT_GRID_TARIFF_OFFPEAK_SEK = 0.8
 DEFAULT_GRID_TARIFF_PEAK_START = 6   # 06:00
 DEFAULT_GRID_TARIFF_PEAK_END = 22    # 22:00
 
+# --- Buy-price contract (tariff mode) ---
+# How the energy part of the buy price (before the grid tariff) is set.
+#   "spot"            — hourly Nordpool spot (default)
+#   "monthly_average" — one flat price for every hour: the month's
+#                       rolling average spot from day 1; hourly spot
+#                       then only drives the sell price and the
+#                       negative-price export block.
+BUY_PRICE_MODE_SPOT = "spot"
+BUY_PRICE_MODE_MONTHLY_AVERAGE = "monthly_average"
+BUY_PRICE_MODES = [BUY_PRICE_MODE_SPOT, BUY_PRICE_MODE_MONTHLY_AVERAGE]
+DEFAULT_BUY_PRICE_MODE = BUY_PRICE_MODE_SPOT
+# Lowest energy price the contract ever charges (SEK/kWh).
+# 0 = no floor (negative spot hours pay you to import).
+DEFAULT_BUY_PRICE_FLOOR_SEK = 0.0
+# Fixed monthly average (SEK/kWh) for "monthly_average" mode.
+# 0 = use the rolling month-to-date average of the Nordpool spot.
+DEFAULT_BUY_PRICE_MONTHLY_AVG_SEK = 0.0
+# HA storage key for the per-day spot averages behind the rolling
+# month-to-date average (Nordpool only exposes today + tomorrow).
+MONTHLY_PRICE_STORE_KEY = "home_energy_management.monthly_prices"
+MONTHLY_PRICE_STORE_VERSION = 1
+
+# --- Battery reserve on expensive days ---
+# SoC (%) the battery is not discharged below while the reserve is
+# active.  0 = disabled (only min_soc applies).
+DEFAULT_BATTERY_RESERVE_SOC = 0  # %
+# The reserve is active when the highest hourly spot price in the
+# planning horizon is at or above this (SEK/kWh).  0 = every day.
+DEFAULT_BATTERY_RESERVE_SPOT_THRESHOLD_SEK = 0.0
+
 # --- Nordpool ---
 DEFAULT_ENTRIES_PER_HOUR = 1  # 1 = hourly prices, 4 = 15-min
 

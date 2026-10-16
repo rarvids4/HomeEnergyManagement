@@ -110,10 +110,18 @@ def _apply_options(coordinator: EnergyManagementCoordinator, options: dict) -> N
         opt.grid_tariff_peak_start = options["grid_tariff_peak_start"]
     if "grid_tariff_peak_end" in options:
         opt.grid_tariff_peak_end = options["grid_tariff_peak_end"]
+    if "buy_price_mode" in options:
+        opt.buy_price_mode = options["buy_price_mode"]
+    if "buy_price_floor_sek" in options:
+        opt.buy_price_floor = options["buy_price_floor_sek"]
+    if "buy_price_monthly_avg_sek" in options:
+        opt.buy_price_monthly_avg = options["buy_price_monthly_avg_sek"]
     _LOGGER.info(
-        "Applied tariff options: peak=%.3f offpeak=%.3f hours=%d-%d",
+        "Applied tariff options: peak=%.3f offpeak=%.3f hours=%d-%d "
+        "buy_mode=%s floor=%.3f monthly_avg=%.3f",
         opt.grid_tariff_peak, opt.grid_tariff_offpeak,
         opt.grid_tariff_peak_start, opt.grid_tariff_peak_end,
+        opt.buy_price_mode, opt.buy_price_floor, opt.buy_price_monthly_avg,
     )
 
 

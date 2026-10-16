@@ -21,6 +21,7 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 from .coordinator import EnergyManagementCoordinator
+from .price_analysis import grid_charge_break_even
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,6 +46,8 @@ async def async_setup_entry(
         DailySavingsSensor(coordinator, entry),
         PredictionLogSensor(coordinator, entry),
         PredictionAccuracySensor(coordinator, entry),
+        MonthlyAveragePriceSensor(coordinator, entry),
+        GridChargeBreakEvenSensor(coordinator, entry),
     ]
 
     async_add_entities(entities)
@@ -476,6 +479,109 @@ class ChargerPlanSensor(EnergyManagementSensor):
         return "mdi:ev-station"
 
 
+class MonthlyAveragePriceSensor(EnergyManagementSensor):
+    """Rolling month-to-date average spot (monthly-average tariff mode).
+
+    No device class: HA only keeps long-term statistics for monetary
+    sensors with state_class total, and a price is a measurement.
+    """
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "monthly_average_price", "Monthly Average Price")
+
+    def _status(self) -> dict[str, Any]:
+        return getattr(self.coordinator, "monthly_price_status", {}) or {}
+
+    @property
+    def native_value(self) -> float | None:
+        return _round_or_none(self._status().get("average"))
+
+    @property
+    def native_unit_of_measurement(self) -> str:
+        data = self.coordinator.data or {}
+        currency = data.get("prices", {}).get("currency", "SEK")
+        return f"{currency}/kWh"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        status = self._status()
+        opt = self.coordinator.optimizer
+        return {
+            "tariff_mode": opt.buy_price_mode,
+            # Energy price actually billed per kWh (average, floor applied)
+            "price_in_use": _round_or_none(status.get("price_in_use")),
+            "price_floor": opt.buy_price_floor,
+            "fixed_monthly_average": opt.buy_price_monthly_avg,
+            "rolling_average": _round_or_none(status.get("rolling_average")),
+            "days_counted": status.get("days", 0),
+            "missing_days": status.get("missing_days", []),
+            "daily_averages": status.get("daily_averages", {}),
+        }
+
+    @property
+    def icon(self) -> str:
+        return "mdi:calendar-month"
+
+
+class GridChargeBreakEvenSensor(EnergyManagementSensor):
+    """Monthly average below which off-peak grid charging pays off.
+
+    Only meaningful in monthly-average mode, where the grid tariff is
+    the only hourly price difference.  The LP makes the actual decision;
+    this shows the threshold it is working against.
+    """
+
+    _attr_state_class = SensorStateClass.MEASUREMENT
+
+    def __init__(self, coordinator, entry):
+        super().__init__(coordinator, entry, "grid_charge_break_even", "Grid Charge Break-even")
+
+    def _values(self) -> tuple[float | None, float | None]:
+        status = getattr(self.coordinator, "monthly_price_status", {}) or {}
+        if not status:
+            return None, None
+        opt = self.coordinator.optimizer
+        break_even = grid_charge_break_even(
+            opt.grid_tariff_peak, opt.grid_tariff_offpeak, opt.round_trip_efficiency,
+        )
+        return break_even, status.get("price_in_use")
+
+    @property
+    def native_value(self) -> float | None:
+        return _round_or_none(self._values()[0])
+
+    @property
+    def native_unit_of_measurement(self) -> str:
+        data = self.coordinator.data or {}
+        currency = data.get("prices", {}).get("currency", "SEK")
+        return f"{currency}/kWh"
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        break_even, price = self._values()
+        opt = self.coordinator.optimizer
+        rt = opt.round_trip_efficiency
+        attrs: dict[str, Any] = {
+            "price_in_use": _round_or_none(price),
+            "grid_tariff_peak": opt.grid_tariff_peak,
+            "grid_tariff_offpeak": opt.grid_tariff_offpeak,
+            "round_trip_efficiency": round(rt, 3),
+        }
+        if break_even is not None and price is not None:
+            attrs["grid_charging_profitable"] = price < break_even
+            # SEK saved (or lost, < 0) per kWh bought off-peak and used at peak
+            attrs["margin_per_kwh"] = round(
+                rt * (price + opt.grid_tariff_peak) - (price + opt.grid_tariff_offpeak), 4,
+            )
+        return attrs
+
+    @property
+    def icon(self) -> str:
+        return "mdi:scale-balance"
+
+
 class DailySavingsSensor(EnergyManagementSensor):
     """Estimated daily savings from optimisation."""
 
@@ -662,3 +768,7 @@ class SurplusChargingSensor(EnergyManagementSensor):
     @property
     def icon(self) -> str:
         return "mdi:solar-power"
+
+
+def _round_or_none(value: float | None, digits: int = 4) -> float | None:
+    return None if value is None else round(value, digits)

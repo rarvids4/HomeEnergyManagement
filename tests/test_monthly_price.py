@@ -10,6 +10,7 @@ from custom_components.home_energy_management import _apply_options
 from custom_components.home_energy_management.monthly_price import (
     MonthlyPriceTracker,
     daily_averages_from_history,
+    daily_averages_from_statistics,
 )
 from custom_components.home_energy_management.optimizer import Optimizer
 from custom_components.home_energy_management.price_analysis import PriceAnalyzer
@@ -122,6 +123,20 @@ def test_history_spans_days_and_skips_partial_ones():
     # The 7th: 1.0 until 04:15, then 2.0
     assert avgs[date(2026, 10, 7)] == pytest.approx((4.25 * 1.0 + 19.75 * 2.0) / 24)
     assert avgs[date(2026, 10, 8)] == pytest.approx(2.0)
+
+
+def test_statistics_average_per_day_with_hour_weight():
+    rows = [(datetime(2026, 10, 1, h), 1.0 if h < 12 else 3.0) for h in range(24)]
+    rows += [(datetime(2026, 10, 2, h), 0.5) for h in range(23)]   # DST-short
+    assert daily_averages_from_statistics(rows) == {
+        date(2026, 10, 1): (pytest.approx(2.0), 24),
+        date(2026, 10, 2): (pytest.approx(0.5), 23),
+    }
+
+
+def test_statistics_skip_partial_days():
+    rows = [(datetime(2026, 10, 1, h), 1.0) for h in range(20)]
+    assert daily_averages_from_statistics(rows) == {}
 
 
 def test_history_stops_at_end():

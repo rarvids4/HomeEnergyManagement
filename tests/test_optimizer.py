@@ -3903,3 +3903,39 @@ class TestNegativePriceExportBlock:
         assert chg_writes[-1]["data"]["value"] == 5000, (
             "Max-charge power must be cranked to inverter max (5000 W)"
         )
+
+
+# ------------------------------------------------------------------
+# Replan triggers and plan method
+# ------------------------------------------------------------------
+
+def _state(state, **attrs):
+    from types import SimpleNamespace
+    return SimpleNamespace(state=state, attributes=attrs)
+
+
+def test_replan_when_nordpool_appears_after_startup():
+    from custom_components.home_energy_management.coordinator import input_became_ready
+    assert input_became_ready(None, _state("0.78"))
+    assert input_became_ready(_state("unavailable"), _state("0.78"))
+
+
+def test_replan_when_tomorrows_prices_arrive():
+    from custom_components.home_energy_management.coordinator import input_became_ready
+    assert input_became_ready(
+        _state("0.78", tomorrow_valid=False), _state("0.78", tomorrow_valid=True),
+    )
+
+
+def test_no_replan_on_ordinary_price_tick_or_outage():
+    from custom_components.home_energy_management.coordinator import input_became_ready
+    assert not input_became_ready(
+        _state("0.78", tomorrow_valid=True), _state("0.81", tomorrow_valid=True),
+    )
+    assert not input_became_ready(_state("0.78"), _state("unavailable"))
+
+
+def test_schedule_reports_no_prices_method():
+    from datetime import datetime
+    from custom_components.home_energy_management.optimizer import Optimizer
+    assert Optimizer._safe_default_schedule(datetime(2026, 10, 18, 9))["method"] == "no_prices"

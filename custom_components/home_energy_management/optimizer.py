@@ -236,6 +236,7 @@ class Optimizer:
             "immediate_actions": immediate_actions,
             "ev_charge_schedule": ev_charge_plan,
             "summary": summary,
+            "method": self._battery.last_method,
             "stats": {
                 "avg_price": round(pw.avg, 4),
                 "min_price": round(pw.min, 4),
@@ -301,5 +302,6 @@ class Optimizer:
             }],
             "immediate_actions": [],
             "summary": "No price data available — defaulting to self-consumption",
+            "method": "no_prices",
             "stats": {"avg_price": 0, "min_price": 0, "max_price": 0, "price_spread": 0},
         }

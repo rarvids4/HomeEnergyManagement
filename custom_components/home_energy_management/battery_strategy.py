@@ -242,6 +242,9 @@ class BatteryStrategy:
         # SoC floor used by the latest plan — min_soc, or the reserve
         # while it is active.
         self.active_min_soc: float = self.min_soc
+        # How the latest plan was made: "lp", "heuristic" (LP failed) or
+        # "passive" (battery control off / spread too small → self-consumption)
+        self.last_method: str = "passive"
         # Inverter min SoC to write while the reserve feature is enabled:
         # the reserve floor while active, otherwise the configured min_soc
         # unchanged (the hard floor only applies to planning).
@@ -299,6 +302,7 @@ class BatteryStrategy:
             else self.configured_min_soc
         )
 
+        self.last_method = "passive"
         if not self.enable_battery or pw.is_empty:
             return self._passive_plan(pw, predicted_consumption)
 
@@ -330,12 +334,14 @@ class BatteryStrategy:
 
         try:
             plan = self._solve_lp(pw, consumption, solar, battery_soc)
+            self.last_method = "lp"
         except Exception as exc:
             _LOGGER.warning(
                 "LP solver failed (%s), falling back to heuristic", exc
             )
 
         if plan is None:
+            self.last_method = "heuristic"
             plan = self._heuristic_plan(
                 pw, consumption, solar, battery_soc, grid_export_power
             )

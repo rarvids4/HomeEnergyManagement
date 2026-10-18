@@ -301,9 +301,8 @@ class BatteryPlanSensor(EnergyManagementSensor):
         opt = self.coordinator.optimizer
         bat = opt._battery
         battery_soc_start = sensor.get("battery_soc", 0)
-        optimizer_method = "lp" if any(
-            "lp_soc_after" in h for h in plan
-        ) else "heuristic"
+        # lp / heuristic (LP failed) / passive / no_prices
+        optimizer_method = schedule.get("method", "no_prices")
         # ── Graph-friendly parallel arrays ────────────────────────
         # Each array is indexed by hour offset (0 = current hour).
         timestamps = [h.get("start", "") for h in plan]

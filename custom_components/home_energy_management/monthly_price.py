@@ -122,3 +122,25 @@ def daily_averages_from_history(
         for day, secs in covered.items()
         if secs >= 86400 * _MIN_DAY_COVERAGE
     }
+
+
+def daily_averages_from_statistics(
+    rows: list[tuple[datetime, float]],
+) -> dict[date, tuple[float, int]]:
+    """Average price and hour count per day from hourly long-term statistics.
+
+    *rows* are ``(local naive hour start, price)`` pairs.  The recorder
+    keeps these indefinitely, so they cover days whose states have been
+    purged.  For a price sensor without a mean the value is the price at
+    the end of the hour — exact for hourly prices, the last quarter for
+    15-min prices.  Only days with at least 23 hours (a DST-short day)
+    are returned.
+    """
+    by_day: dict[date, list[float]] = {}
+    for start, price in rows:
+        by_day.setdefault(start.date(), []).append(price)
+    return {
+        day: (sum(vals) / len(vals), len(vals))
+        for day, vals in by_day.items()
+        if len(vals) >= 23
+    }

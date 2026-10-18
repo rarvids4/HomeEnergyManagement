@@ -42,7 +42,11 @@ from .const import (
     OUTPUT_EV_CHARGERS,
 )
 from .logger import PredictionLogger
-from .monthly_price import MonthlyPriceTracker, daily_averages_from_history
+from .monthly_price import (
+    MonthlyPriceTracker,
+    daily_averages_from_history,
+    daily_averages_from_statistics,
+)
 from .optimizer import Optimizer
 from .predictor import ConsumptionPredictor, STREAM_EV, STREAM_HOUSE
 from .solar_predictor import SolarPredictor
@@ -142,6 +146,22 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             _LOGGER.info("Auto-replan: watching %s", watched)
             unsub = async_track_state_change_event(
                 hass, watched, self._on_setting_changed,
+            )
+            self._unsub_state_listeners.append(unsub)
+
+        # --- Replan as soon as prices / forecast are usable ---
+        # HEM often starts before Nordpool, which left the first 15 min
+        # after a restart without a plan; tomorrow's prices also arrive
+        # mid-cycle.
+        price_inputs = [
+            e for e in (
+                self.inputs.get(INPUT_NORDPOOL, {}).get("current_price"),
+                self.inputs.get(INPUT_WEATHER, {}).get("entity"),
+            ) if e
+        ]
+        if price_inputs:
+            unsub = async_track_state_change_event(
+                hass, price_inputs, self._on_input_changed,
             )
             self._unsub_state_listeners.append(unsub)
 
@@ -347,6 +367,18 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         # schedule it as a task so it runs in the event loop.
         self.hass.async_create_task(self.async_request_refresh())
 
+    @callback
+    def _on_input_changed(self, event: Event) -> None:
+        """Replan when a price / forecast input just got usable data."""
+        if not input_became_ready(
+            event.data.get("old_state"), event.data.get("new_state"),
+        ):
+            return
+        _LOGGER.info(
+            "Input ready: %s — triggering replan", event.data.get("entity_id"),
+        )
+        self.hass.async_create_task(self.async_request_refresh())
+
     async def _async_update_data(self) -> dict[str, Any]:
         """Fetch data from HA sensors, run prediction & optimization."""
         try:
@@ -418,10 +450,9 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             # 7. Execute immediate actions
             await self._execute_actions(schedule)
 
-            # 8. Compute actual consumption in same kWh unit as predictions
-            interval_h = self.update_interval.total_seconds() / 3600.0
+            # 8. Actual consumption in the predictions' unit (kWh per hour)
             actual_consumption_kwh = round(
-                (sensor_data.get("house_load", 0) / 1000.0) * interval_h, 3
+                sensor_data.get("house_load", 0) / 1000.0, 3
             )
 
             # 9. Log actual vs previous prediction (before overwriting)
@@ -471,10 +502,10 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         ev_power = sensor_data.get("ev_power", 0)         # W
         house_base_w = max(total_house - ev_power, 0)
 
-        interval_h = self.update_interval.total_seconds() / 3600.0
-        total_kwh = (total_house / 1000.0) * interval_h
-        house_kwh = (house_base_w / 1000.0) * interval_h
-        ev_kwh = (ev_power / 1000.0) * interval_h
+        # kWh per hour, the unit the predictions are in
+        total_kwh = total_house / 1000.0
+        house_kwh = house_base_w / 1000.0
+        ev_kwh = ev_power / 1000.0
 
         prices = self._read_prices()
 
@@ -507,10 +538,12 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         # House base = total minus EV (clamp to zero)
         house_base_w = max(total_house - ev_power, 0)
 
-        # Convert W → kWh (one observation per coordinator interval)
-        interval_h = self.update_interval.total_seconds() / 3600.0
-        house_kwh = (house_base_w / 1000.0) * interval_h
-        ev_kwh = (ev_power / 1000.0) * interval_h
+        # Record kWh per hour (= average kW), not the energy of one
+        # cycle: the predictor keeps hourly slots and the LP plans in
+        # 1 h steps, so kW × 0.25 h at a 15-min interval made every
+        # forecast 4× too low.
+        house_kwh = house_base_w / 1000.0
+        ev_kwh = ev_power / 1000.0
 
         self.predictor.add_observation(now, house_kwh, stream=STREAM_HOUSE)
         if ev_kwh > 0:
@@ -661,8 +694,8 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
 
         On first use the stored per-day averages are loaded and any
         missing days this month are back-filled from the recorder's
-        history of the Nordpool price state (limited by the recorder's
-        retention, 10 days by default).
+        history of the Nordpool price (states, then long-term statistics
+        for days older than the recorder's retention).
         """
         today = datetime.now().date()
         tracker = self.monthly_prices
@@ -696,9 +729,12 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
         }
 
     async def _backfill_monthly_prices(self, today) -> bool:
-        """Fill missing days this month from recorded Nordpool price states.
+        """Fill missing days this month from recorded Nordpool prices.
 
-        Returns True when any day was recovered.
+        Price states are exact but purged after the recorder's retention
+        (10 days by default); older days come from the long-term hourly
+        statistics, which are kept indefinitely.  Returns True when any
+        day was recovered.
         """
         missing = self.monthly_prices.missing_days(today)
         entity_id = self.inputs.get(INPUT_NORDPOOL, {}).get("current_price")
@@ -725,6 +761,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             _LOGGER.warning("Monthly price back-fill skipped: %s", exc)
             return False
 
+        total_missing = len(missing)
         points = []
         for state in states.get(entity_id, []):
             try:
@@ -739,11 +776,61 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             if day in missing:
                 self.monthly_prices.record_day(day, [avg], hours=24)
                 filled += 1
+
+        missing = self.monthly_prices.missing_days(today)
+        from_stats = 0
+        if missing:
+            from_stats = await self._backfill_monthly_prices_from_statistics(
+                entity_id, missing, end,
+            )
         _LOGGER.info(
-            "Monthly price back-fill: %d of %d missing days recovered from history",
-            filled, len(missing),
+            "Monthly price back-fill: %d of %d missing days recovered "
+            "(%d from history, %d from long-term statistics)",
+            filled + from_stats, total_missing, filled, from_stats,
         )
-        return filled > 0
+        return filled + from_stats > 0
+
+    async def _backfill_monthly_prices_from_statistics(
+        self, entity_id: str, missing: list, end: datetime,
+    ) -> int:
+        """Fill *missing* days from hourly long-term statistics.
+
+        Returns the number of days recovered.
+        """
+        start = datetime.combine(missing[0], datetime.min.time())
+        try:
+            from homeassistant.components.recorder import get_instance, statistics
+
+            stats = await get_instance(self.hass).async_add_executor_job(
+                statistics.statistics_during_period,
+                self.hass,
+                start.astimezone(),
+                end.astimezone(),
+                {entity_id},
+                "hour",
+                None,
+                {"mean", "state"},
+            )
+        except Exception as exc:  # recorder missing / API change
+            _LOGGER.warning("Monthly price statistics back-fill skipped: %s", exc)
+            return 0
+
+        rows = []
+        for row in stats.get(entity_id, []):
+            price = row.get("mean")
+            if price is None:
+                price = row.get("state")
+            if price is None:
+                continue
+            hour = datetime.fromtimestamp(row["start"])  # local naive
+            rows.append((hour, float(price)))
+
+        filled = 0
+        for day, (avg, hours) in daily_averages_from_statistics(rows).items():
+            if day in missing:
+                self.monthly_prices.record_day(day, [avg], hours=hours)
+                filled += 1
+        return filled
 
     def _read_prices(self) -> dict[str, Any]:
         """Read Nordpool price data from HA.
@@ -1065,3 +1152,21 @@ def _aggregate_to_hourly(prices: list[float], entries_per_hour: int) -> list[flo
         if chunk:
             hourly.append(sum(chunk) / len(chunk))
     return hourly
+
+
+_NOT_READY = ("unavailable", "unknown")
+
+
+def input_became_ready(old_state, new_state) -> bool:
+    """True when an input just became usable or got tomorrow's prices.
+
+    Ordinary price ticks (every 15 min) are left to the regular cycle.
+    """
+    if new_state is None or new_state.state in _NOT_READY:
+        return False
+    if old_state is None or old_state.state in _NOT_READY:
+        return True
+    return (
+        new_state.attributes.get("tomorrow_valid") is True
+        and old_state.attributes.get("tomorrow_valid") is not True
+    )

@@ -269,3 +269,38 @@ class TestSplitStreams:
         assert abs(mon - 1.0) < 0.1
         assert abs(tue - 3.0) < 0.1
         assert abs(tue - mon) > 1.5  # clearly different
+
+
+class TestObservationUnits:
+    """The coordinator must record load in kWh per hour, the LP's unit."""
+
+    def _record(self, house_load_w, ev_power_w, interval_s=900):
+        from types import SimpleNamespace
+        from datetime import timedelta
+        from custom_components.home_energy_management.coordinator import (
+            EnergyManagementCoordinator,
+        )
+        fake = SimpleNamespace(
+            predictor=ConsumptionPredictor(),
+            update_interval=timedelta(seconds=interval_s),
+        )
+        EnergyManagementCoordinator._record_observations(
+            fake, {"house_load": house_load_w, "ev_power": ev_power_w},
+        )
+        return fake.predictor
+
+    def test_house_load_is_recorded_per_hour_not_per_cycle(self):
+        # 1.8 kW for a whole hour is 1.8 kWh/h, whatever the cycle length
+        pred = self._record(1800, 0)
+        assert pred.predict(hours_ahead=1, current_load=0)[0] == pytest.approx(1.8)
+
+    def test_cycle_length_does_not_change_the_forecast(self):
+        a = self._record(1800, 0, interval_s=900)
+        b = self._record(1800, 0, interval_s=300)
+        assert a.predict(1, 0)[0] == pytest.approx(b.predict(1, 0)[0])
+
+    def test_ev_power_is_split_out_per_hour(self):
+        pred = self._record(9000, 7000)
+        split = pred.predict_split(hours_ahead=1, current_house_load=0)
+        assert split["house_base"][0] == pytest.approx(2.0)
+        assert split["ev_charging"][0] == pytest.approx(7.0)

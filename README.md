@@ -321,7 +321,7 @@ outputs:
       service: "input_number.set_value"
       entity_id: "input_number.sg_forced_charge_discharge_power"
       min: 0
-      max: 5000
+      max: 7000
       step: 100
 
     # Charge/discharge power limits (safety caps)
@@ -329,13 +329,13 @@ outputs:
       service: "input_number.set_value"
       entity_id: "input_number.sg_battery_max_charge_power"
       min: 100
-      max: 5000
+      max: 7000
       step: 100
     set_discharge_power:
       service: "input_number.set_value"
       entity_id: "input_number.sg_battery_max_discharge_power"
       min: 10
-      max: 5000
+      max: 7000
       step: 100
 
     # Export power limit (register 13087/13088) — optional

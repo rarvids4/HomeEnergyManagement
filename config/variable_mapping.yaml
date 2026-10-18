@@ -180,18 +180,20 @@ outputs:
       force_charge: "Forced charge"
       force_discharge: "Forced discharge"
 
-    # Power limits
+    # Power limits (W). Set max to your inverter's battery rating and make
+    # sure the HA input_number helpers allow the same max, otherwise
+    # input_number.set_value rejects the write.
     set_charge_power:
       service: "input_number.set_value"
       entity_id: "input_number.CHANGE_ME_battery_max_charge_power"
       min: 100
-      max: 5000
+      max: 7000
       step: 100
     set_discharge_power:
       service: "input_number.set_value"
       entity_id: "input_number.CHANGE_ME_battery_max_discharge_power"
       min: 10
-      max: 5000
+      max: 7000
       step: 100
 
     # Export power limit (Sungrow registers 13074 / 13087)

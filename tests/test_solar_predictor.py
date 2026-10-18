@@ -267,3 +267,82 @@ class TestClockToSolarHour:
         solar = sp._clock_to_solar_hour(dt)
         # longitude=15°E matches CET meridian, so correction = 0
         assert abs(solar - 12.0) < 0.1
+
+
+# ── Tilted panels ────────────────────────────────────────────────────
+
+class TestTiltedClearSky:
+    """Plane-of-array model for tilted panels."""
+
+    def test_flat_panel_close_to_legacy_model(self):
+        """tilt=0 stays near sin(altitude), so old calibrations hold."""
+        legacy = SolarPredictor._clear_sky_factor(58.0, 95, 12.0)
+        flat = SolarPredictor._tilted_clear_sky_factor(58.0, 95, 12.0, 0.0, 180.0)
+        assert flat == pytest.approx(legacy, rel=0.1)
+
+    def test_south_tilt_beats_horizontal_in_october(self):
+        """Low autumn sun: a 30° south panel gets far more than flat."""
+        flat = SolarPredictor._clear_sky_factor(59.3, 291, 12.0)
+        tilted = SolarPredictor._tilted_clear_sky_factor(59.3, 291, 12.0, 30.0, 180.0)
+        assert tilted > 1.4 * flat
+
+    def test_south_panel_peaks_at_solar_noon(self):
+        morning = SolarPredictor._tilted_clear_sky_factor(59.3, 291, 9.0, 30.0, 180.0)
+        noon = SolarPredictor._tilted_clear_sky_factor(59.3, 291, 12.0, 30.0, 180.0)
+        afternoon = SolarPredictor._tilted_clear_sky_factor(59.3, 291, 15.0, 30.0, 180.0)
+        assert noon > morning
+        assert morning == pytest.approx(afternoon, rel=0.01)
+
+    def test_east_panel_favours_morning(self):
+        morning = SolarPredictor._tilted_clear_sky_factor(59.3, 172, 9.0, 30.0, 90.0)
+        afternoon = SolarPredictor._tilted_clear_sky_factor(59.3, 172, 15.0, 30.0, 90.0)
+        assert morning > afternoon
+
+    def test_night_is_zero(self):
+        assert SolarPredictor._tilted_clear_sky_factor(59.3, 291, 0.0, 30.0, 180.0) == 0.0
+
+    def test_predict_uses_tilt_when_configured(self):
+        now = datetime(2026, 10, 18, 12, 0, tzinfo=timezone(timedelta(hours=2)))
+        flat = SolarPredictor(pv_peak_power_kw=20.0, latitude=59.3, longitude=18.0)
+        tilted = SolarPredictor(
+            pv_peak_power_kw=20.0, latitude=59.3, longitude=18.0,
+            panel_tilt_deg=30.0, panel_azimuth_deg=180.0,
+        )
+        clouds = [0.0] * 6
+        assert sum(tilted.predict(6, list(clouds), now)) > 1.4 * sum(flat.predict(6, list(clouds), now))
+
+
+# ── Actual-PV correction ─────────────────────────────────────────────
+
+class TestActualCorrection:
+    """Near-term forecast scaled by measured PV output."""
+
+    def test_current_hour_matches_measured(self):
+        out = SolarPredictor.apply_actual_correction([3.5, 3.0, 2.0, 1.0], 10.5, hours=3)
+        assert out[0] == pytest.approx(10.5)
+
+    def test_ratio_fades_out(self):
+        out = SolarPredictor.apply_actual_correction([2.0, 2.0, 2.0, 2.0], 6.0, hours=2)
+        # ratio 3: h0 ×3, h1 ×2, h2 unchanged
+        assert out == [6.0, 4.0, 2.0, 2.0]
+
+    def test_also_scales_down(self):
+        out = SolarPredictor.apply_actual_correction([8.0, 8.0], 2.0, hours=2)
+        assert out[0] == pytest.approx(2.0)
+        assert out[1] == pytest.approx(5.0)
+
+    def test_ratio_clamped(self):
+        out = SolarPredictor.apply_actual_correction([1.0], 20.0, hours=1)
+        assert out[0] == pytest.approx(4.0)
+
+    def test_disabled_when_hours_zero(self):
+        assert SolarPredictor.apply_actual_correction([3.0, 2.0], 9.0, hours=0) == [3.0, 2.0]
+
+    def test_skipped_at_dawn(self):
+        """Tiny forecasts give noisy ratios — leave them alone."""
+        assert SolarPredictor.apply_actual_correction([0.1, 1.0], 1.0, hours=3) == [0.1, 1.0]
+
+    def test_input_not_mutated(self):
+        pred = [2.0, 2.0]
+        SolarPredictor.apply_actual_correction(pred, 6.0, hours=2)
+        assert pred == [2.0, 2.0]

@@ -320,6 +320,14 @@ parameters:
   # Cloud opacity: how much cloud cover reduces PV output (0–1).
   # 0.75 means 100% clouds → 25% of clear-sky output (diffuse radiation).
   pv_cloud_opacity: 0.75
+  # Panel geometry. Tilted panels catch far more low autumn/winter sun
+  # than the default horizontal model assumes. Leave panel_tilt_deg
+  # commented out to keep the horizontal model.
+  # panel_tilt_deg: 30          # degrees from horizontal
+  # panel_azimuth_deg: 180      # clockwise from north: 180 = south, 90 = east
+  # Scale the near-term forecast by actual PV output (ratio applied
+  # fully to the current hour, fading out over N hours). 0 = off.
+  solar_actual_correction_hours: 0
   # Log level for internal prediction log (debug / info / warning)
   log_level: "info"
   # --- Solar surplus EV charging ---

@@ -53,6 +53,8 @@ class SolarPredictor:
         latitude: float = 58.0,
         longitude: float = 16.0,
         cloud_opacity: float = 0.75,
+        panel_tilt_deg: float | None = None,
+        panel_azimuth_deg: float = 180.0,
     ) -> None:
         """Initialise the predictor.
 
@@ -70,11 +72,23 @@ class SolarPredictor:
         cloud_opacity
             How strongly clouds reduce output (0–1).
             0.75 means 100 % clouds → 25 % of clear-sky output.
+        panel_tilt_deg
+            Panel tilt from horizontal (0 = flat, 90 = vertical).
+            ``None`` keeps the legacy horizontal sin(altitude) model.
+            Tilted panels catch far more of the low autumn/winter sun
+            than a horizontal surface, so the legacy model under-
+            predicts heavily from October to February.
+        panel_azimuth_deg
+            Direction the panels face, degrees clockwise from north
+            (180 = south, 90 = east, 270 = west).  Only used together
+            with ``panel_tilt_deg``.
         """
         self.pv_peak_power_kw = pv_peak_power_kw
         self.latitude = latitude
         self.longitude = longitude
         self.cloud_opacity = cloud_opacity
+        self.panel_tilt_deg = panel_tilt_deg
+        self.panel_azimuth_deg = panel_azimuth_deg
 
     # ==================================================================
     # Public API
@@ -156,7 +170,13 @@ class SolarPredictor:
             solar_hour = self._clock_to_solar_hour(dt)
 
             # Clear-sky factor (0 = night, ~0.6 = noon in April @ 58°N)
-            cs = self._clear_sky_factor(self.latitude, doy, solar_hour)
+            if self.panel_tilt_deg is None:
+                cs = self._clear_sky_factor(self.latitude, doy, solar_hour)
+            else:
+                cs = self._tilted_clear_sky_factor(
+                    self.latitude, doy, solar_hour,
+                    self.panel_tilt_deg, self.panel_azimuth_deg,
+                )
 
             # Cloud reduction
             cloud_pct = max(0.0, min(100.0, cloud_coverage[h]))
@@ -178,6 +198,48 @@ class SolarPredictor:
             )
 
         return result
+
+    @staticmethod
+    def apply_actual_correction(
+        predicted: list[float],
+        measured_kw: float,
+        hours: int,
+        min_forecast_kwh: float = 0.2,
+        max_ratio: float = 4.0,
+    ) -> list[float]:
+        """Scale the near-term forecast by what the panels produce right now.
+
+        ``ratio = measured_kw / predicted[0]`` (clamped to
+        ``[1/max_ratio, max_ratio]``) is applied fully to the current
+        hour and fades out linearly over ``hours`` hours:
+
+          predicted[h] × (1 + (ratio − 1) × (1 − h / hours))
+
+        So the current hour equals the measured output, and the
+        forecast returns to the weather model after ``hours`` hours.
+        Skipped when ``hours`` ≤ 0 or the current-hour forecast is
+        below ``min_forecast_kwh`` (dawn/dusk/night: the ratio would
+        be noise).
+        """
+        if hours <= 0 or not predicted or predicted[0] < min_forecast_kwh:
+            return list(predicted)
+        if measured_kw < 0:
+            return list(predicted)
+
+        ratio = measured_kw / predicted[0]
+        ratio = max(1.0 / max_ratio, min(max_ratio, ratio))
+
+        corrected = list(predicted)
+        for h in range(min(hours, len(corrected))):
+            weight = 1.0 - h / hours
+            corrected[h] = round(max(0.0, corrected[h] * (1.0 + (ratio - 1.0) * weight)), 2)
+
+        _LOGGER.info(
+            "Solar forecast corrected by actual PV: %.2f kW now vs %.2f kWh "
+            "forecast (ratio %.2f, fading over %d h)",
+            measured_kw, predicted[0], ratio, hours,
+        )
+        return corrected
 
     # ==================================================================
     # Internal helpers
@@ -237,6 +299,61 @@ class SolarPredictor:
             return 0.0
 
         return max(0.0, math.sin(altitude))
+
+    @staticmethod
+    def _tilted_clear_sky_factor(
+        latitude: float,
+        day_of_year: int,
+        solar_hour: float,
+        tilt_deg: float,
+        azimuth_deg: float,
+    ) -> float:
+        """Clear-sky relative output (0–1) on a tilted panel.
+
+          beam    = cos(incidence) × T(air mass)
+          diffuse = 0.1 × sin(alt) × (1 + cos(tilt)) / 2
+          T       = 0.7^(AM^0.678) / 0.7     (1 at zenith; Meinel)
+
+        With ``tilt_deg = 0`` this stays close to the legacy
+        sin(altitude) model, so an existing ``pv_peak_power_kw``
+        calibration remains valid.
+        """
+        lat = math.radians(latitude)
+        dec = math.radians(
+            23.45 * math.sin(math.radians(360.0 / 365.0 * (284 + day_of_year)))
+        )
+        ha = math.radians((solar_hour - 12.0) * 15.0)
+
+        sin_alt = (
+            math.sin(lat) * math.sin(dec)
+            + math.cos(lat) * math.cos(dec) * math.cos(ha)
+        )
+        if sin_alt <= 0:
+            return 0.0
+        alt = math.asin(min(1.0, sin_alt))
+        cos_alt = math.cos(alt)
+
+        # Sun azimuth, clockwise from north (morning < 180 < afternoon)
+        if cos_alt < 1e-9 or abs(math.cos(lat)) < 1e-9:
+            sun_az = math.pi
+        else:
+            cos_az = (math.sin(dec) - sin_alt * math.sin(lat)) / (cos_alt * math.cos(lat))
+            sun_az = math.acos(max(-1.0, min(1.0, cos_az)))
+            if ha > 0:
+                sun_az = 2 * math.pi - sun_az
+
+        tilt = math.radians(tilt_deg)
+        cos_inc = (
+            sin_alt * math.cos(tilt)
+            + cos_alt * math.sin(tilt) * math.cos(sun_az - math.radians(azimuth_deg))
+        )
+
+        air_mass = min(38.0, 1.0 / sin_alt)
+        transmittance = 0.7 ** (air_mass ** 0.678) / 0.7
+
+        beam = max(0.0, cos_inc) * transmittance
+        diffuse = 0.1 * sin_alt * (1.0 + math.cos(tilt)) / 2.0
+        return max(0.0, min(1.0, beam + diffuse))
 
     @staticmethod
     def _extract_cloud_coverage(

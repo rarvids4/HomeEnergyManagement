@@ -23,6 +23,9 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator
 from .const import (
     BUY_PRICE_MODE_MONTHLY_AVERAGE,
     DEFAULT_CLOUD_OPACITY,
+    DEFAULT_PANEL_AZIMUTH_DEG,
+    DEFAULT_PANEL_TILT_DEG,
+    DEFAULT_SOLAR_ACTUAL_CORRECTION_HOURS,
     DEFAULT_ENTRIES_PER_HOUR,
     DEFAULT_FAST_EV_UPDATE_INTERVAL,
     DEFAULT_PV_PEAK_POWER_KW,
@@ -121,6 +124,8 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             latitude=float(lat),
             longitude=float(lon),
             cloud_opacity=self.params.get("pv_cloud_opacity", DEFAULT_CLOUD_OPACITY),
+            panel_tilt_deg=self.params.get("panel_tilt_deg", DEFAULT_PANEL_TILT_DEG),
+            panel_azimuth_deg=self.params.get("panel_azimuth_deg", DEFAULT_PANEL_AZIMUTH_DEG),
         )
 
         # --- Manual override tracking ---
@@ -434,6 +439,14 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
 
             # 5b. Predict solar production from weather forecast
             predicted_solar = await self._predict_solar(horizon)
+            predicted_solar = self.solar_predictor.apply_actual_correction(
+                predicted_solar,
+                measured_kw=sensor_data.get("pv_power", 0.0) / 1000.0,
+                hours=int(self.params.get(
+                    "solar_actual_correction_hours",
+                    DEFAULT_SOLAR_ACTUAL_CORRECTION_HOURS,
+                )),
+            )
 
             # 6. Run optimizer to produce a schedule
             schedule = self.optimizer.optimize(

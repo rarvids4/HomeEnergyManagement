@@ -172,6 +172,13 @@ DEFAULT_PV_PEAK_POWER_KW = 14.4
 # Cloud opacity: how much cloud coverage reduces PV output (0–1).
 # 0.75 means 100 % clouds → 25 % of clear-sky output (diffuse radiation).
 DEFAULT_CLOUD_OPACITY = 0.75
+# Panel geometry: tilt from horizontal (deg) and azimuth clockwise from
+# north (180 = south).  Tilt None = legacy horizontal model.
+DEFAULT_PANEL_TILT_DEG = None
+DEFAULT_PANEL_AZIMUTH_DEG = 180.0
+# Scale the near-term solar forecast by actual PV output, fading out
+# over this many hours.  0 = disabled.
+DEFAULT_SOLAR_ACTUAL_CORRECTION_HOURS = 0
 
 # --- Grid transfer tariffs ---
 # Added to spot price to get the effective cost per kWh.

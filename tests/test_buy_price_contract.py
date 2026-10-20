@@ -296,3 +296,41 @@ def test_normal_day_restores_configured_min_soc_below_hard_floor(midnight):
     assert [a["data"]["value"] for a in _min_soc_writes(result["immediate_actions"])] == [4]
     assert opt._battery.active_min_soc == 8
 
+
+
+# ------------------------------------------------------------------
+# Arbitrage threshold: min_price_spread after round-trip losses
+# ------------------------------------------------------------------
+
+# A normal October day: spot positive all day, so under the flat
+# monthly-average buy price only the tariff step separates night and day.
+POSITIVE_SPOT = [s + 0.5 for s in SPOT]
+
+
+def test_tariff_step_alone_does_not_cycle_the_battery():
+    """Buying off-peak to avoid peak gains ~nothing after losses.
+
+    Gross spread 2.00 − 1.43 = 0.57 used to run the LP, which then grid-
+    charged at night and oscillated charge/discharge. After the 81 %
+    round trip the gain is 2.00 − 1.43/0.81 = 0.23 < 0.30 → plain
+    self-consumption: solar fills the battery, the house drains it.
+    """
+    pw = _window(CONTRACT_PARAMS, POSITIVE_SPOT)
+    assert pw.spread > 0.30
+    strat = BatteryStrategy(CONTRACT_PARAMS, OUTPUTS)
+
+    plan = strat.plan_battery(pw, [1.7] * 24, 25.0)
+
+    assert strat.last_method == "passive"
+    assert all(e["action"] == "self_consumption" for e in plan)
+    assert "arbitrage" in plan[0]["reason"]
+
+
+def test_real_price_spread_still_runs_the_lp():
+    params = {**TARIFF_PARAMS, "enable_battery_control": True}
+    spot = [0.2] * 6 + [2.5] * 18          # hourly contract, big swing
+    strat = BatteryStrategy(params, OUTPUTS)
+
+    strat.plan_battery(_window(params, spot), [1.7] * 24, 25.0)
+
+    assert strat.last_method == "lp"

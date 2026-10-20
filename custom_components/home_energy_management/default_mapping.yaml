@@ -218,7 +218,10 @@ parameters:
   optimization_interval_minutes: 15
   # How many hours ahead to plan
   planning_horizon_hours: 24
-  # Minimum price difference (SEK/kWh) to justify a charge/discharge cycle
+  # Minimum arbitrage gain (SEK/kWh) after round-trip losses — dearest
+  # price minus cheapest ÷ (charge × discharge efficiency) — to run the
+  # battery optimizer. Below it (and with no negative prices) the battery
+  # runs plain self-consumption: solar fills it, the house drains it.
   min_price_spread: 0.30
   # Number of days of history to use for consumption prediction
   prediction_history_days: 14

@@ -373,7 +373,7 @@ All tuning parameters live in the `parameters:` section. Every parameter has a b
 |-----------|------|---------|-------------|
 | `optimization_interval_minutes` | int | `15` | How often the optimizer re-runs (minutes) |
 | `planning_horizon_hours` | int | `24` | How many hours ahead to plan |
-| `min_price_spread` | float | `0.30` | Minimum price difference (SEK/kWh) to justify a charge/discharge cycle (heuristic fallback) |
+| `min_price_spread` | float | `0.30` | Minimum arbitrage gain (SEK/kWh) after round-trip losses (dearest price − cheapest ÷ round-trip efficiency) to run the battery optimizer; below it, with no negative prices, the battery runs plain self-consumption. Also used by the heuristic fallback |
 | `enable_charger_control` | bool | `true` | Toggle all EV charger control on/off |
 | `enable_battery_control` | bool | `true` | Toggle all battery control on/off |
 | `log_level` | string | `"info"` | Internal prediction log level (`debug` / `info` / `warning`) |

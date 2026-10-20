@@ -318,17 +318,31 @@ class BatteryStrategy:
         # If the effective price spread is too small, battery arbitrage
         # yields negligible savings and isn't worth the wear.  Skip LP
         # and return a passive self-consumption plan.
-        price_spread = max(pw.effective) - min(pw.effective)
+        #
+        # The spread is what survives the round trip: a kWh bought at
+        # the cheapest hour only delivers η_c·η_d kWh at the dearest.
+        # With a flat buy price the gross spread is just the tariff
+        # step (e.g. 2.36 − 1.89 = 0.47) while the real gain is ~0.03,
+        # and the LP used to cycle the battery for it every night.
+        round_trip = self.charge_efficiency * self.discharge_efficiency
+        price_spread = max(pw.effective) - min(pw.effective) / round_trip
         has_negative_spot = any(p < 0 for p in pw.spot)
 
         if price_spread < self.min_price_spread and not has_negative_spot:
             _LOGGER.debug(
-                "Price spread %.3f < min_price_spread %.3f — "
-                "defaulting to self-consumption",
+                "Price spread after round-trip losses %.3f < "
+                "min_price_spread %.3f — defaulting to self-consumption",
                 price_spread,
                 self.min_price_spread,
             )
-            return self._passive_plan(pw, predicted_consumption)
+            return self._passive_plan(
+                pw, predicted_consumption,
+                reason=(
+                    f"Self-consumption: arbitrage gain {price_spread:.2f} "
+                    f"< min_price_spread {self.min_price_spread:.2f}"
+                ),
+                predicted_solar=solar,
+            )
 
         plan: list[dict[str, Any]] | None = None
 
@@ -993,8 +1007,10 @@ class BatteryStrategy:
         self,
         pw: PriceWindow,
         predicted_consumption: list[float],
+        reason: str = "Battery control disabled",
+        predicted_solar: list[float] | None = None,
     ) -> list[dict[str, Any]]:
-        """Self-consumption plan when battery control is disabled."""
+        """Self-consumption plan (battery control disabled / no arbitrage)."""
         plan: list[dict[str, Any]] = []
         for i, price in enumerate(pw.effective):
             hour = (pw.current_hour + i) % 24
@@ -1007,10 +1023,13 @@ class BatteryStrategy:
             plan.append({
                 "hour": hour,
                 "action": ACTION_SELF_CONSUMPTION,
-                "reason": "Battery control disabled",
+                "reason": reason,
                 "price": round(price, 4),
                 "spot_price": round(spot, 4),
                 "predicted_consumption_kwh": round(cons, 2),
+                "predicted_solar_kwh": round(
+                    predicted_solar[i] if predicted_solar and i < len(predicted_solar) else 0.0, 2,
+                ),
             })
         return plan
 

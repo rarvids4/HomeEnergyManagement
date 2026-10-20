@@ -1030,11 +1030,18 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
             device_id = action.get("device_id")
             service_data = action.get("data", {})
 
-            if not service or (not entity_id and not device_id):
+            if not service:
                 continue
 
             domain, service_name = service.split(".", 1) if "." in service else (service, "")
             if not service_name:
+                continue
+
+            # Modbus writes address the inverter through their data
+            # (hub / slave / address), not an entity or device — they
+            # used to be dropped here, so the battery charge cap only
+            # reached the inverter when the input_number *changed*.
+            if not entity_id and not device_id and domain != "modbus":
                 continue
 
             # --- Manual override detection ---
@@ -1069,7 +1076,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                             )
                             continue
 
-            target = entity_id or device_id
+            target = entity_id or device_id or service_data.get("hub")
             _LOGGER.info(
                 "Executing action: %s on %s with data %s",
                 service,
@@ -1082,7 +1089,7 @@ class EnergyManagementCoordinator(DataUpdateCoordinator):
                 call_data = dict(service_data)
                 if device_id and not entity_id:
                     call_data["device_id"] = device_id
-                else:
+                elif entity_id:
                     call_data["entity_id"] = entity_id
 
                 await self.hass.services.async_call(

@@ -76,6 +76,9 @@ class EVScheduler:
             "ev_cheap_price_threshold", DEFAULT_EV_CHEAP_PRICE_THRESHOLD
         )
 
+        # Spot price per plan index — tie-breaker for equal effective prices
+        self._spot_by_idx: dict[int, float] = {}
+
     # ------------------------------------------------------------------
     # Public: plan EV charging
     # ------------------------------------------------------------------
@@ -210,6 +213,13 @@ class EVScheduler:
 
         Returns list of (plan_index, price, hour) tuples.
         """
+        # With a flat buy price (monthly average) every off-peak hour has
+        # the same effective price; break the tie on spot so the car
+        # charges in the cheapest hour instead of the first one.
+        self._spot_by_idx = {
+            i: entry.get("spot_price", entry["price"])
+            for i, entry in enumerate(hourly_plan)
+        }
         candidates = [
             (i, entry["price"], entry["hour"])
             for i, entry in enumerate(hourly_plan)
@@ -218,12 +228,13 @@ class EVScheduler:
         candidates.sort(key=self._night_adjusted_key)
         return candidates
 
-    def _night_adjusted_key(self, candidate: tuple) -> float:
-        """Sort key: apply night preference bonus to off-peak hours."""
-        _idx, price, hour = candidate
+    def _night_adjusted_key(self, candidate: tuple) -> tuple[float, float]:
+        """Sort key: night-adjusted price, then spot price on ties."""
+        idx, price, hour = candidate
+        spot = self._spot_by_idx.get(idx, price)
         if hour >= self.ev_night_start or hour < self.ev_night_end:
-            return price - self.ev_night_preference
-        return price
+            return price - self.ev_night_preference, spot
+        return price, spot
 
     def _schedule_vehicle(
         self,
